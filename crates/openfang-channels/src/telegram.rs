@@ -68,11 +68,12 @@ impl TelegramAdapter {
         Ok(bot_name)
     }
 
-    /// Call `sendMessage` on the Telegram API.
+    /// Call `sendMessage` on the Telegram API, optionally into a forum topic.
     async fn api_send_message(
         &self,
         chat_id: i64,
         text: &str,
+        message_thread_id: Option<i64>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let url = format!(
             "https://api.telegram.org/bot{}/sendMessage",
@@ -82,10 +83,13 @@ impl TelegramAdapter {
         // Telegram has a 4096 character limit per message — split if needed
         let chunks = split_message(text, 4096);
         for chunk in chunks {
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "chat_id": chat_id,
                 "text": chunk,
             });
+            if let Some(tid) = message_thread_id {
+                body["message_thread_id"] = serde_json::json!(tid);
+            }
 
             let resp = self.client.post(&url).json(&body).send().await?;
             let status = resp.status();
@@ -276,17 +280,15 @@ impl ChannelAdapter for TelegramAdapter {
         user: &ChannelUser,
         content: ChannelContent,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let chat_id: i64 = user
-            .platform_id
-            .parse()
-            .map_err(|_| format!("Invalid Telegram chat_id: {}", user.platform_id))?;
+        // platform_id format: "chat_id" or "chat_id:topic_id" for forum topics
+        let (chat_id, topic_id) = parse_platform_id(&user.platform_id)?;
 
         match content {
             ChannelContent::Text(text) => {
-                self.api_send_message(chat_id, &text).await?;
+                self.api_send_message(chat_id, &text, topic_id).await?;
             }
             _ => {
-                self.api_send_message(chat_id, "(Unsupported content type)")
+                self.api_send_message(chat_id, "(Unsupported content type)", topic_id)
                     .await?;
             }
         }
@@ -294,16 +296,31 @@ impl ChannelAdapter for TelegramAdapter {
     }
 
     async fn send_typing(&self, user: &ChannelUser) -> Result<(), Box<dyn std::error::Error>> {
-        let chat_id: i64 = user
-            .platform_id
-            .parse()
-            .map_err(|_| format!("Invalid Telegram chat_id: {}", user.platform_id))?;
+        let (chat_id, _topic_id) = parse_platform_id(&user.platform_id)?;
         self.api_send_typing(chat_id).await
     }
 
     async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self.shutdown_tx.send(true);
         Ok(())
+    }
+}
+
+/// Parse a composite platform_id ("chat_id" or "chat_id:topic_id") into its components.
+fn parse_platform_id(platform_id: &str) -> Result<(i64, Option<i64>), Box<dyn std::error::Error>> {
+    if let Some((chat_part, topic_part)) = platform_id.split_once(':') {
+        let chat_id: i64 = chat_part
+            .parse()
+            .map_err(|_| format!("Invalid Telegram chat_id: {chat_part}"))?;
+        let topic_id: i64 = topic_part
+            .parse()
+            .map_err(|_| format!("Invalid Telegram topic_id: {topic_part}"))?;
+        Ok((chat_id, Some(topic_id)))
+    } else {
+        let chat_id: i64 = platform_id
+            .parse()
+            .map_err(|_| format!("Invalid Telegram chat_id: {platform_id}"))?;
+        Ok((chat_id, None))
     }
 }
 
@@ -336,6 +353,9 @@ fn parse_telegram_update(
 
     let chat_type = message["chat"]["type"].as_str().unwrap_or("private");
     let is_group = chat_type == "group" || chat_type == "supergroup";
+
+    // Forum topic support: extract message_thread_id for supergroup forums
+    let topic_id = message["message_thread_id"].as_i64();
 
     let text = message["text"].as_str()?;
     let message_id = message["message_id"].as_i64().unwrap_or(0);
@@ -370,12 +390,19 @@ fn parse_telegram_update(
         ChannelContent::Text(text.to_string())
     };
 
-    // Use chat_id as the platform_id (so responses go to the right chat)
+    // Use "chat_id:topic_id" as platform_id for forum topics, plain "chat_id" otherwise.
+    // This allows per-topic agent binding and ensures replies go to the correct topic.
+    let platform_id = match topic_id {
+        Some(tid) => format!("{chat_id}:{tid}"),
+        None => chat_id.to_string(),
+    };
+    let thread_id = topic_id.map(|tid| tid.to_string());
+
     Some(ChannelMessage {
         channel: ChannelType::Telegram,
         platform_message_id: message_id.to_string(),
         sender: ChannelUser {
-            platform_id: chat_id.to_string(),
+            platform_id,
             display_name,
             openfang_user: None,
         },
@@ -383,7 +410,7 @@ fn parse_telegram_update(
         target_agent: None,
         timestamp,
         is_group,
-        thread_id: None,
+        thread_id,
         metadata: HashMap::new(),
     })
 }

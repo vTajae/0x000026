@@ -1327,6 +1327,10 @@ pub struct MemoryConfig {
     /// Environment variable name for the embedding API key.
     #[serde(default)]
     pub embedding_api_key_env: Option<String>,
+    /// Base URL override for the embedding provider (e.g., "http://10.0.0.68:11434/v1").
+    /// When set, overrides the default URL for the chosen provider.
+    #[serde(default)]
+    pub embedding_base_url: Option<String>,
     /// How often to run memory consolidation (hours). 0 = disabled.
     #[serde(default = "default_consolidation_interval")]
     pub consolidation_interval_hours: u64,
@@ -1345,6 +1349,7 @@ impl Default for MemoryConfig {
             decay_rate: 0.1,
             embedding_provider: None,
             embedding_api_key_env: None,
+            embedding_base_url: None,
             consolidation_interval_hours: default_consolidation_interval(),
         }
     }
