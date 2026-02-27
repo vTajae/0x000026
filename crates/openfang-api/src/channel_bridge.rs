@@ -785,6 +785,15 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             )
         };
         self.kernel.delivery_tracker.record(agent_id, receipt);
+
+        // Persist last channel for cron CronDelivery::LastChannel
+        if success {
+            let kv_val = serde_json::json!({"channel": channel, "recipient": recipient});
+            let _ = self
+                .kernel
+                .memory
+                .structured_set(agent_id, "delivery.last_channel", kv_val);
+        }
     }
 
     async fn check_auto_reply(&self, agent_id: AgentId, message: &str) -> Option<String> {

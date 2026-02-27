@@ -520,7 +520,7 @@ pub fn strip_tool_result_details(content: &str) -> String {
     } else {
         format!(
             "{}...[truncated from {} chars]",
-            &cleaned[..max_len],
+            crate::str_utils::safe_truncate_str(&cleaned, max_len),
             cleaned.len()
         )
     }

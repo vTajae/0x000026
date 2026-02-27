@@ -520,11 +520,7 @@ impl LoopGuard {
         let params_str = serde_json::to_string(params).unwrap_or_default();
         hasher.update(params_str.as_bytes());
         hasher.update(b"|");
-        let truncated = if result.len() > 1000 {
-            &result[..1000]
-        } else {
-            result
-        };
+        let truncated = crate::str_utils::safe_truncate_str(result, 1000);
         hasher.update(truncated.as_bytes());
         hex::encode(hasher.finalize())
     }

@@ -293,16 +293,37 @@ impl CronScheduler {
 ///
 /// - `At { at }` — returns `at` directly.
 /// - `Every { every_secs }` — returns `now + every_secs`.
-/// - `Cron { .. }` — returns 60 seconds from now (placeholder until a cron
-///   expression parser is added).
+/// - `Cron { expr, tz }` — parses the cron expression and computes the next
+///   matching time. Supports standard 5-field (`min hour dom month dow`) and
+///   6-field (`sec min hour dom month dow`) formats by converting to the
+///   7-field format required by the `cron` crate.
 pub fn compute_next_run(schedule: &CronSchedule) -> chrono::DateTime<Utc> {
     match schedule {
         CronSchedule::At { at } => *at,
         CronSchedule::Every { every_secs } => Utc::now() + Duration::seconds(*every_secs as i64),
-        CronSchedule::Cron { .. } => {
-            // Placeholder: real cron parsing will be added when the `cron`
-            // crate is brought in. For now, fire 60 seconds from now.
-            Utc::now() + Duration::seconds(60)
+        CronSchedule::Cron { expr, tz: _ } => {
+            // Convert standard 5/6-field cron to 7-field for the `cron` crate.
+            // Standard 5-field: min hour dom month dow
+            // 6-field:          sec min hour dom month dow
+            // cron crate:       sec min hour dom month dow year
+            let trimmed = expr.trim();
+            let fields: Vec<&str> = trimmed.split_whitespace().collect();
+            let seven_field = match fields.len() {
+                5 => format!("0 {trimmed} *"),
+                6 => format!("{trimmed} *"),
+                _ => expr.clone(),
+            };
+
+            match seven_field.parse::<cron::Schedule>() {
+                Ok(sched) => sched
+                    .upcoming(Utc)
+                    .next()
+                    .unwrap_or_else(|| Utc::now() + Duration::hours(1)),
+                Err(e) => {
+                    warn!("Failed to parse cron expression '{}': {}", expr, e);
+                    Utc::now() + Duration::hours(1)
+                }
+            }
         }
     }
 }
@@ -655,18 +676,47 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_next_run_cron_placeholder() {
-        let before = Utc::now();
+    fn test_compute_next_run_cron_daily() {
+        let now = Utc::now();
         let schedule = CronSchedule::Cron {
             expr: "0 9 * * *".into(),
             tz: None,
         };
         let next = compute_next_run(&schedule);
-        let after = Utc::now();
 
-        // Placeholder returns ~60s from now
-        assert!(next >= before + Duration::seconds(59));
-        assert!(next <= after + Duration::seconds(61));
+        // Should be within the next 24 hours (next 09:00 UTC)
+        assert!(next > now);
+        assert!(next <= now + Duration::hours(24));
+        assert_eq!(next.format("%M").to_string(), "00");
+        assert_eq!(next.format("%H").to_string(), "09");
+    }
+
+    #[test]
+    fn test_compute_next_run_cron_with_dow() {
+        let now = Utc::now();
+        let schedule = CronSchedule::Cron {
+            expr: "30 14 * * 1-5".into(),
+            tz: None,
+        };
+        let next = compute_next_run(&schedule);
+
+        // Should be within the next 7 days and at 14:30
+        assert!(next > now);
+        assert!(next <= now + Duration::days(7));
+        assert_eq!(next.format("%H:%M").to_string(), "14:30");
+    }
+
+    #[test]
+    fn test_compute_next_run_cron_invalid_expr() {
+        let now = Utc::now();
+        let schedule = CronSchedule::Cron {
+            expr: "not a cron".into(),
+            tz: None,
+        };
+        let next = compute_next_run(&schedule);
+        // Invalid expression falls back to 1 hour from now
+        assert!(next > now + Duration::minutes(59));
+        assert!(next <= now + Duration::minutes(61));
     }
 
     // -- error message truncation in record_failure -------------------------

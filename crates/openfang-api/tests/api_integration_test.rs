@@ -75,6 +75,7 @@ async fn start_test_server_with_provider(
         peer_registry: None,
         bridge_manager: tokio::sync::Mutex::new(None),
         channels_config: tokio::sync::RwLock::new(Default::default()),
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
     });
 
     let app = Router::new()
@@ -700,6 +701,7 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         peer_registry: None,
         bridge_manager: tokio::sync::Mutex::new(None),
         channels_config: tokio::sync::RwLock::new(Default::default()),
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
     });
 
     let api_key_state = state.kernel.config.api_key.clone();

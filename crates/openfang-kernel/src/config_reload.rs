@@ -41,6 +41,8 @@ pub enum HotAction {
     ReloadA2aConfig,
     /// Fallback provider chain changed.
     ReloadFallbackProviders,
+    /// Provider base URL overrides changed.
+    ReloadProviderUrls,
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +235,10 @@ pub fn build_reload_plan(old: &KernelConfig, new: &KernelConfig) -> ReloadPlan {
 
     if field_changed(&old.fallback_providers, &new.fallback_providers) {
         plan.hot_actions.push(HotAction::ReloadFallbackProviders);
+    }
+
+    if field_changed(&old.provider_urls, &new.provider_urls) {
+        plan.hot_actions.push(HotAction::ReloadProviderUrls);
     }
 
     // ----- No-op fields -----
@@ -459,6 +465,17 @@ mod tests {
         let plan = build_reload_plan(&a, &b);
         assert!(!plan.restart_required);
         assert!(plan.hot_actions.contains(&HotAction::ReloadExtensions));
+    }
+
+    #[test]
+    fn test_provider_urls_hot_reload() {
+        let a = default_cfg();
+        let mut b = default_cfg();
+        b.provider_urls
+            .insert("ollama".to_string(), "http://10.0.0.5:11434/v1".to_string());
+        let plan = build_reload_plan(&a, &b);
+        assert!(!plan.restart_required);
+        assert!(plan.hot_actions.contains(&HotAction::ReloadProviderUrls));
     }
 
     // -----------------------------------------------------------------------

@@ -11,6 +11,7 @@
 //! 3. Minimal fallback without LLM (when summarization is unavailable)
 
 use crate::llm_driver::{CompletionRequest, LlmDriver};
+use crate::str_utils::safe_truncate_str;
 use openfang_memory::session::Session;
 use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
 use openfang_types::tool::ToolDefinition;
@@ -342,7 +343,7 @@ fn build_conversation_text(messages: &[Message], config: &CompactionConfig) -> S
                     if oversized {
                         let limit = config.max_chunk_chars / 4;
                         let truncated = if s.len() > limit {
-                            format!("{}...[truncated from {} chars]", &s[..limit], s.len())
+                            format!("{}...[truncated from {} chars]", safe_truncate_str(s, limit), s.len())
                         } else {
                             s.clone()
                         };
@@ -361,7 +362,7 @@ fn build_conversation_text(messages: &[Message], config: &CompactionConfig) -> S
                                     let limit = config.max_chunk_chars / 4;
                                     conversation_text.push_str(&format!(
                                         "{role_label}: {}...[truncated from {} chars]\n\n",
-                                        &text[..limit],
+                                        safe_truncate_str(text, limit),
                                         text.len()
                                     ));
                                 } else {
@@ -373,7 +374,7 @@ fn build_conversation_text(messages: &[Message], config: &CompactionConfig) -> S
                         ContentBlock::ToolUse { name, input, .. } => {
                             let input_str = serde_json::to_string(input).unwrap_or_default();
                             let input_preview = if input_str.len() > 200 {
-                                format!("{}...", &input_str[..200])
+                                format!("{}...", safe_truncate_str(&input_str, 200))
                             } else {
                                 input_str
                             };
@@ -388,7 +389,7 @@ fn build_conversation_text(messages: &[Message], config: &CompactionConfig) -> S
                             // Strip base64 blobs and injection markers before compaction
                             let cleaned = crate::session_repair::strip_tool_result_details(content);
                             let preview = if cleaned.len() > 2000 {
-                                format!("{}...", &cleaned[..2000])
+                                format!("{}...", safe_truncate_str(&cleaned, 2000))
                             } else {
                                 cleaned
                             };
@@ -886,7 +887,7 @@ mod tests {
         assert!(input_str.len() > 200);
         // Just verify the truncation logic works correctly
         let preview = if input_str.len() > 200 {
-            format!("{}...", &input_str[..200])
+            format!("{}...", safe_truncate_str(&input_str, 200))
         } else {
             input_str.clone()
         };

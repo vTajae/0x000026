@@ -879,7 +879,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "action": {
                         "type": "object",
-                        "description": "Action: {\"action\":\"system_event\",\"text\":\"...\"} or {\"action\":\"agent_turn\",\"message\":\"...\",\"timeout_secs\":300}"
+                        "description": "Action: {\"kind\":\"system_event\",\"text\":\"...\"} or {\"kind\":\"agent_turn\",\"message\":\"...\",\"timeout_secs\":300}"
                     },
                     "delivery": {
                         "type": "object",
@@ -1231,7 +1231,7 @@ async fn tool_web_fetch_legacy(input: &serde_json::Value) -> Result<String, Stri
     let truncated = if body.len() > max_len {
         format!(
             "{}... [truncated, {} total bytes]",
-            &body[..max_len],
+            crate::str_utils::safe_truncate_str(&body, max_len),
             body.len()
         )
     } else {
@@ -1367,7 +1367,7 @@ async fn tool_shell_exec(
             let stdout_str = if stdout.len() > max_output {
                 format!(
                     "{}...\n[truncated, {} total bytes]",
-                    &stdout[..max_output],
+                    crate::str_utils::safe_truncate_str(&stdout, max_output),
                     stdout.len()
                 )
             } else {
@@ -1376,7 +1376,7 @@ async fn tool_shell_exec(
             let stderr_str = if stderr.len() > max_output {
                 format!(
                     "{}...\n[truncated, {} total bytes]",
-                    &stderr[..max_output],
+                    crate::str_utils::safe_truncate_str(&stderr, max_output),
                     stderr.len()
                 )
             } else {

@@ -522,10 +522,15 @@ pub fn tool_hint(name: &str) -> &'static str {
 
 /// Cap a string to `max_chars`, appending "..." if truncated.
 fn cap_str(s: &str, max_chars: usize) -> String {
-    if s.len() <= max_chars {
+    if s.chars().count() <= max_chars {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_chars])
+        let end = s
+            .char_indices()
+            .nth(max_chars)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        format!("{}...", &s[..end])
     }
 }
 
@@ -834,6 +839,23 @@ mod tests {
     fn test_cap_str_long() {
         let result = cap_str("hello world", 5);
         assert_eq!(result, "hello...");
+    }
+
+    #[test]
+    fn test_cap_str_multibyte_utf8() {
+        // This was panicking with "byte index is not a char boundary" (#38)
+        let chinese = "你好世界这是一个测试字符串";
+        let result = cap_str(chinese, 4);
+        assert_eq!(result, "你好世界...");
+        // Exact boundary
+        assert_eq!(cap_str(chinese, 100), chinese);
+    }
+
+    #[test]
+    fn test_cap_str_emoji() {
+        let emoji = "👋🌍🚀✨💯";
+        let result = cap_str(emoji, 3);
+        assert_eq!(result, "👋🌍🚀...");
     }
 
     #[test]

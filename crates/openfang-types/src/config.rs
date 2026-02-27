@@ -1039,6 +1039,34 @@ pub struct KernelConfig {
     /// Global spending budget configuration.
     #[serde(default)]
     pub budget: BudgetConfig,
+    /// Provider base URL overrides (provider ID → custom base URL).
+    /// e.g. `ollama = "http://192.168.1.100:11434/v1"`
+    #[serde(default)]
+    pub provider_urls: HashMap<String, String>,
+    /// OAuth client ID overrides for PKCE flows.
+    #[serde(default)]
+    pub oauth: OAuthConfig,
+}
+
+/// OAuth client ID overrides for PKCE flows.
+///
+/// Configure in config.toml:
+/// ```toml
+/// [oauth]
+/// google_client_id = "your-google-client-id"
+/// github_client_id = "your-github-client-id"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OAuthConfig {
+    /// Google OAuth2 client ID for PKCE flow.
+    pub google_client_id: Option<String>,
+    /// GitHub OAuth client ID for PKCE flow.
+    pub github_client_id: Option<String>,
+    /// Microsoft (Entra ID) OAuth client ID.
+    pub microsoft_client_id: Option<String>,
+    /// Slack OAuth client ID.
+    pub slack_client_id: Option<String>,
 }
 
 /// Global spending budget configuration.
@@ -1183,6 +1211,8 @@ impl Default for KernelConfig {
             auth_profiles: HashMap::new(),
             thinking: None,
             budget: BudgetConfig::default(),
+            provider_urls: HashMap::new(),
+            oauth: OAuthConfig::default(),
         }
     }
 }

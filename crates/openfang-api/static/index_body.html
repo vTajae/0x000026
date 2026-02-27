@@ -13,7 +13,11 @@
           </div>
         </div>
       </div>
-      <button class="theme-toggle" @click="toggleTheme()" :title="theme === 'dark' ? 'Switch to light' : 'Switch to dark'" x-text="theme === 'dark' ? '\u2600' : '\u263E'"></button>
+      <div class="theme-switcher">
+        <button class="theme-opt" :class="{ active: themeMode === 'light' }" @click="setTheme('light')" title="Light">&#9788;</button>
+        <button class="theme-opt" :class="{ active: themeMode === 'system' }" @click="setTheme('system')" title="System">&#9675;</button>
+        <button class="theme-opt" :class="{ active: themeMode === 'dark' }" @click="setTheme('dark')" title="Dark">&#9790;</button>
+      </div>
     </div>
 
     <div class="sidebar-status" :class="{ offline: !connected && !$store.app.booting }">
@@ -1519,7 +1523,7 @@
                       <th>Agent</th>
                       <th>Status</th>
                       <th>Last Run</th>
-                      <th>Runs</th>
+                      <th>Next Run</th>
                       <th>Actions</th>
                     </tr>
                   </thead>
@@ -1539,7 +1543,7 @@
                           <span class="badge" :class="job.enabled ? 'badge-success' : 'badge-dim'" x-text="job.enabled ? 'Active' : 'Paused'"></span>
                         </td>
                         <td class="text-xs" :title="formatTime(job.last_run)" x-text="relativeTime(job.last_run)"></td>
-                        <td class="text-xs" x-text="job.run_count || 0"></td>
+                        <td class="text-xs" :title="formatTime(job.next_run)" x-text="relativeTime(job.next_run)"></td>
                         <td>
                           <div class="flex gap-1">
                             <button class="btn btn-primary btn-sm" @click="runNow(job)" :disabled="runningJobId === job.id">
@@ -2881,6 +2885,19 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                   <!-- No key needed -->
                   <template x-if="!p.api_key_env || p.key_required === false">
                     <div class="text-xs mt-2" style="color:var(--success)" x-show="p.auth_status !== 'configured' && p.auth_status !== 'not_set' && p.auth_status !== 'missing'">No API key needed &mdash; runs locally or is free</div>
+                  </template>
+                  <!-- Base URL editor for local providers -->
+                  <template x-if="p.is_local">
+                    <div class="mt-3" style="border-top:1px solid var(--border);padding-top:8px">
+                      <div class="text-xs text-dim mb-1">Base URL</div>
+                      <div class="key-input-group">
+                        <input type="text" :placeholder="'http://localhost:...'" x-model="providerUrlInputs[p.id]" style="font-size:12px">
+                        <button class="btn btn-primary btn-sm" @click="saveProviderUrl(p)" :disabled="providerUrlSaving[p.id]">
+                          <span x-show="!providerUrlSaving[p.id]">Save</span>
+                          <span x-show="providerUrlSaving[p.id]" class="spinner" style="width:10px;height:10px;border-width:2px"></span>
+                        </button>
+                      </div>
+                    </div>
                   </template>
                 </div>
               </template>

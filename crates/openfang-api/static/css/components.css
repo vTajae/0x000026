@@ -1098,19 +1098,25 @@ mark.search-highlight {
   font-weight: 500;
 }
 
-/* Theme toggle */
-.theme-toggle {
-  cursor: pointer;
-  padding: 6px 8px;
+/* Theme switcher — 3-mode pill (Light / System / Dark) */
+.theme-switcher {
+  display: inline-flex;
   border-radius: var(--radius-sm);
-  color: var(--text-muted);
-  font-size: 16px;
-  background: none;
-  border: 1px solid transparent;
-  transition: all 0.2s;
+  border: 1px solid var(--border);
+  overflow: hidden;
 }
-
-.theme-toggle:hover { color: var(--accent); border-color: var(--border); }
+.theme-opt {
+  cursor: pointer;
+  padding: 4px 8px;
+  font-size: 14px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  transition: all 0.2s;
+  line-height: 1;
+}
+.theme-opt:hover { color: var(--text-primary); background: var(--bg-hover); }
+.theme-opt.active { color: var(--accent); background: var(--accent-glow); }
 
 /* Utility */
 .flex { display: flex; }

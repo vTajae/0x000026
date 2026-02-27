@@ -45,11 +45,7 @@ pub async fn generate_image(request: &ImageGenRequest) -> Result<ImageGenResult,
         let status = response.status();
         let error_body = response.text().await.unwrap_or_default();
         // SECURITY: don't include full error body which might contain key info
-        let truncated = if error_body.len() > 500 {
-            &error_body[..500]
-        } else {
-            &error_body
-        };
+        let truncated = crate::str_utils::safe_truncate_str(&error_body, 500);
         return Err(format!(
             "Image generation failed (HTTP {}): {}",
             status, truncated

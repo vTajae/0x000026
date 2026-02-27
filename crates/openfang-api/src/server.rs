@@ -48,6 +48,7 @@ pub async fn build_router(
         peer_registry: kernel.peer_registry.as_ref().map(|r| Arc::new(r.clone())),
         bridge_manager: tokio::sync::Mutex::new(bridge),
         channels_config: tokio::sync::RwLock::new(channels_config),
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
     });
 
     // CORS: allow localhost origins by default. If API key is set, the API
@@ -460,6 +461,10 @@ pub async fn build_router(
             axum::routing::post(routes::test_provider),
         )
         .route(
+            "/api/providers/{name}/url",
+            axum::routing::put(routes::set_provider_url),
+        )
+        .route(
             "/api/skills/create",
             axum::routing::post(routes::create_skill),
         )
@@ -710,11 +715,12 @@ pub async fn run_daemon(
     // Run server with graceful shutdown.
     // SECURITY: `into_make_service_with_connect_info` injects the peer
     // SocketAddr so the auth middleware can check for loopback connections.
+    let api_shutdown = state.shutdown_notify.clone();
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(shutdown_signal(api_shutdown))
     .await?;
 
     // Clean up daemon info file
@@ -752,11 +758,11 @@ pub fn read_daemon_info(home_dir: &Path) -> Option<DaemonInfo> {
     serde_json::from_str(&contents).ok()
 }
 
-/// Wait for an OS termination signal.
+/// Wait for an OS termination signal OR an API shutdown request.
 ///
-/// On Unix: listens for SIGINT and SIGTERM.
-/// On Windows: listens for Ctrl+C.
-async fn shutdown_signal() {
+/// On Unix: listens for SIGINT, SIGTERM, and API notify.
+/// On Windows: listens for Ctrl+C and API notify.
+async fn shutdown_signal(api_shutdown: Arc<tokio::sync::Notify>) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -770,15 +776,22 @@ async fn shutdown_signal() {
             _ = sigterm.recv() => {
                 info!("Received SIGTERM, shutting down...");
             }
+            _ = api_shutdown.notified() => {
+                info!("Shutdown requested via API, shutting down...");
+            }
         }
     }
 
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
-        info!("Ctrl+C received, shutting down...");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl+C received, shutting down...");
+            }
+            _ = api_shutdown.notified() => {
+                info!("Shutdown requested via API, shutting down...");
+            }
+        }
     }
 }
 

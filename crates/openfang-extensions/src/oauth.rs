@@ -26,6 +26,32 @@ pub fn default_client_ids() -> HashMap<&'static str, &'static str> {
     m
 }
 
+/// Resolve OAuth client IDs with config overrides applied on top of defaults.
+pub fn resolve_client_ids(
+    config: &openfang_types::config::OAuthConfig,
+) -> HashMap<String, String> {
+    let defaults = default_client_ids();
+    let mut resolved: HashMap<String, String> = defaults
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    if let Some(ref id) = config.google_client_id {
+        resolved.insert("google".into(), id.clone());
+    }
+    if let Some(ref id) = config.github_client_id {
+        resolved.insert("github".into(), id.clone());
+    }
+    if let Some(ref id) = config.microsoft_client_id {
+        resolved.insert("microsoft".into(), id.clone());
+    }
+    if let Some(ref id) = config.slack_client_id {
+        resolved.insert("slack".into(), id.clone());
+    }
+
+    resolved
+}
+
 /// OAuth2 token response (raw from provider, for deserialization).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OAuthTokens {
@@ -332,5 +358,28 @@ mod tests {
         assert!(ids.contains_key("github"));
         assert!(ids.contains_key("microsoft"));
         assert!(ids.contains_key("slack"));
+    }
+
+    #[test]
+    fn resolve_client_ids_uses_defaults() {
+        let config = openfang_types::config::OAuthConfig::default();
+        let ids = resolve_client_ids(&config);
+        assert_eq!(ids["google"], "openfang-google-client-id");
+        assert_eq!(ids["github"], "openfang-github-client-id");
+    }
+
+    #[test]
+    fn resolve_client_ids_applies_overrides() {
+        let config = openfang_types::config::OAuthConfig {
+            google_client_id: Some("my-real-google-id".into()),
+            github_client_id: None,
+            microsoft_client_id: Some("my-msft-id".into()),
+            slack_client_id: None,
+        };
+        let ids = resolve_client_ids(&config);
+        assert_eq!(ids["google"], "my-real-google-id");
+        assert_eq!(ids["github"], "openfang-github-client-id"); // default
+        assert_eq!(ids["microsoft"], "my-msft-id");
+        assert_eq!(ids["slack"], "openfang-slack-client-id"); // default
     }
 }

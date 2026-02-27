@@ -140,15 +140,28 @@ pub(crate) fn check_ssrf(url: &str) -> Result<(), String> {
     }
 
     let host = extract_host(url);
-    let hostname = host.split(':').next().unwrap_or(&host);
+    // For IPv6 bracket notation like [::1]:80, extract [::1] as hostname
+    let hostname = if host.starts_with('[') {
+        host.find(']')
+            .map(|i| &host[..=i])
+            .unwrap_or(&host)
+    } else {
+        host.split(':').next().unwrap_or(&host)
+    };
 
     // Hostname-based blocklist (catches metadata endpoints)
     let blocked = [
         "localhost",
+        "ip6-localhost",
         "metadata.google.internal",
         "metadata.aws.internal",
         "instance-data",
         "169.254.169.254",
+        "100.100.100.200", // Alibaba Cloud IMDS
+        "192.0.0.192",     // Azure IMDS alternative
+        "0.0.0.0",
+        "::1",
+        "[::1]",
     ];
     if blocked.contains(&hostname) {
         return Err(format!("SSRF blocked: {hostname} is a restricted hostname"));
@@ -192,6 +205,19 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 fn extract_host(url: &str) -> String {
     if let Some(after_scheme) = url.split("://").nth(1) {
         let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
+        // Handle IPv6 bracket notation: [::1]:8080
+        if host_port.starts_with('[') {
+            // Extract [addr]:port or [addr]
+            if let Some(bracket_end) = host_port.find(']') {
+                let ipv6_host = &host_port[..=bracket_end]; // includes brackets
+                let after_bracket = &host_port[bracket_end + 1..];
+                if let Some(port) = after_bracket.strip_prefix(':') {
+                    return format!("{ipv6_host}:{port}");
+                }
+                let default_port = if url.starts_with("https") { 443 } else { 80 };
+                return format!("{ipv6_host}:{default_port}");
+            }
+        }
         if host_port.contains(':') {
             host_port.to_string()
         } else if url.starts_with("https") {
@@ -244,5 +270,36 @@ mod tests {
         assert!(check_ssrf("file:///etc/passwd").is_err());
         assert!(check_ssrf("ftp://internal.corp/data").is_err());
         assert!(check_ssrf("gopher://evil.com").is_err());
+    }
+
+    #[test]
+    fn test_ssrf_blocks_cloud_metadata() {
+        // Alibaba Cloud IMDS
+        assert!(check_ssrf("http://100.100.100.200/latest/meta-data/").is_err());
+        // Azure IMDS alternative
+        assert!(check_ssrf("http://192.0.0.192/metadata/instance").is_err());
+    }
+
+    #[test]
+    fn test_ssrf_blocks_zero_ip() {
+        assert!(check_ssrf("http://0.0.0.0/").is_err());
+    }
+
+    #[test]
+    fn test_ssrf_blocks_ipv6_localhost() {
+        assert!(check_ssrf("http://[::1]/admin").is_err());
+        assert!(check_ssrf("http://[::1]:8080/api").is_err());
+    }
+
+    #[test]
+    fn test_extract_host_ipv6() {
+        let h = extract_host("http://[::1]:8080/path");
+        assert_eq!(h, "[::1]:8080");
+
+        let h2 = extract_host("https://[::1]/path");
+        assert_eq!(h2, "[::1]:443");
+
+        let h3 = extract_host("http://[::1]/path");
+        assert_eq!(h3, "[::1]:80");
     }
 }

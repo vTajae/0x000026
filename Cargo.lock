@@ -1072,6 +1072,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cron"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5877d3fbf742507b66bc2a1945106bd30dd8504019d596901ddd012a4dd01740"
+dependencies = [
+ "chrono",
+ "once_cell",
+ "winnow 0.6.26",
+]
+
+[[package]]
 name = "crossbeam"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3650,7 +3661,7 @@ dependencies = [
 
 [[package]]
 name = "openfang-api"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "axum",
@@ -3686,7 +3697,7 @@ dependencies = [
 
 [[package]]
 name = "openfang-channels"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "axum",
@@ -3713,7 +3724,7 @@ dependencies = [
 
 [[package]]
 name = "openfang-cli"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "clap",
  "clap_complete",
@@ -3740,7 +3751,7 @@ dependencies = [
 
 [[package]]
 name = "openfang-desktop"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "axum",
  "open",
@@ -3766,7 +3777,7 @@ dependencies = [
 
 [[package]]
 name = "openfang-extensions"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3794,7 +3805,7 @@ dependencies = [
 
 [[package]]
 name = "openfang-hands"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "chrono",
  "dashmap",
@@ -3811,10 +3822,11 @@ dependencies = [
 
 [[package]]
 name = "openfang-kernel"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "chrono",
+ "cron",
  "crossbeam",
  "dashmap",
  "dirs 6.0.0",
@@ -3846,7 +3858,7 @@ dependencies = [
 
 [[package]]
 name = "openfang-memory"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3865,7 +3877,7 @@ dependencies = [
 
 [[package]]
 name = "openfang-migrate"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
@@ -3884,7 +3896,7 @@ dependencies = [
 
 [[package]]
 name = "openfang-runtime"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3915,7 +3927,7 @@ dependencies = [
 
 [[package]]
 name = "openfang-skills"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "chrono",
  "hex",
@@ -3937,7 +3949,7 @@ dependencies = [
 
 [[package]]
 name = "openfang-types"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3956,7 +3968,7 @@ dependencies = [
 
 [[package]]
 name = "openfang-wire"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4638,7 +4650,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8252,6 +8264,15 @@ dependencies = [
 
 [[package]]
 name = "winnow"
+version = "0.6.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e90edd2ac1aa278a5c4599b1d89cf03074b610800f866d4026dc199d7929a28"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "winnow"
 version = "0.7.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a5364e9d77fcdeeaa6062ced926ee3381faa2ee02d3eb83a5c27a8825540829"
@@ -8491,7 +8512,7 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.7"
 
 [[package]]
 name = "yoke"

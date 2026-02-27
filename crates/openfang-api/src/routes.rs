@@ -31,6 +31,8 @@ pub struct AppState {
     pub bridge_manager: tokio::sync::Mutex<Option<openfang_channels::bridge::BridgeManager>>,
     /// Live channel config — updated on every hot-reload so list_channels() reflects reality.
     pub channels_config: tokio::sync::RwLock<openfang_types::config::ChannelsConfig>,
+    /// Notify handle to trigger graceful HTTP server shutdown from the API.
+    pub shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -492,6 +494,8 @@ pub async fn shutdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "ok",
     );
     state.kernel.shutdown();
+    // Signal the HTTP server to initiate graceful shutdown so the process exits.
+    state.shutdown_notify.notify_one();
     Json(serde_json::json!({"status": "shutting_down"}))
 }
 
@@ -3992,9 +3996,9 @@ pub async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResp
 // Tools endpoint
 // ---------------------------------------------------------------------------
 
-/// GET /api/tools — List all built-in tool definitions.
-pub async fn list_tools() -> impl IntoResponse {
-    let tools: Vec<serde_json::Value> = builtin_tool_definitions()
+/// GET /api/tools — List all tool definitions (built-in + MCP).
+pub async fn list_tools(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut tools: Vec<serde_json::Value> = builtin_tool_definitions()
         .iter()
         .map(|t| {
             serde_json::json!({
@@ -4004,6 +4008,18 @@ pub async fn list_tools() -> impl IntoResponse {
             })
         })
         .collect();
+
+    // Include MCP tools so they're visible in Settings -> Tools
+    if let Ok(mcp_tools) = state.kernel.mcp_tools.lock() {
+        for t in mcp_tools.iter() {
+            tools.push(serde_json::json!({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.input_schema,
+                "source": "mcp",
+            }));
+        }
+    }
 
     Json(serde_json::json!({"tools": tools, "total": tools.len()}))
 }
@@ -4838,6 +4854,7 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
             "model_count": p.model_count,
             "key_required": p.key_required,
             "api_key_env": p.api_key_env,
+            "base_url": p.base_url,
         });
 
         // For local providers, add reachability info via health probe
@@ -5895,6 +5912,122 @@ pub async fn test_provider(
     }
 }
 
+/// PUT /api/providers/{name}/url — Set a custom base URL for a provider.
+pub async fn set_provider_url(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // Validate provider exists
+    let provider_exists = {
+        let catalog = state
+            .kernel
+            .model_catalog
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        catalog.get_provider(&name).is_some()
+    };
+    if !provider_exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Unknown provider '{}'", name)})),
+        );
+    }
+
+    let base_url = match body["base_url"].as_str() {
+        Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing or empty 'base_url' field"})),
+            );
+        }
+    };
+
+    // Validate URL scheme
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "base_url must start with http:// or https://"})),
+        );
+    }
+
+    // Update catalog in memory
+    {
+        let mut catalog = state
+            .kernel
+            .model_catalog
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        catalog.set_provider_url(&name, &base_url);
+    }
+
+    // Persist to config.toml [provider_urls] section
+    let config_path = state.kernel.config.home_dir.join("config.toml");
+    if let Err(e) = upsert_provider_url(&config_path, &name, &base_url) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
+        );
+    }
+
+    // Probe reachability at the new URL
+    let probe =
+        openfang_runtime::provider_health::probe_provider(&name, &base_url).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "saved",
+            "provider": name,
+            "base_url": base_url,
+            "reachable": probe.reachable,
+            "latency_ms": probe.latency_ms,
+        })),
+    )
+}
+
+/// Upsert a provider URL in the `[provider_urls]` section of config.toml.
+fn upsert_provider_url(
+    config_path: &std::path::Path,
+    provider: &str,
+    url: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let content = if config_path.exists() {
+        std::fs::read_to_string(config_path)?
+    } else {
+        String::new()
+    };
+
+    let mut doc: toml::Value = if content.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str(&content)?
+    };
+
+    let root = doc.as_table_mut().ok_or("Config is not a TOML table")?;
+
+    if !root.contains_key("provider_urls") {
+        root.insert(
+            "provider_urls".to_string(),
+            toml::Value::Table(toml::map::Map::new()),
+        );
+    }
+    let urls_table = root
+        .get_mut("provider_urls")
+        .and_then(|v| v.as_table_mut())
+        .ok_or("provider_urls is not a table")?;
+
+    urls_table.insert(provider.to_string(), toml::Value::String(url.to_string()));
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    std::fs::write(config_path, toml::to_string_pretty(&doc)?)?;
+    Ok(())
+}
+
 /// POST /api/skills/create — Create a local prompt-only skill.
 pub async fn create_skill(
     State(state): State<Arc<AppState>>,
@@ -6809,6 +6942,36 @@ pub async fn patch_agent_config(
         }
     };
 
+    // Input length limits
+    const MAX_NAME_LEN: usize = 256;
+    const MAX_DESC_LEN: usize = 4096;
+    const MAX_PROMPT_LEN: usize = 65_536;
+
+    if let Some(ref name) = req.name {
+        if name.len() > MAX_NAME_LEN {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({"error": format!("Name exceeds max length ({MAX_NAME_LEN} chars)")})),
+            );
+        }
+    }
+    if let Some(ref desc) = req.description {
+        if desc.len() > MAX_DESC_LEN {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({"error": format!("Description exceeds max length ({MAX_DESC_LEN} chars)")})),
+            );
+        }
+    }
+    if let Some(ref prompt) = req.system_prompt {
+        if prompt.len() > MAX_PROMPT_LEN {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({"error": format!("System prompt exceeds max length ({MAX_PROMPT_LEN} chars)")})),
+            );
+        }
+    }
+
     // Validate color format if provided
     if let Some(ref color) = req.color {
         if !color.is_empty() && !color.starts_with('#') {
@@ -6947,6 +7110,13 @@ pub async fn clone_agent(
             );
         }
     };
+
+    if req.new_name.len() > 256 {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "Name exceeds max length (256 chars)"})),
+        );
+    }
 
     if req.new_name.trim().is_empty() {
         return (

@@ -268,38 +268,48 @@ fn parse_mastodon_notification(
 fn strip_html_tags(html: &str) -> String {
     let mut result = String::with_capacity(html.len());
     let mut in_tag = false;
+    let mut tag_buf = String::new();
 
     for ch in html.chars() {
         match ch {
             '<' => {
                 in_tag = true;
-                // Check if this is a <br> or </p> — insert newline
-                if html[result.len()..].starts_with("<br")
-                    || html[result.len()..].starts_with("</p")
+                tag_buf.clear();
+            }
+            '>' if in_tag => {
+                in_tag = false;
+                // Insert newline for block-level closing tags
+                let tag_lower = tag_buf.to_lowercase();
+                if tag_lower.starts_with("br")
+                    || tag_lower.starts_with("/p")
+                    || tag_lower.starts_with("/div")
+                    || tag_lower.starts_with("/li")
                 {
                     result.push('\n');
                 }
+                tag_buf.clear();
             }
-            '>' => {
-                in_tag = false;
+            _ if in_tag => {
+                tag_buf.push(ch);
             }
-            _ if !in_tag => {
+            _ => {
                 result.push(ch);
             }
-            _ => {}
         }
     }
 
-    // Decode common HTML entities
-    result
+    // Decode HTML entities
+    let decoded = result
         .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&apos;", "'")
-        .trim()
-        .to_string()
+        .replace("&#x27;", "'")
+        .replace("&nbsp;", " ");
+
+    decoded.trim().to_string()
 }
 
 #[async_trait]
@@ -575,6 +585,35 @@ mod tests {
     #[test]
     fn test_strip_html_tags_no_tags() {
         assert_eq!(strip_html_tags("plain text"), "plain text");
+    }
+
+    #[test]
+    fn test_strip_html_tags_emoji() {
+        assert_eq!(
+            strip_html_tags("<p>Hello 🦀🔥 world</p>"),
+            "Hello 🦀🔥 world"
+        );
+    }
+
+    #[test]
+    fn test_strip_html_tags_cjk() {
+        assert_eq!(
+            strip_html_tags("<p>你好 <strong>世界</strong></p>"),
+            "你好 世界"
+        );
+    }
+
+    #[test]
+    fn test_strip_html_tags_numeric_entities() {
+        assert_eq!(strip_html_tags("&#39;hello&#39;"), "'hello'");
+    }
+
+    #[test]
+    fn test_strip_html_tags_div_newline() {
+        assert_eq!(
+            strip_html_tags("<div>one</div><div>two</div>").trim(),
+            "one\ntwo"
+        );
     }
 
     #[test]

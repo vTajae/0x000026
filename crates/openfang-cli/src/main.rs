@@ -1332,7 +1332,23 @@ fn cmd_stop() {
             let client = daemon_client();
             match client.post(format!("{base}/api/shutdown")).send() {
                 Ok(r) if r.status().is_success() => {
-                    ui::success("Daemon is shutting down");
+                    // Wait for daemon to actually stop (up to 5 seconds)
+                    for _ in 0..10 {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        if find_daemon().is_none() {
+                            ui::success("Daemon stopped");
+                            return;
+                        }
+                    }
+                    // Still alive — force kill via PID
+                    if let Some(home) = dirs::home_dir() {
+                        let of_dir = home.join(".openfang");
+                        if let Some(info) = read_daemon_info(&of_dir) {
+                            force_kill_pid(info.pid);
+                            let _ = std::fs::remove_file(of_dir.join("daemon.json"));
+                        }
+                    }
+                    ui::success("Daemon stopped (forced)");
                 }
                 Ok(r) => {
                     ui::error(&format!("Shutdown request failed ({})", r.status()));
@@ -1348,6 +1364,21 @@ fn cmd_stop() {
                 "Is it running? Check with: openfang status",
             );
         }
+    }
+}
+
+fn force_kill_pid(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output();
     }
 }
 

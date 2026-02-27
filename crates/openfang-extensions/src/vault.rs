@@ -31,7 +31,6 @@ const SALT_LEN: usize = 16;
 /// Nonce length for AES-256-GCM.
 const NONCE_LEN: usize = 12;
 /// Magic bytes for vault file format versioning.
-#[allow(dead_code)]
 const VAULT_MAGIC: &[u8; 4] = b"OFV1";
 
 /// On-disk vault format (encrypted).
@@ -312,14 +311,34 @@ impl CredentialVault {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&self.path, content)?;
+
+        // Prepend OFV1 magic bytes for format detection
+        let mut output = Vec::with_capacity(VAULT_MAGIC.len() + content.len());
+        output.extend_from_slice(VAULT_MAGIC);
+        output.extend_from_slice(content.as_bytes());
+        std::fs::write(&self.path, output)?;
         Ok(())
     }
 
     /// Load and decrypt vault from disk.
     fn load(&mut self, master_key: &[u8; 32]) -> ExtensionResult<()> {
-        let content = std::fs::read_to_string(&self.path)?;
-        let vault_file: VaultFile = serde_json::from_str(&content)
+        let raw = std::fs::read(&self.path)?;
+
+        // Strip OFV1 magic header if present; legacy JSON files start with '{'
+        let content = if raw.starts_with(VAULT_MAGIC) {
+            std::str::from_utf8(&raw[VAULT_MAGIC.len()..])
+                .map_err(|e| ExtensionError::Vault(format!("UTF-8 decode failed: {e}")))?
+        } else if raw.first() == Some(&b'{') {
+            // Legacy JSON vault (no magic header)
+            std::str::from_utf8(&raw)
+                .map_err(|e| ExtensionError::Vault(format!("UTF-8 decode failed: {e}")))?
+        } else {
+            return Err(ExtensionError::Vault(
+                "Unrecognized vault file format".to_string(),
+            ));
+        };
+
+        let vault_file: VaultFile = serde_json::from_str(content)
             .map_err(|e| ExtensionError::Vault(format!("Vault file parse failed: {e}")))?;
 
         if vault_file.version != 1 {
@@ -589,5 +608,51 @@ mod tests {
         let k1 = derive_key(&master, &salt).unwrap();
         let k2 = derive_key(&master, &salt).unwrap();
         assert_eq!(k1.as_ref(), k2.as_ref());
+    }
+
+    #[test]
+    fn vault_file_has_magic_header() {
+        let (_dir, mut vault) = test_vault();
+        let key = random_key();
+        vault.init_with_key(key).unwrap();
+
+        let raw = std::fs::read(&vault.path).unwrap();
+        assert_eq!(&raw[..4], b"OFV1");
+    }
+
+    #[test]
+    fn vault_legacy_json_compat() {
+        let (dir, mut vault) = test_vault();
+        let key = random_key();
+        vault.init_with_key(key.clone()).unwrap();
+        vault
+            .set("KEY".to_string(), Zeroizing::new("val".to_string()))
+            .unwrap();
+
+        // Strip the OFV1 magic header to simulate a legacy vault file
+        let raw = std::fs::read(&vault.path).unwrap();
+        assert_eq!(&raw[..4], b"OFV1");
+        std::fs::write(&vault.path, &raw[4..]).unwrap();
+
+        // Should still load (legacy compat)
+        let mut vault2 = CredentialVault::new(dir.path().join("vault.enc"));
+        vault2.unlock_with_key(key).unwrap();
+        assert_eq!(vault2.get("KEY").unwrap().as_str(), "val");
+    }
+
+    #[test]
+    fn vault_rejects_bad_magic() {
+        let (dir, mut vault) = test_vault();
+        let key = random_key();
+        vault.init_with_key(key.clone()).unwrap();
+
+        // Overwrite with unrecognized binary data
+        std::fs::write(&vault.path, b"BAAD not json").unwrap();
+
+        let mut vault2 = CredentialVault::new(dir.path().join("vault.enc"));
+        let result = vault2.unlock_with_key(key);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("Unrecognized vault file format"));
     }
 }

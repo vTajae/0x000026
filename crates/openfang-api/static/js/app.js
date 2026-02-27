@@ -154,7 +154,12 @@ document.addEventListener('alpine:init', function() {
 function app() {
   return {
     page: 'agents',
-    theme: localStorage.getItem('openfang-theme') || 'light',
+    themeMode: localStorage.getItem('openfang-theme-mode') || 'system',
+    theme: (() => {
+      var mode = localStorage.getItem('openfang-theme-mode') || 'system';
+      if (mode === 'system') return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      return mode;
+    })(),
     sidebarCollapsed: localStorage.getItem('openfang-sidebar') === 'collapsed',
     mobileMenuOpen: false,
     connected: false,
@@ -166,6 +171,13 @@ function app() {
 
     init() {
       var self = this;
+
+      // Listen for OS theme changes (only matters when mode is 'system')
+      window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function(e) {
+        if (self.themeMode === 'system') {
+          self.theme = e.matches ? 'dark' : 'light';
+        }
+      });
 
       // Hash routing
       var validPages = ['overview','agents','sessions','approvals','workflows','scheduler','channels','skills','hands','analytics','logs','settings','wizard'];
@@ -234,9 +246,20 @@ function app() {
       this.mobileMenuOpen = false;
     },
 
+    setTheme(mode) {
+      this.themeMode = mode;
+      localStorage.setItem('openfang-theme-mode', mode);
+      if (mode === 'system') {
+        this.theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      } else {
+        this.theme = mode;
+      }
+    },
+
     toggleTheme() {
-      this.theme = this.theme === 'dark' ? 'light' : 'dark';
-      localStorage.setItem('openfang-theme', this.theme);
+      var modes = ['light', 'system', 'dark'];
+      var next = modes[(modes.indexOf(this.themeMode) + 1) % modes.length];
+      this.setTheme(next);
     },
 
     toggleSidebar() {

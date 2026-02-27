@@ -1111,6 +1111,9 @@ fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> String
         llm_errors::LlmErrorCategory::ModelNotFound => {
             "Model unavailable. Use /model to see options.".to_string()
         }
+        llm_errors::LlmErrorCategory::Format => {
+            "LLM request failed. Check your API key and model configuration in Settings.".to_string()
+        }
         _ => classified.sanitized_message,
     }
 }

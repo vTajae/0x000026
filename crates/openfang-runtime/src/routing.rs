@@ -149,7 +149,7 @@ impl ModelRouter {
 
     /// Resolve aliases in the routing config using the catalog.
     ///
-    /// For example, if "sonnet" is configured, resolves to "claude-sonnet-4-20250514".
+    /// For example, if "sonnet" is configured, resolves to "claude-sonnet-4-6".
     pub fn resolve_aliases(&mut self, catalog: &crate::model_catalog::ModelCatalog) {
         if let Some(resolved) = catalog.resolve_alias(&self.config.simple_model) {
             self.config.simple_model = resolved.to_string();
@@ -172,8 +172,8 @@ mod tests {
     fn default_config() -> ModelRoutingConfig {
         ModelRoutingConfig {
             simple_model: "llama-3.3-70b-versatile".to_string(),
-            medium_model: "claude-sonnet-4-20250514".to_string(),
-            complex_model: "claude-opus-4-20250514".to_string(),
+            medium_model: "claude-sonnet-4-6".to_string(),
+            complex_model: "claude-opus-4-6".to_string(),
             simple_threshold: 200,
             complex_threshold: 800,
         }
@@ -274,11 +274,11 @@ mod tests {
         );
         assert_eq!(
             router.model_for_complexity(TaskComplexity::Medium),
-            "claude-sonnet-4-20250514"
+            "claude-sonnet-4-6"
         );
         assert_eq!(
             router.model_for_complexity(TaskComplexity::Complex),
-            "claude-opus-4-20250514"
+            "claude-opus-4-6"
         );
     }
 
@@ -294,8 +294,8 @@ mod tests {
         let catalog = crate::model_catalog::ModelCatalog::new();
         let config = ModelRoutingConfig {
             simple_model: "llama-3.3-70b-versatile".to_string(),
-            medium_model: "claude-sonnet-4-20250514".to_string(),
-            complex_model: "claude-opus-4-20250514".to_string(),
+            medium_model: "claude-sonnet-4-6".to_string(),
+            complex_model: "claude-opus-4-6".to_string(),
             simple_threshold: 200,
             complex_threshold: 800,
         };
@@ -309,8 +309,8 @@ mod tests {
         let catalog = crate::model_catalog::ModelCatalog::new();
         let config = ModelRoutingConfig {
             simple_model: "unknown-model".to_string(),
-            medium_model: "claude-sonnet-4-20250514".to_string(),
-            complex_model: "claude-opus-4-20250514".to_string(),
+            medium_model: "claude-sonnet-4-6".to_string(),
+            complex_model: "claude-opus-4-6".to_string(),
             simple_threshold: 200,
             complex_threshold: 800,
         };
@@ -338,11 +338,11 @@ mod tests {
         );
         assert_eq!(
             router.model_for_complexity(TaskComplexity::Medium),
-            "claude-sonnet-4-20250514"
+            "claude-sonnet-4-6"
         );
         assert_eq!(
             router.model_for_complexity(TaskComplexity::Complex),
-            "claude-opus-4-20250514"
+            "claude-opus-4-6"
         );
     }
 

@@ -10,7 +10,7 @@ use openfang_types::model_catalog::{
     LMSTUDIO_BASE_URL, MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, OLLAMA_BASE_URL,
     OPENAI_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
     REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VLLM_BASE_URL, XAI_BASE_URL,
-    ZHIPU_BASE_URL,
+    ZHIPU_BASE_URL, ZHIPU_CODING_BASE_URL,
 };
 use std::collections::HashMap;
 
@@ -126,6 +126,28 @@ impl ModelCatalog {
     /// List all alias mappings.
     pub fn list_aliases(&self) -> &HashMap<String, String> {
         &self.aliases
+    }
+
+    /// Set a custom base URL for a provider, overriding the default.
+    ///
+    /// Returns `true` if the provider was found and updated.
+    pub fn set_provider_url(&mut self, provider: &str, url: &str) -> bool {
+        if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider) {
+            p.base_url = url.to_string();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply a batch of provider URL overrides from config.
+    ///
+    /// Each entry maps a provider ID to a custom base URL.
+    /// Unknown providers are silently skipped.
+    pub fn apply_url_overrides(&mut self, overrides: &HashMap<String, String>) {
+        for (provider, url) in overrides {
+            self.set_provider_url(provider, url);
+        }
     }
 
     /// List models filtered by tier.
@@ -414,6 +436,15 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             model_count: 0,
         },
         ProviderInfo {
+            id: "zhipu_coding".into(),
+            display_name: "Zhipu Coding (CodeGeeX)".into(),
+            api_key_env: "ZHIPU_API_KEY".into(),
+            base_url: ZHIPU_CODING_BASE_URL.into(),
+            key_required: true,
+            auth_status: AuthStatus::Missing,
+            model_count: 0,
+        },
+        ProviderInfo {
             id: "moonshot".into(),
             display_name: "Moonshot (Kimi)".into(),
             api_key_env: "MOONSHOT_API_KEY".into(),
@@ -446,18 +477,20 @@ fn builtin_providers() -> Vec<ProviderInfo> {
 
 fn builtin_aliases() -> HashMap<String, String> {
     let pairs = [
-        ("sonnet", "claude-sonnet-4-20250514"),
-        ("claude-sonnet", "claude-sonnet-4-20250514"),
+        ("sonnet", "claude-sonnet-4-6"),
+        ("claude-sonnet", "claude-sonnet-4-6"),
         ("haiku", "claude-haiku-4-5-20251001"),
         ("claude-haiku", "claude-haiku-4-5-20251001"),
-        ("opus", "claude-opus-4-20250514"),
-        ("claude-opus", "claude-opus-4-20250514"),
+        ("opus", "claude-opus-4-6"),
+        ("claude-opus", "claude-opus-4-6"),
         ("gpt4", "gpt-4o"),
         ("gpt4o", "gpt-4o"),
         ("gpt4-mini", "gpt-4o-mini"),
-        ("flash", "gemini-2.5-flash"),
-        ("gemini-flash", "gemini-2.5-flash"),
-        ("gemini-pro", "gemini-2.5-pro"),
+        ("gpt5", "gpt-5.2"),
+        ("gpt5-mini", "gpt-5-mini"),
+        ("flash", "gemini-3-flash"),
+        ("gemini-flash", "gemini-3-flash"),
+        ("gemini-pro", "gemini-3.1-pro"),
         ("deepseek", "deepseek-chat"),
         ("llama", "llama-3.3-70b-versatile"),
         ("llama-70b", "llama-3.3-70b-versatile"),
@@ -471,9 +504,10 @@ fn builtin_aliases() -> HashMap<String, String> {
         ("mistral-nemo", "open-mistral-nemo"),
         ("pixtral", "pixtral-large-latest"),
         // xAI aliases
-        ("grok", "grok-2"),
+        ("grok", "grok-4"),
         ("grok-mini", "grok-2-mini"),
         ("grok3", "grok-3"),
+        ("grok-fast", "grok-4.1-fast"),
         // Perplexity alias
         ("sonar", "sonar-pro"),
         // AI21 aliases
@@ -493,6 +527,7 @@ fn builtin_aliases() -> HashMap<String, String> {
         ("ernie", "ernie-4.5-8k"),
         ("kimi", "moonshot-v1-128k"),
         ("minimax", "minimax-text-01"),
+        ("codegeex", "codegeex-4"),
     ];
     pairs
         .into_iter()
@@ -503,8 +538,36 @@ fn builtin_aliases() -> HashMap<String, String> {
 fn builtin_models() -> Vec<ModelCatalogEntry> {
     vec![
         // ══════════════════════════════════════════════════════════════
-        // Anthropic (5)
+        // Anthropic (7)
         // ══════════════════════════════════════════════════════════════
+        ModelCatalogEntry {
+            id: "claude-opus-4-6".into(),
+            display_name: "Claude Opus 4.6".into(),
+            provider: "anthropic".into(),
+            tier: ModelTier::Frontier,
+            context_window: 200_000,
+            max_output_tokens: 128_000,
+            input_cost_per_m: 5.0,
+            output_cost_per_m: 25.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["opus".into(), "claude-opus".into()],
+        },
+        ModelCatalogEntry {
+            id: "claude-sonnet-4-6".into(),
+            display_name: "Claude Sonnet 4.6".into(),
+            provider: "anthropic".into(),
+            tier: ModelTier::Smart,
+            context_window: 200_000,
+            max_output_tokens: 64_000,
+            input_cost_per_m: 3.0,
+            output_cost_per_m: 15.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["sonnet".into(), "claude-sonnet".into()],
+        },
         ModelCatalogEntry {
             id: "claude-opus-4-20250514".into(),
             display_name: "Claude Opus 4".into(),
@@ -517,7 +580,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_tools: true,
             supports_vision: true,
             supports_streaming: true,
-            aliases: vec!["opus".into(), "claude-opus".into()],
+            aliases: vec![],
         },
         ModelCatalogEntry {
             id: "claude-sonnet-4-20250514".into(),
@@ -531,7 +594,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_tools: true,
             supports_vision: true,
             supports_streaming: true,
-            aliases: vec!["sonnet".into(), "claude-sonnet".into()],
+            aliases: vec![],
         },
         ModelCatalogEntry {
             id: "claude-haiku-4-5-20251001".into(),
@@ -576,7 +639,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec![],
         },
         // ══════════════════════════════════════════════════════════════
-        // OpenAI (10)
+        // OpenAI (16)
         // ══════════════════════════════════════════════════════════════
         ModelCatalogEntry {
             id: "gpt-4o".into(),
@@ -718,9 +781,149 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
+        ModelCatalogEntry {
+            id: "gpt-5".into(),
+            display_name: "GPT-5".into(),
+            provider: "openai".into(),
+            tier: ModelTier::Frontier,
+            context_window: 400_000,
+            max_output_tokens: 128_000,
+            input_cost_per_m: 1.25,
+            output_cost_per_m: 10.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "gpt-5-mini".into(),
+            display_name: "GPT-5 Mini".into(),
+            provider: "openai".into(),
+            tier: ModelTier::Balanced,
+            context_window: 400_000,
+            max_output_tokens: 128_000,
+            input_cost_per_m: 0.25,
+            output_cost_per_m: 2.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["gpt5-mini".into()],
+        },
+        ModelCatalogEntry {
+            id: "gpt-5-nano".into(),
+            display_name: "GPT-5 Nano".into(),
+            provider: "openai".into(),
+            tier: ModelTier::Fast,
+            context_window: 400_000,
+            max_output_tokens: 128_000,
+            input_cost_per_m: 0.05,
+            output_cost_per_m: 0.40,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "gpt-5.1".into(),
+            display_name: "GPT-5.1".into(),
+            provider: "openai".into(),
+            tier: ModelTier::Frontier,
+            context_window: 400_000,
+            max_output_tokens: 128_000,
+            input_cost_per_m: 1.25,
+            output_cost_per_m: 10.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "gpt-5.2".into(),
+            display_name: "GPT-5.2".into(),
+            provider: "openai".into(),
+            tier: ModelTier::Frontier,
+            context_window: 400_000,
+            max_output_tokens: 128_000,
+            input_cost_per_m: 1.75,
+            output_cost_per_m: 14.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["gpt5".into()],
+        },
+        ModelCatalogEntry {
+            id: "gpt-5.2-pro".into(),
+            display_name: "GPT-5.2 Pro".into(),
+            provider: "openai".into(),
+            tier: ModelTier::Frontier,
+            context_window: 400_000,
+            max_output_tokens: 128_000,
+            input_cost_per_m: 1.75,
+            output_cost_per_m: 14.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
         // ══════════════════════════════════════════════════════════════
-        // Google Gemini (6)
+        // Google Gemini (10)
         // ══════════════════════════════════════════════════════════════
+        ModelCatalogEntry {
+            id: "gemini-3.1-pro".into(),
+            display_name: "Gemini 3.1 Pro".into(),
+            provider: "gemini".into(),
+            tier: ModelTier::Frontier,
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+            input_cost_per_m: 2.50,
+            output_cost_per_m: 15.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["gemini-pro".into()],
+        },
+        ModelCatalogEntry {
+            id: "gemini-3-flash".into(),
+            display_name: "Gemini 3 Flash".into(),
+            provider: "gemini".into(),
+            tier: ModelTier::Smart,
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+            input_cost_per_m: 0.50,
+            output_cost_per_m: 3.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["flash".into(), "gemini-flash".into()],
+        },
+        ModelCatalogEntry {
+            id: "gemini-3-deep-think".into(),
+            display_name: "Gemini 3 Deep Think".into(),
+            provider: "gemini".into(),
+            tier: ModelTier::Frontier,
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+            input_cost_per_m: 2.50,
+            output_cost_per_m: 15.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "gemini-2.5-flash-lite".into(),
+            display_name: "Gemini 2.5 Flash Lite".into(),
+            provider: "gemini".into(),
+            tier: ModelTier::Fast,
+            context_window: 1_048_576,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.04,
+            output_cost_per_m: 0.15,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
         ModelCatalogEntry {
             id: "gemini-2.5-pro".into(),
             display_name: "Gemini 2.5 Pro".into(),
@@ -733,7 +936,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_tools: true,
             supports_vision: true,
             supports_streaming: true,
-            aliases: vec!["gemini-pro".into()],
+            aliases: vec![],
         },
         ModelCatalogEntry {
             id: "gemini-2.5-flash".into(),
@@ -747,7 +950,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_tools: true,
             supports_vision: true,
             supports_streaming: true,
-            aliases: vec!["flash".into(), "gemini-flash".into()],
+            aliases: vec![],
         },
         ModelCatalogEntry {
             id: "gemini-2.0-flash".into(),
@@ -865,7 +1068,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec![],
         },
         // ══════════════════════════════════════════════════════════════
-        // Groq (10)
+        // Groq (11)
         // ══════════════════════════════════════════════════════════════
         ModelCatalogEntry {
             id: "llama-3.3-70b-versatile".into(),
@@ -1004,6 +1207,20 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             output_cost_per_m: 0.20,
             supports_tools: true,
             supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "meta-llama/llama-4-scout-17b-16e-instruct".into(),
+            display_name: "Llama 4 Scout 17B".into(),
+            provider: "groq".into(),
+            tier: ModelTier::Balanced,
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.11,
+            output_cost_per_m: 0.34,
+            supports_tools: true,
+            supports_vision: true,
             supports_streaming: true,
             aliases: vec![],
         },
@@ -1744,8 +1961,36 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec![],
         },
         // ══════════════════════════════════════════════════════════════
-        // xAI (4)
+        // xAI (6)
         // ══════════════════════════════════════════════════════════════
+        ModelCatalogEntry {
+            id: "grok-4".into(),
+            display_name: "Grok 4".into(),
+            provider: "xai".into(),
+            tier: ModelTier::Frontier,
+            context_window: 256_000,
+            max_output_tokens: 32_768,
+            input_cost_per_m: 3.0,
+            output_cost_per_m: 15.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["grok".into()],
+        },
+        ModelCatalogEntry {
+            id: "grok-4.1-fast".into(),
+            display_name: "Grok 4.1 Fast".into(),
+            provider: "xai".into(),
+            tier: ModelTier::Fast,
+            context_window: 2_000_000,
+            max_output_tokens: 32_768,
+            input_cost_per_m: 0.20,
+            output_cost_per_m: 0.50,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec!["grok-fast".into()],
+        },
         ModelCatalogEntry {
             id: "grok-3".into(),
             display_name: "Grok 3".into(),
@@ -1758,7 +2003,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_tools: true,
             supports_vision: true,
             supports_streaming: true,
-            aliases: vec![],
+            aliases: vec!["grok3".into()],
         },
         ModelCatalogEntry {
             id: "grok-3-mini".into(),
@@ -1786,7 +2031,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_tools: true,
             supports_vision: true,
             supports_streaming: true,
-            aliases: vec!["grok".into()],
+            aliases: vec![],
         },
         ModelCatalogEntry {
             id: "grok-2-mini".into(),
@@ -2115,6 +2360,23 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec![],
         },
         // ══════════════════════════════════════════════════════════════
+        // Zhipu Coding / CodeGeeX (1)
+        // ══════════════════════════════════════════════════════════════
+        ModelCatalogEntry {
+            id: "codegeex-4".into(),
+            display_name: "CodeGeeX 4".into(),
+            provider: "zhipu_coding".into(),
+            tier: ModelTier::Smart,
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.10,
+            output_cost_per_m: 0.10,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec!["codegeex".into()],
+        },
+        // ══════════════════════════════════════════════════════════════
         // Moonshot / Kimi (3)
         // ══════════════════════════════════════════════════════════════
         ModelCatalogEntry {
@@ -2205,8 +2467,36 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec![],
         },
         // ══════════════════════════════════════════════════════════════
-        // AWS Bedrock (6)
+        // AWS Bedrock (8)
         // ══════════════════════════════════════════════════════════════
+        ModelCatalogEntry {
+            id: "bedrock/anthropic.claude-opus-4-6".into(),
+            display_name: "Claude Opus 4.6 (Bedrock)".into(),
+            provider: "bedrock".into(),
+            tier: ModelTier::Frontier,
+            context_window: 200_000,
+            max_output_tokens: 128_000,
+            input_cost_per_m: 5.00,
+            output_cost_per_m: 25.00,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "bedrock/anthropic.claude-sonnet-4-6".into(),
+            display_name: "Claude Sonnet 4.6 (Bedrock)".into(),
+            provider: "bedrock".into(),
+            tier: ModelTier::Smart,
+            context_window: 200_000,
+            max_output_tokens: 64_000,
+            input_cost_per_m: 3.00,
+            output_cost_per_m: 15.00,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
         ModelCatalogEntry {
             id: "bedrock/anthropic.claude-opus-4-20250514".into(),
             display_name: "Claude Opus 4 (Bedrock)".into(),
@@ -2307,7 +2597,7 @@ mod tests {
     #[test]
     fn test_catalog_has_providers() {
         let catalog = ModelCatalog::new();
-        assert_eq!(catalog.list_providers().len(), 27);
+        assert_eq!(catalog.list_providers().len(), 28);
     }
 
     #[test]
@@ -2323,7 +2613,7 @@ mod tests {
     fn test_find_model_by_alias() {
         let catalog = ModelCatalog::new();
         let entry = catalog.find_model("sonnet").unwrap();
-        assert_eq!(entry.id, "claude-sonnet-4-20250514");
+        assert_eq!(entry.id, "claude-sonnet-4-6");
     }
 
     #[test]
@@ -2344,7 +2634,7 @@ mod tests {
         let catalog = ModelCatalog::new();
         assert_eq!(
             catalog.resolve_alias("sonnet"),
-            Some("claude-sonnet-4-20250514")
+            Some("claude-sonnet-4-6")
         );
         assert_eq!(
             catalog.resolve_alias("haiku"),
@@ -2357,7 +2647,7 @@ mod tests {
     fn test_models_by_provider() {
         let catalog = ModelCatalog::new();
         let anthropic = catalog.models_by_provider("anthropic");
-        assert_eq!(anthropic.len(), 5);
+        assert_eq!(anthropic.len(), 7);
         assert!(anthropic.iter().all(|m| m.provider == "anthropic"));
     }
 
@@ -2415,9 +2705,9 @@ mod tests {
     fn test_provider_model_counts() {
         let catalog = ModelCatalog::new();
         let anthropic = catalog.get_provider("anthropic").unwrap();
-        assert_eq!(anthropic.model_count, 5);
+        assert_eq!(anthropic.model_count, 7);
         let groq = catalog.get_provider("groq").unwrap();
-        assert_eq!(groq.model_count, 10);
+        assert_eq!(groq.model_count, 11);
     }
 
     #[test]
@@ -2425,9 +2715,9 @@ mod tests {
         let catalog = ModelCatalog::new();
         let aliases = catalog.list_aliases();
         assert!(aliases.len() >= 20);
-        assert_eq!(aliases.get("sonnet").unwrap(), "claude-sonnet-4-20250514");
+        assert_eq!(aliases.get("sonnet").unwrap(), "claude-sonnet-4-6");
         // New aliases
-        assert_eq!(aliases.get("grok").unwrap(), "grok-2");
+        assert_eq!(aliases.get("grok").unwrap(), "grok-4");
         assert_eq!(aliases.get("jamba").unwrap(), "jamba-1.5-large");
     }
 
@@ -2435,7 +2725,7 @@ mod tests {
     fn test_find_grok_by_alias() {
         let catalog = ModelCatalog::new();
         let entry = catalog.find_model("grok").unwrap();
-        assert_eq!(entry.id, "grok-2");
+        assert_eq!(entry.id, "grok-4");
         assert_eq!(entry.provider, "xai");
     }
 
@@ -2456,11 +2746,13 @@ mod tests {
     fn test_xai_models() {
         let catalog = ModelCatalog::new();
         let xai = catalog.models_by_provider("xai");
-        assert_eq!(xai.len(), 4);
-        assert!(xai.iter().any(|m| m.id == "grok-2"));
-        assert!(xai.iter().any(|m| m.id == "grok-2-mini"));
+        assert_eq!(xai.len(), 6);
+        assert!(xai.iter().any(|m| m.id == "grok-4"));
+        assert!(xai.iter().any(|m| m.id == "grok-4.1-fast"));
         assert!(xai.iter().any(|m| m.id == "grok-3"));
         assert!(xai.iter().any(|m| m.id == "grok-3-mini"));
+        assert!(xai.iter().any(|m| m.id == "grok-2"));
+        assert!(xai.iter().any(|m| m.id == "grok-2-mini"));
     }
 
     #[test]
@@ -2525,6 +2817,7 @@ mod tests {
         assert!(catalog.get_provider("qwen").is_some());
         assert!(catalog.get_provider("minimax").is_some());
         assert!(catalog.get_provider("zhipu").is_some());
+        assert!(catalog.get_provider("zhipu_coding").is_some());
         assert!(catalog.get_provider("moonshot").is_some());
         assert!(catalog.get_provider("qianfan").is_some());
         assert!(catalog.get_provider("bedrock").is_some());
@@ -2535,6 +2828,7 @@ mod tests {
         let catalog = ModelCatalog::new();
         assert!(catalog.find_model("kimi").is_some());
         assert!(catalog.find_model("glm").is_some());
+        assert!(catalog.find_model("codegeex").is_some());
         assert!(catalog.find_model("ernie").is_some());
         assert!(catalog.find_model("minimax").is_some());
     }
@@ -2543,6 +2837,52 @@ mod tests {
     fn test_bedrock_models() {
         let catalog = ModelCatalog::new();
         let bedrock = catalog.models_by_provider("bedrock");
-        assert_eq!(bedrock.len(), 6);
+        assert_eq!(bedrock.len(), 8);
+    }
+
+    #[test]
+    fn test_set_provider_url() {
+        let mut catalog = ModelCatalog::new();
+        let old_url = catalog.get_provider("ollama").unwrap().base_url.clone();
+        assert_eq!(old_url, OLLAMA_BASE_URL);
+
+        let updated = catalog.set_provider_url("ollama", "http://192.168.1.100:11434/v1");
+        assert!(updated);
+        assert_eq!(
+            catalog.get_provider("ollama").unwrap().base_url,
+            "http://192.168.1.100:11434/v1"
+        );
+    }
+
+    #[test]
+    fn test_set_provider_url_unknown() {
+        let mut catalog = ModelCatalog::new();
+        let updated = catalog.set_provider_url("nonexistent", "http://localhost:9999");
+        assert!(!updated);
+    }
+
+    #[test]
+    fn test_apply_url_overrides() {
+        let mut catalog = ModelCatalog::new();
+        let mut overrides = HashMap::new();
+        overrides.insert("ollama".to_string(), "http://10.0.0.5:11434/v1".to_string());
+        overrides.insert("vllm".to_string(), "http://10.0.0.6:8000/v1".to_string());
+        overrides.insert("nonexistent".to_string(), "http://nowhere".to_string());
+
+        catalog.apply_url_overrides(&overrides);
+
+        assert_eq!(
+            catalog.get_provider("ollama").unwrap().base_url,
+            "http://10.0.0.5:11434/v1"
+        );
+        assert_eq!(
+            catalog.get_provider("vllm").unwrap().base_url,
+            "http://10.0.0.6:8000/v1"
+        );
+        // lmstudio should be unchanged
+        assert_eq!(
+            catalog.get_provider("lmstudio").unwrap().base_url,
+            LMSTUDIO_BASE_URL
+        );
     }
 }

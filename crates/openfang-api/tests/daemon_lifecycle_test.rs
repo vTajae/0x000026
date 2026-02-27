@@ -112,6 +112,7 @@ async fn test_full_daemon_lifecycle() {
         peer_registry: None,
         bridge_manager: tokio::sync::Mutex::new(None),
         channels_config: tokio::sync::RwLock::new(Default::default()),
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
     });
 
     let app = Router::new()
@@ -234,6 +235,7 @@ async fn test_server_immediate_responsiveness() {
         peer_registry: None,
         bridge_manager: tokio::sync::Mutex::new(None),
         channels_config: tokio::sync::RwLock::new(Default::default()),
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
     });
 
     let app = Router::new()

@@ -15,6 +15,8 @@ function settingsPage() {
     modelProviderFilter: '',
     modelTierFilter: '',
     providerKeyInputs: {},
+    providerUrlInputs: {},
+    providerUrlSaving: {},
     providerTesting: {},
     providerTestResults: {},
     loading: true,
@@ -208,6 +210,12 @@ function settingsPage() {
       try {
         var data = await OpenFangAPI.get('/api/providers');
         this.providers = data.providers || [];
+        for (var i = 0; i < this.providers.length; i++) {
+          var p = this.providers[i];
+          if (p.is_local && p.base_url && !this.providerUrlInputs[p.id]) {
+            this.providerUrlInputs[p.id] = p.base_url;
+          }
+        }
       } catch(e) { this.providers = []; }
     },
 
@@ -376,6 +384,28 @@ function settingsPage() {
         OpenFangToast.error('Test failed: ' + e.message);
       }
       this.providerTesting[provider.id] = false;
+    },
+
+    async saveProviderUrl(provider) {
+      var url = this.providerUrlInputs[provider.id];
+      if (!url || !url.trim()) { OpenFangToast.error('Please enter a base URL'); return; }
+      url = url.trim();
+      if (url.indexOf('http://') !== 0 && url.indexOf('https://') !== 0) {
+        OpenFangToast.error('URL must start with http:// or https://'); return;
+      }
+      this.providerUrlSaving[provider.id] = true;
+      try {
+        var result = await OpenFangAPI.put('/api/providers/' + encodeURIComponent(provider.id) + '/url', { base_url: url });
+        if (result.reachable) {
+          OpenFangToast.success(provider.display_name + ' URL saved &mdash; reachable (' + (result.latency_ms || '?') + 'ms)');
+        } else {
+          OpenFangToast.warning(provider.display_name + ' URL saved but not reachable');
+        }
+        await this.loadProviders();
+      } catch(e) {
+        OpenFangToast.error('Failed to save URL: ' + e.message);
+      }
+      this.providerUrlSaving[provider.id] = false;
     },
 
     // -- Security methods --

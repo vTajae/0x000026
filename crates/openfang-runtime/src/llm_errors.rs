@@ -331,15 +331,20 @@ pub fn sanitize_for_user(category: LlmErrorCategory, _raw: &str) -> String {
             "The conversation is too long for the model's context window."
         }
         LlmErrorCategory::Format => {
-            "Invalid request format. This may be a bug \u{2014} please report it."
+            "LLM request failed. Check your API key and model configuration in Settings."
         }
         LlmErrorCategory::ModelNotFound => {
             "The requested model was not found. Check the model name."
         }
     };
     // Cap at 200 chars (all built-in messages are under 200, but defensive).
-    if msg.len() > 200 {
-        format!("{}...", &msg[..197])
+    if msg.chars().count() > 200 {
+        let end = msg
+            .char_indices()
+            .nth(197)
+            .map(|(i, _)| i)
+            .unwrap_or(msg.len());
+        format!("{}...", &msg[..end])
     } else {
         msg.to_string()
     }

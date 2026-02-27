@@ -20,17 +20,40 @@ function Write-Banner {
 }
 
 function Get-Architecture {
+    # Try multiple detection methods — piped iex can break some approaches
+    $arch = ""
+
+    # Method 1: .NET RuntimeInformation
     try {
-        $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
-    } catch {
-        # PowerShell 5.1 fallback
-        $arch = $env:PROCESSOR_ARCHITECTURE
+        $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    } catch {}
+
+    # Method 2: PROCESSOR_ARCHITECTURE env var
+    if (-not $arch -or $arch -eq "") {
+        try { $arch = $env:PROCESSOR_ARCHITECTURE } catch {}
     }
-    switch ($arch) {
-        { $_ -in "X64", "AMD64" }  { return "x86_64" }
-        { $_ -in "Arm64", "ARM64" } { return "aarch64" }
+
+    # Method 3: WMI
+    if (-not $arch -or $arch -eq "") {
+        try {
+            $wmiArch = (Get-CimInstance Win32_Processor).Architecture
+            if ($wmiArch -eq 9) { $arch = "AMD64" }
+            elseif ($wmiArch -eq 12) { $arch = "ARM64" }
+        } catch {}
+    }
+
+    # Method 4: pointer size fallback (64-bit = 8 bytes)
+    if (-not $arch -or $arch -eq "") {
+        if ([IntPtr]::Size -eq 8) { $arch = "X64" }
+    }
+
+    $archUpper = "$arch".ToUpper().Trim()
+    switch ($archUpper) {
+        { $_ -in "X64", "AMD64", "X86_64" }     { return "x86_64" }
+        { $_ -in "ARM64", "AARCH64", "ARM" }     { return "aarch64" }
         default {
-            Write-Host "  Unsupported architecture: $arch" -ForegroundColor Red
+            Write-Host "  Unsupported architecture: $arch (detection may have failed)" -ForegroundColor Red
+            Write-Host "  Try: cargo install --git https://github.com/RightNow-AI/openfang openfang-cli" -ForegroundColor Yellow
             exit 1
         }
     }
