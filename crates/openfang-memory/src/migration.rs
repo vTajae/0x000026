@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -37,6 +37,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 7 {
         migrate_v7(conn)?;
+    }
+
+    if current_version < 8 {
+        migrate_v8(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -294,6 +298,19 @@ fn migrate_v7(conn: &Connection) -> Result<(), rusqlite::Error> {
 
         INSERT OR IGNORE INTO migrations (version, applied_at, description)
         VALUES (7, datetime('now'), 'Add paired_devices table for device pairing');
+        ",
+    )?;
+    Ok(())
+}
+
+/// Version 8: Add entity name+type index for fast find-or-create lookups.
+fn migrate_v8(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_entities_name_type ON entities(name, entity_type);
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (8, datetime('now'), 'Add entity name+type index for knowledge graph dedup');
         ",
     )?;
     Ok(())

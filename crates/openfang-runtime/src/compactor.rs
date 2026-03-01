@@ -46,6 +46,52 @@ pub struct CompactionConfig {
     pub context_window_tokens: usize,
 }
 
+impl CompactionConfig {
+    /// Create a compaction config tuned for a specific context window size.
+    ///
+    /// Local LLMs with small context windows (8K-32K) need much more aggressive
+    /// compaction than cloud models with 200K windows.
+    pub fn for_context_window(window_tokens: usize) -> Self {
+        if window_tokens <= 32_768 {
+            // Aggressive: compact early, keep less, trigger at 50% fill
+            Self {
+                threshold: 15,
+                keep_recent: 5,
+                max_summary_tokens: 512,
+                base_chunk_ratio: 0.3,
+                min_chunk_ratio: 0.1,
+                safety_margin: 1.3,
+                summarization_overhead_tokens: 2048,
+                max_chunk_chars: 20_000,
+                max_retries: 2,
+                token_threshold_ratio: 0.5,
+                context_window_tokens: window_tokens,
+            }
+        } else if window_tokens <= 65_536 {
+            // Moderate: compact at reasonable thresholds
+            Self {
+                threshold: 20,
+                keep_recent: 8,
+                max_summary_tokens: 768,
+                base_chunk_ratio: 0.35,
+                min_chunk_ratio: 0.12,
+                safety_margin: 1.25,
+                summarization_overhead_tokens: 3072,
+                max_chunk_chars: 40_000,
+                max_retries: 3,
+                token_threshold_ratio: 0.6,
+                context_window_tokens: window_tokens,
+            }
+        } else {
+            // Large context: default behavior
+            Self {
+                context_window_tokens: window_tokens,
+                ..Default::default()
+            }
+        }
+    }
+}
+
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
@@ -223,6 +269,26 @@ pub fn generate_context_report(
     let cw = context_window.max(1);
     let pct = (total as f64 / cw as f64 * 100.0).min(100.0);
     let pressure = ContextPressure::from_percent(pct);
+
+    match pressure {
+        ContextPressure::High => {
+            warn!(
+                pct = format!("{pct:.1}"),
+                total_tokens = total,
+                context_window = cw,
+                "Context pressure HIGH — compaction recommended"
+            );
+        }
+        ContextPressure::Critical => {
+            warn!(
+                pct = format!("{pct:.1}"),
+                total_tokens = total,
+                context_window = cw,
+                "Context pressure CRITICAL — compaction urgently needed"
+            );
+        }
+        _ => {}
+    }
 
     let recommendation = match pressure {
         ContextPressure::Low => "Context usage is healthy.".to_string(),
@@ -599,6 +665,107 @@ async fn summarize_in_chunks(
 /// 3. **Minimal fallback**: if LLM is unavailable, produces a placeholder note
 ///
 /// Returns the summary, the kept messages, and metadata about the operation.
+/// Extract facts from messages about to be compacted and store them in the knowledge graph.
+/// This ensures knowledge isn't lost when context is pruned.
+pub fn pre_compaction_fact_extraction(
+    messages: &[Message],
+    memory: &openfang_memory::MemorySubstrate,
+) {
+    use openfang_memory::knowledge::extract_facts_from_text;
+
+    // Concatenate all message text
+    let mut text = String::new();
+    for msg in messages {
+        let msg_text = match &msg.content {
+            MessageContent::Text(t) => t.clone(),
+            MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        if !msg_text.is_empty() {
+            text.push(' ');
+            text.push_str(&msg_text);
+        }
+    }
+
+    if text.len() < 50 {
+        return;
+    }
+
+    let facts = extract_facts_from_text(&text);
+    if facts.is_empty() {
+        return;
+    }
+
+    info!(
+        count = facts.len(),
+        "Pre-compaction: extracted {} knowledge graph facts from {} messages",
+        facts.len(),
+        messages.len()
+    );
+
+    // Store each fact as a knowledge graph triple
+    for fact in &facts {
+        let subject = openfang_types::memory::Entity {
+            id: String::new(),
+            entity_type: fact.subject_type.clone(),
+            name: fact.subject_name.clone(),
+            properties: std::collections::HashMap::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let object = openfang_types::memory::Entity {
+            id: String::new(),
+            entity_type: fact.object_type.clone(),
+            name: fact.object_name.clone(),
+            properties: std::collections::HashMap::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        if let (Ok(subj_id), Ok(obj_id)) = (
+            memory.knowledge_find_or_create(subject),
+            memory.knowledge_find_or_create(object),
+        ) {
+            let relation = openfang_types::memory::Relation {
+                source: subj_id,
+                relation: fact.relation.clone(),
+                target: obj_id,
+                properties: std::collections::HashMap::new(),
+                confidence: fact.confidence,
+                created_at: chrono::Utc::now(),
+            };
+            // Synchronous add_relation via knowledge store
+            let _ = memory.add_relation_sync(relation);
+        }
+    }
+
+    // Also store a procedural memory summarizing extracted facts (near-zero decay)
+    let summary: Vec<String> = facts
+        .iter()
+        .map(|f| format!("{} -> {} -> {}", f.subject_name, serde_json::to_string(&f.relation).unwrap_or_default(), f.object_name))
+        .collect();
+    if !summary.is_empty() {
+        let content = format!("Pre-compaction facts: {}", summary.join("; "));
+        // Use a fixed shared agent ID for cross-agent procedural knowledge
+        let shared_id = openfang_types::agent::AgentId(uuid::Uuid::from_bytes([
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+        ]));
+        let _ = memory.remember_sync(
+            shared_id,
+            &content,
+            openfang_types::memory::MemorySource::System,
+            "procedural",
+            std::collections::HashMap::new(),
+        );
+    }
+}
+
 pub async fn compact_session(
     driver: Arc<dyn LlmDriver>,
     model: &str,

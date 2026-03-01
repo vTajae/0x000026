@@ -42,11 +42,22 @@ pub trait KernelHandle: Send + Sync {
     /// Kill an agent by ID.
     fn kill_agent(&self, agent_id: &str) -> Result<(), String>;
 
-    /// Store a value in shared memory (cross-agent accessible).
-    fn memory_store(&self, key: &str, value: serde_json::Value) -> Result<(), String>;
+    /// Store a value in memory, scoped to `caller_agent_id`.
+    /// If `caller_agent_id` is empty or invalid, falls back to the shared namespace.
+    fn memory_store(
+        &self,
+        caller_agent_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<(), String>;
 
-    /// Recall a value from shared memory.
-    fn memory_recall(&self, key: &str) -> Result<Option<serde_json::Value>, String>;
+    /// Recall a value from memory, scoped to `caller_agent_id`.
+    /// If `caller_agent_id` is empty or invalid, falls back to the shared namespace.
+    fn memory_recall(
+        &self,
+        caller_agent_id: &str,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, String>;
 
     /// Find agents by query (matches on name substring, tag, or tool name; case-insensitive).
     fn find_agents(&self, query: &str) -> Vec<AgentInfo>;
@@ -185,5 +196,15 @@ pub trait KernelHandle: Send + Sync {
         // The kernel MUST override this with real enforcement
         let _ = parent_caps;
         self.spawn_agent(manifest_toml, parent_id).await
+    }
+
+    /// Record a model observation for the performance scoring ledger.
+    fn record_model_observation(
+        &self,
+        model_id: &str,
+        observation: crate::model_scoring::ModelObservation,
+    ) {
+        let _ = (model_id, observation);
+        // Default: no-op. Kernel overrides with real ledger.
     }
 }

@@ -314,6 +314,189 @@ impl MemorySubstrate {
     }
 
     // -----------------------------------------------------------------
+    // Shared semantic memory promotion
+    // -----------------------------------------------------------------
+
+    /// Well-known agent ID for the shared semantic memory pool.
+    pub fn shared_semantic_agent_id() -> AgentId {
+        AgentId(uuid::Uuid::from_bytes([
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02,
+        ]))
+    }
+
+    /// Promote a memory to the shared semantic pool.
+    ///
+    /// If a similar memory already exists (cosine similarity > 0.85),
+    /// the existing memory is boosted instead of creating a duplicate.
+    pub fn promote_to_shared(
+        &self,
+        content: &str,
+        source: MemorySource,
+        metadata: HashMap<String, serde_json::Value>,
+        embedding: Option<&[f32]>,
+    ) -> OpenFangResult<MemoryId> {
+        let shared_id = Self::shared_semantic_agent_id();
+
+        // Dedup check: see if a similar memory already exists in the shared pool
+        if let Some(query_emb) = embedding {
+            let existing = self.semantic.recall_with_embedding(
+                "",
+                10,
+                Some(MemoryFilter {
+                    agent_id: Some(shared_id),
+                    ..Default::default()
+                }),
+                Some(query_emb),
+            )?;
+
+            for mem in &existing {
+                if let Some(ref mem_emb) = mem.embedding {
+                    let sim = crate::semantic::cosine_similarity(query_emb, mem_emb);
+                    if sim > 0.85 {
+                        // Boost existing memory instead of duplicating
+                        let conn = self
+                            .conn
+                            .lock()
+                            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+                        let now = chrono::Utc::now().to_rfc3339();
+                        if let Err(e) = conn.execute(
+                            "UPDATE memories SET access_count = access_count + 1, accessed_at = ?1, confidence = MIN(1.0, confidence + 0.05) WHERE id = ?2",
+                            rusqlite::params![now, mem.id.0.to_string()],
+                        ) {
+                            tracing::warn!(error = %e, id = %mem.id, "Failed to boost shared memory");
+                        }
+                        tracing::debug!(
+                            sim = sim,
+                            existing_id = %mem.id,
+                            "Boosted existing shared memory instead of promoting duplicate"
+                        );
+                        return Ok(mem.id);
+                    }
+                }
+            }
+        }
+
+        // No duplicate found — store as new shared memory
+        self.semantic.remember_with_embedding(
+            shared_id,
+            content,
+            source,
+            "semantic",
+            metadata,
+            embedding,
+        )
+    }
+
+    /// Async wrapper for `promote_to_shared`.
+    pub async fn promote_to_shared_async(
+        &self,
+        content: &str,
+        source: MemorySource,
+        metadata: HashMap<String, serde_json::Value>,
+        embedding: Option<&[f32]>,
+    ) -> OpenFangResult<MemoryId> {
+        let store = self.semantic.clone();
+        let conn = Arc::clone(&self.conn);
+        let content = content.to_string();
+        let embedding_owned = embedding.map(|e| e.to_vec());
+
+        tokio::task::spawn_blocking(move || {
+            let shared_id = AgentId(uuid::Uuid::from_bytes([
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x02,
+            ]));
+
+            // Dedup check
+            if let Some(ref query_emb) = embedding_owned {
+                let existing = store.recall_with_embedding(
+                    "",
+                    10,
+                    Some(MemoryFilter {
+                        agent_id: Some(shared_id),
+                        ..Default::default()
+                    }),
+                    Some(query_emb),
+                )?;
+
+                for mem in &existing {
+                    if let Some(ref mem_emb) = mem.embedding {
+                        let sim = crate::semantic::cosine_similarity(query_emb, mem_emb);
+                        if sim > 0.85 {
+                            let db = conn
+                                .lock()
+                                .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+                            let now = chrono::Utc::now().to_rfc3339();
+                            if let Err(e) = db.execute(
+                                "UPDATE memories SET access_count = access_count + 1, accessed_at = ?1, confidence = MIN(1.0, confidence + 0.05) WHERE id = ?2",
+                                rusqlite::params![now, mem.id.0.to_string()],
+                            ) {
+                                tracing::warn!(error = %e, id = %mem.id, "Failed to boost shared memory (async)");
+                            }
+                            return Ok(mem.id);
+                        }
+                    }
+                }
+            }
+
+            store.remember_with_embedding(
+                shared_id,
+                &content,
+                source,
+                "semantic",
+                metadata,
+                embedding_owned.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Synchronous remember — stores a memory without async overhead.
+    /// Used by compaction and other sync contexts.
+    pub fn remember_sync(
+        &self,
+        agent_id: AgentId,
+        content: &str,
+        source: MemorySource,
+        scope: &str,
+        metadata: HashMap<String, serde_json::Value>,
+    ) -> OpenFangResult<MemoryId> {
+        self.semantic.remember(agent_id, content, source, scope, metadata)
+    }
+
+    /// Synchronous recall — searches for memories without async overhead.
+    /// Used by kernel prompt building and other sync contexts.
+    pub fn recall_sync(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: Option<MemoryFilter>,
+    ) -> OpenFangResult<Vec<MemoryFragment>> {
+        self.semantic.recall(query, limit, filter)
+    }
+
+    // -----------------------------------------------------------------
+    // Knowledge graph helpers
+    // -----------------------------------------------------------------
+
+    /// Find or create an entity in the knowledge graph.
+    /// If an entity with the same (name, entity_type) exists, updates it and returns the existing ID.
+    pub fn knowledge_find_or_create(&self, entity: Entity) -> OpenFangResult<String> {
+        self.knowledge.find_or_create_entity(entity)
+    }
+
+    /// Find entities mentioned in text by name lookup.
+    pub fn knowledge_find_entities_in_text(&self, text: &str) -> OpenFangResult<Vec<Entity>> {
+        self.knowledge.find_entities_in_text(text)
+    }
+
+    /// Synchronous add_relation (for use in non-async contexts like pre-compaction).
+    pub fn add_relation_sync(&self, relation: Relation) -> OpenFangResult<String> {
+        self.knowledge.add_relation(relation)
+    }
+
+    // -----------------------------------------------------------------
     // Embedding-aware memory operations
     // -----------------------------------------------------------------
 
@@ -646,17 +829,99 @@ impl Memory for MemorySubstrate {
     }
 
     async fn export(&self, format: ExportFormat) -> OpenFangResult<Vec<u8>> {
-        let _ = format;
-        Ok(Vec::new())
+        let semantic = self.semantic.clone();
+        let knowledge = self.knowledge.clone();
+        let structured = self.structured.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let memories = semantic.export_all()?;
+            let entities = knowledge.export_entities()?;
+            let relations = knowledge.export_relations()?;
+            let kv_data = structured.export_all_kv()?;
+
+            let export_data = openfang_types::memory::MemoryExportData {
+                version: 1,
+                exported_at: chrono::Utc::now().to_rfc3339(),
+                memories,
+                entities,
+                relations,
+                kv_data,
+            };
+
+            match format {
+                ExportFormat::Json => serde_json::to_vec_pretty(&export_data)
+                    .map_err(|e| OpenFangError::Serialization(e.to_string())),
+                ExportFormat::MessagePack => {
+                    // MessagePack not yet implemented — fall back to compact JSON
+                    tracing::debug!("MessagePack export not implemented, using compact JSON");
+                    serde_json::to_vec(&export_data)
+                        .map_err(|e| OpenFangError::Serialization(e.to_string()))
+                }
+            }
+        })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 
-    async fn import(&self, _data: &[u8], _format: ExportFormat) -> OpenFangResult<ImportReport> {
-        Ok(ImportReport {
-            entities_imported: 0,
-            relations_imported: 0,
-            memories_imported: 0,
-            errors: vec!["Import not yet implemented in Phase 1".to_string()],
+    async fn import(&self, data: &[u8], format: ExportFormat) -> OpenFangResult<ImportReport> {
+        let export_data: openfang_types::memory::MemoryExportData = match format {
+            ExportFormat::Json | ExportFormat::MessagePack => {
+                // MessagePack not yet implemented — both formats use JSON for now
+                serde_json::from_slice(data)
+                    .map_err(|e| OpenFangError::Serialization(e.to_string()))?
+            }
+        };
+
+        let semantic = self.semantic.clone();
+        let knowledge = self.knowledge.clone();
+        let structured = self.structured.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut errors = Vec::new();
+            let mut memories_imported = 0u64;
+            let mut entities_imported = 0u64;
+            let mut relations_imported = 0u64;
+
+            // Import memories
+            for mem in &export_data.memories {
+                match semantic.import_memory(mem) {
+                    Ok(()) => memories_imported += 1,
+                    Err(e) => errors.push(format!("Memory {}: {e}", mem.id)),
+                }
+            }
+
+            // Import entities
+            for entity in &export_data.entities {
+                match knowledge.import_entity(entity) {
+                    Ok(()) => entities_imported += 1,
+                    Err(e) => errors.push(format!("Entity {}: {e}", entity.name)),
+                }
+            }
+
+            // Import relations
+            for relation in &export_data.relations {
+                match knowledge.import_relation(relation) {
+                    Ok(()) => relations_imported += 1,
+                    Err(e) => errors.push(format!("Relation {} -> {}: {e}", relation.source, relation.target)),
+                }
+            }
+
+            // Import KV data
+            for entry in &export_data.kv_data {
+                if let Err(e) = structured.import_kv(entry) {
+                    errors.push(format!("KV {}/{}: {e}", entry.agent_id, entry.key));
+                }
+            }
+
+            Ok(ImportReport {
+                entities_imported,
+                relations_imported,
+                memories_imported,
+                errors,
+            })
         })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 }
 

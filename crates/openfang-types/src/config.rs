@@ -1367,7 +1367,7 @@ pub struct MemoryConfig {
 }
 
 fn default_consolidation_interval() -> u64 {
-    24
+    1
 }
 
 impl Default for MemoryConfig {
@@ -1559,6 +1559,15 @@ pub struct DiscordConfig {
     pub bot_token_env: String,
     /// Guild (server) IDs allowed to interact (empty = allow all).
     pub allowed_guilds: Vec<u64>,
+    /// Channel IDs allowed to interact (empty = allow all).
+    #[serde(default)]
+    pub allowed_channels: Vec<String>,
+    /// User IDs or usernames allowed to interact (empty = allow all).
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Channel IDs where the bot reads but never responds.
+    #[serde(default)]
+    pub read_only_channels: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
     /// Gateway intents bitmask (default: 33280 = GUILD_MESSAGES | MESSAGE_CONTENT).
@@ -1573,6 +1582,9 @@ impl Default for DiscordConfig {
         Self {
             bot_token_env: "DISCORD_BOT_TOKEN".to_string(),
             allowed_guilds: vec![],
+            allowed_channels: vec![],
+            allowed_users: vec![],
+            read_only_channels: vec![],
             default_agent: None,
             intents: 33280,
             overrides: ChannelOverrides::default(),

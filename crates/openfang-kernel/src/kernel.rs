@@ -15,6 +15,7 @@ use crate::workflow::{StepAgent, Workflow, WorkflowEngine, WorkflowId, WorkflowR
 
 use openfang_memory::MemorySubstrate;
 use openfang_runtime::agent_loop::{run_agent_loop, run_agent_loop_streaming, AgentLoopResult};
+use openfang_runtime::auth_cooldown::ProviderCooldown;
 use openfang_runtime::audit::AuditLog;
 use openfang_runtime::drivers;
 use openfang_runtime::kernel_handle::{self, KernelHandle};
@@ -32,6 +33,7 @@ use openfang_types::memory::Memory;
 use openfang_types::tool::ToolDefinition;
 
 use async_trait::async_trait;
+use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, info, warn};
@@ -123,6 +125,10 @@ pub struct OpenFangKernel {
     pub peer_registry: Option<openfang_wire::PeerRegistry>,
     /// OFP peer node — the local networking node.
     pub peer_node: Option<Arc<openfang_wire::PeerNode>>,
+    /// Provider circuit breaker with exponential cooldown.
+    pub cooldown: Arc<ProviderCooldown>,
+    /// Model performance ledger for quality-based routing.
+    pub model_ledger: Arc<openfang_runtime::model_scoring::ModelLedger>,
     /// Boot timestamp for uptime calculation.
     pub booted_at: std::time::Instant,
     /// WhatsApp Web gateway child process PID (for shutdown cleanup).
@@ -611,6 +617,48 @@ impl OpenFangKernel {
             "Model catalog: {total_count} models, {available_count} available from configured providers ({local_count} local)"
         );
 
+        // Ollama health check (warn-only, non-blocking)
+        {
+            let ollama_url = config
+                .provider_urls
+                .get("ollama")
+                .cloned()
+                .or_else(|| {
+                    config
+                        .default_model
+                        .base_url
+                        .as_ref()
+                        .filter(|_| config.default_model.provider == "ollama")
+                        .cloned()
+                })
+                .unwrap_or_else(|| "http://localhost:11434/v1".to_string());
+            // Extract host:port for TCP probe
+            let probe_addr = ollama_url
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .trim_end_matches("/v1")
+                .trim_end_matches('/');
+            match std::net::TcpStream::connect_timeout(
+                &probe_addr
+                    .to_socket_addrs()
+                    .ok()
+                    .and_then(|mut a| a.next())
+                    .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 11434))),
+                std::time::Duration::from_secs(2),
+            ) {
+                Ok(_) => {
+                    info!(url = %ollama_url, "Ollama is reachable");
+                }
+                Err(e) => {
+                    warn!(
+                        url = %ollama_url,
+                        error = %e,
+                        "Ollama is unreachable — local fallback will be unavailable until it comes online"
+                    );
+                }
+            }
+        }
+
         // Initialize skill registry
         let skills_dir = config.home_dir.join("skills");
         let mut skill_registry = openfang_skills::registry::SkillRegistry::new(skills_dir);
@@ -874,6 +922,8 @@ impl OpenFangKernel {
             process_manager: Arc::new(openfang_runtime::process_manager::ProcessManager::new(5)),
             peer_registry: None,
             peer_node: None,
+            cooldown: Arc::new(ProviderCooldown::new(Default::default())),
+            model_ledger: Arc::new(openfang_runtime::model_scoring::ModelLedger::new()),
             booted_at: std::time::Instant::now(),
             whatsapp_gateway_pid: Arc::new(std::sync::Mutex::new(None)),
             self_handle: OnceLock::new(),
@@ -1272,13 +1322,23 @@ impl OpenFangKernel {
                 label: None,
             });
 
+        let tools = self.available_tools(agent_id);
+        let tools = entry.mode.filter_tools(tools);
+        let driver = self.resolve_driver(&entry.manifest)?;
+
+        // Look up model's actual context window from the catalog
+        let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
+            cat.find_model(&entry.manifest.model.model)
+                .map(|m| m.context_window as usize)
+        });
+
         // Check if auto-compaction is needed: message-count OR token-count trigger
         let needs_compact = {
             use openfang_runtime::compactor::{
                 estimate_token_count, needs_compaction as check_compact,
                 needs_compaction_by_tokens, CompactionConfig,
             };
-            let config = CompactionConfig::default();
+            let config = CompactionConfig::for_context_window(ctx_window.unwrap_or(200_000));
             let by_messages = check_compact(&session, &config);
             let estimated = estimate_token_count(
                 &session.messages,
@@ -1296,16 +1356,6 @@ impl OpenFangKernel {
             }
             by_messages || by_tokens
         };
-
-        let tools = self.available_tools(agent_id);
-        let tools = entry.mode.filter_tools(tools);
-        let driver = self.resolve_driver(&entry.manifest)?;
-
-        // Look up model's actual context window from the catalog
-        let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
-            cat.find_model(&entry.manifest.model.model)
-                .map(|m| m.context_window as usize)
-        });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
         let mut manifest = entry.manifest.clone();
@@ -1338,11 +1388,16 @@ impl OpenFangKernel {
                 .flatten()
                 .and_then(|v| v.as_str().map(String::from));
 
+            let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+            let is_passthrough = openfang_runtime::prompt_builder::detect_passthrough(
+                &tool_names,
+                &manifest.model.system_prompt,
+            );
             let prompt_ctx = openfang_runtime::prompt_builder::PromptContext {
                 agent_name: manifest.name.clone(),
                 agent_description: manifest.description.clone(),
                 base_system_prompt: manifest.model.system_prompt.clone(),
-                granted_tools: tools.iter().map(|t| t.name.clone()).collect(),
+                granted_tools: tool_names,
                 recalled_memories: vec![],
                 skill_summary: self.build_skill_summary(&manifest.skills),
                 skill_prompt_context: self.collect_prompt_context(&manifest.skills),
@@ -1401,6 +1456,25 @@ impl OpenFangKernel {
                         .and_then(|w| read_identity_file(w, "HEARTBEAT.md"))
                 } else {
                     None
+                },
+                is_passthrough,
+                self_corrections: if !is_passthrough {
+                    self.memory
+                        .recall_sync(
+                            "Response quality issue",
+                            3,
+                            Some(openfang_types::memory::MemoryFilter {
+                                agent_id: Some(agent_id),
+                                scope: Some("procedural".to_string()),
+                                ..Default::default()
+                            }),
+                        )
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|m| m.content)
+                        .collect()
+                } else {
+                    vec![]
                 },
             };
             manifest.model.system_prompt =
@@ -1504,6 +1578,7 @@ impl OpenFangKernel {
                 Some(&kernel_clone.hooks),
                 ctx_window,
                 Some(&kernel_clone.process_manager),
+                Some(&kernel_clone.cooldown),
             )
             .await;
 
@@ -1541,7 +1616,7 @@ impl OpenFangKernel {
                         use openfang_runtime::compactor::{
                             estimate_token_count, needs_compaction_by_tokens, CompactionConfig,
                         };
-                        let config = CompactionConfig::default();
+                        let config = CompactionConfig::for_context_window(ctx_window.unwrap_or(200_000));
                         let estimated = estimate_token_count(&session.messages, None, None);
                         if needs_compaction_by_tokens(estimated, &config) {
                             let kc = kernel_clone.clone();
@@ -1786,11 +1861,16 @@ impl OpenFangKernel {
                 .flatten()
                 .and_then(|v| v.as_str().map(String::from));
 
+            let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+            let is_passthrough = openfang_runtime::prompt_builder::detect_passthrough(
+                &tool_names,
+                &manifest.model.system_prompt,
+            );
             let prompt_ctx = openfang_runtime::prompt_builder::PromptContext {
                 agent_name: manifest.name.clone(),
                 agent_description: manifest.description.clone(),
                 base_system_prompt: manifest.model.system_prompt.clone(),
-                granted_tools: tools.iter().map(|t| t.name.clone()).collect(),
+                granted_tools: tool_names,
                 recalled_memories: vec![], // Recalled in agent_loop, not here
                 skill_summary: self.build_skill_summary(&manifest.skills),
                 skill_prompt_context: self.collect_prompt_context(&manifest.skills),
@@ -1849,6 +1929,25 @@ impl OpenFangKernel {
                         .and_then(|w| read_identity_file(w, "HEARTBEAT.md"))
                 } else {
                     None
+                },
+                is_passthrough,
+                self_corrections: if !is_passthrough {
+                    self.memory
+                        .recall_sync(
+                            "Response quality issue",
+                            3,
+                            Some(openfang_types::memory::MemoryFilter {
+                                agent_id: Some(agent_id),
+                                scope: Some("procedural".to_string()),
+                                ..Default::default()
+                            }),
+                        )
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|m| m.content)
+                        .collect()
+                } else {
+                    vec![]
                 },
             };
             manifest.model.system_prompt =
@@ -1954,6 +2053,7 @@ impl OpenFangKernel {
             Some(&self.hooks),
             ctx_window,
             Some(&self.process_manager),
+            Some(&self.cooldown),
         )
         .await
         .map_err(KernelError::OpenFang)?;
@@ -2398,7 +2498,12 @@ impl OpenFangKernel {
                 label: None,
             });
 
-        let config = CompactionConfig::default();
+        // Look up model context window for appropriate compaction thresholds
+        let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
+            cat.find_model(&entry.manifest.model.model)
+                .map(|m| m.context_window as usize)
+        });
+        let config = CompactionConfig::for_context_window(ctx_window.unwrap_or(200_000));
 
         if !needs_compaction(&session, &config) {
             return Ok(format!(
@@ -2406,6 +2511,18 @@ impl OpenFangKernel {
                 session.messages.len(),
                 config.threshold
             ));
+        }
+
+        // Pre-compaction: extract knowledge graph facts from messages about to be compacted
+        {
+            let split_at = session.messages.len().saturating_sub(config.keep_recent);
+            let to_compact = &session.messages[..split_at];
+            if !to_compact.is_empty() {
+                openfang_runtime::compactor::pre_compaction_fact_extraction(
+                    to_compact,
+                    &self.memory,
+                );
+            }
         }
 
         let driver = self.resolve_driver(&entry.manifest)?;
@@ -4221,6 +4338,16 @@ fn shared_memory_agent_id() -> AgentId {
     ]))
 }
 
+/// A well-known agent ID for the shared semantic memory pool.
+/// Distinct from the KV shared namespace (0x01). High-value memories
+/// promoted from any agent are stored here and recalled by all agents.
+pub fn shared_semantic_agent_id() -> AgentId {
+    AgentId(uuid::Uuid::from_bytes([
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x02,
+    ]))
+}
+
 /// Deliver a cron job's agent response to the configured delivery target.
 async fn cron_deliver_response(
     kernel: &OpenFangKernel,
@@ -4237,12 +4364,41 @@ async fn cron_deliver_response(
     match delivery {
         CronDelivery::None => {}
         CronDelivery::Channel { channel, to } => {
-            tracing::debug!(channel = %channel, to = %to, "Cron: delivering to channel");
+            tracing::info!(channel = %channel, to = %to, "Cron: delivering to channel");
             // Persist as last channel for this agent (survives restarts)
             let kv_val = serde_json::json!({"channel": channel, "recipient": to});
             let _ = kernel
                 .memory
                 .structured_set(agent_id, "delivery.last_channel", kv_val);
+
+            // Deliver via self-call to the local API (bridge picks up outgoing messages)
+            let api_listen = &kernel.config.api_listen;
+            let url = format!("http://{api_listen}/api/agents/{}/send", agent_id);
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build();
+            if let Ok(client) = client {
+                let payload = serde_json::json!({
+                    "channel": channel,
+                    "to": to,
+                    "message": response,
+                });
+                match client.post(&url).json(&payload).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        tracing::info!(channel = %channel, to = %to, "Cron: channel delivery succeeded");
+                    }
+                    Ok(resp) => {
+                        tracing::warn!(
+                            channel = %channel,
+                            status = %resp.status(),
+                            "Cron: channel delivery returned non-success"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Cron: channel delivery failed");
+                    }
+                }
+            }
         }
         CronDelivery::LastChannel => {
             match kernel
@@ -4258,6 +4414,13 @@ async fn cron_deliver_response(
                             recipient = %recipient,
                             "Cron: delivering to last channel"
                         );
+                        // Re-dispatch as explicit channel delivery
+                        let explicit = openfang_types::scheduler::CronDelivery::Channel {
+                            channel: channel.to_string(),
+                            to: recipient.to_string(),
+                        };
+                        Box::pin(cron_deliver_response(kernel, agent_id, response, &explicit))
+                            .await;
                     }
                 }
                 _ => {
@@ -4351,15 +4514,30 @@ impl KernelHandle for OpenFangKernel {
         OpenFangKernel::kill_agent(self, id).map_err(|e| format!("Kill failed: {e}"))
     }
 
-    fn memory_store(&self, key: &str, value: serde_json::Value) -> Result<(), String> {
-        let agent_id = shared_memory_agent_id();
+    fn memory_store(
+        &self,
+        caller_agent_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<(), String> {
+        let agent_id: AgentId = caller_agent_id
+            .parse()
+            .map(AgentId)
+            .unwrap_or_else(|_| shared_memory_agent_id());
         self.memory
             .structured_set(agent_id, key, value)
             .map_err(|e| format!("Memory store failed: {e}"))
     }
 
-    fn memory_recall(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
-        let agent_id = shared_memory_agent_id();
+    fn memory_recall(
+        &self,
+        caller_agent_id: &str,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let agent_id: AgentId = caller_agent_id
+            .parse()
+            .map(AgentId)
+            .unwrap_or_else(|_| shared_memory_agent_id());
         self.memory
             .structured_get(agent_id, key)
             .map_err(|e| format!("Memory recall failed: {e}"))
@@ -4451,9 +4629,9 @@ impl KernelHandle for OpenFangKernel {
         &self,
         entity: openfang_types::memory::Entity,
     ) -> Result<String, String> {
+        // Use find-or-create for deduplication by (name, entity_type)
         self.memory
-            .add_entity(entity)
-            .await
+            .knowledge_find_or_create(entity)
             .map_err(|e| format!("Knowledge add entity failed: {e}"))
     }
 
@@ -4737,6 +4915,14 @@ impl KernelHandle for OpenFangKernel {
 
         // Delegate to the normal spawn path (use trait method via KernelHandle::)
         KernelHandle::spawn_agent(self, manifest_toml, parent_id).await
+    }
+
+    fn record_model_observation(
+        &self,
+        model_id: &str,
+        observation: openfang_runtime::model_scoring::ModelObservation,
+    ) {
+        self.model_ledger.record(model_id, observation);
     }
 }
 

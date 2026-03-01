@@ -3863,6 +3863,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "openfang-types",
+ "regex-lite",
  "rmp-serde",
  "rusqlite",
  "serde",

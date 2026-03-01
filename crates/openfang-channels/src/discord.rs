@@ -39,6 +39,9 @@ pub struct DiscordAdapter {
     token: Zeroizing<String>,
     client: reqwest::Client,
     allowed_guilds: Vec<u64>,
+    allowed_channels: Vec<String>,
+    allowed_users: Vec<String>,
+    read_only_channels: Vec<String>,
     intents: u64,
     shutdown_tx: Arc<watch::Sender<bool>>,
     shutdown_rx: watch::Receiver<bool>,
@@ -51,12 +54,22 @@ pub struct DiscordAdapter {
 }
 
 impl DiscordAdapter {
-    pub fn new(token: String, allowed_guilds: Vec<u64>, intents: u64) -> Self {
+    pub fn new(
+        token: String,
+        allowed_guilds: Vec<u64>,
+        allowed_channels: Vec<String>,
+        allowed_users: Vec<String>,
+        read_only_channels: Vec<String>,
+        intents: u64,
+    ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             token: Zeroizing::new(token),
             client: reqwest::Client::new(),
             allowed_guilds,
+            allowed_channels,
+            allowed_users,
+            read_only_channels,
             intents,
             shutdown_tx: Arc::new(shutdown_tx),
             shutdown_rx,
@@ -147,6 +160,9 @@ impl ChannelAdapter for DiscordAdapter {
         let token = self.token.clone();
         let intents = self.intents;
         let allowed_guilds = self.allowed_guilds.clone();
+        let allowed_channels = self.allowed_channels.clone();
+        let allowed_users = self.allowed_users.clone();
+        let read_only_channels = self.read_only_channels.clone();
         let bot_user_id = self.bot_user_id.clone();
         let session_id_store = self.session_id.clone();
         let resume_url_store = self.resume_gateway_url.clone();
@@ -325,7 +341,14 @@ impl ChannelAdapter for DiscordAdapter {
 
                                 "MESSAGE_CREATE" | "MESSAGE_UPDATE" => {
                                     if let Some(msg) =
-                                        parse_discord_message(d, &bot_user_id, &allowed_guilds)
+                                        parse_discord_message(
+                                            d,
+                                            &bot_user_id,
+                                            &allowed_guilds,
+                                            &allowed_channels,
+                                            &allowed_users,
+                                            &read_only_channels,
+                                        )
                                             .await
                                     {
                                         debug!(
@@ -441,19 +464,26 @@ async fn parse_discord_message(
     d: &serde_json::Value,
     bot_user_id: &Arc<RwLock<Option<String>>>,
     allowed_guilds: &[u64],
+    allowed_channels: &[String],
+    allowed_users: &[String],
+    read_only_channels: &[String],
 ) -> Option<ChannelMessage> {
     let author = d.get("author")?;
     let author_id = author["id"].as_str()?;
+    let username = author["username"].as_str().unwrap_or("Unknown");
+    let channel_id = d["channel_id"].as_str()?;
 
-    // Filter out bot's own messages
+    let is_read_only = !read_only_channels.is_empty() && read_only_channels.contains(&channel_id.to_string());
+
+    // Filter out bot's own messages (always — even in read-only channels)
     if let Some(ref bid) = *bot_user_id.read().await {
         if author_id == bid {
             return None;
         }
     }
 
-    // Filter out other bots
-    if author["bot"].as_bool() == Some(true) {
+    // Filter out other bots — UNLESS this is a read-only channel (transcriber is a bot)
+    if !is_read_only && author["bot"].as_bool() == Some(true) {
         return None;
     }
 
@@ -467,14 +497,26 @@ async fn parse_discord_message(
         }
     }
 
+    // Filter by allowed channels (read-only channels are implicitly allowed)
+    if !allowed_channels.is_empty() && !is_read_only && !allowed_channels.contains(&channel_id.to_string()) {
+        return None;
+    }
+
+    // Filter by allowed users (skip for read-only channels — transcriber bot won't be listed)
+    if !allowed_users.is_empty() && !is_read_only {
+        let id_match = allowed_users.contains(&author_id.to_string());
+        let name_match = allowed_users.contains(&username.to_string());
+        if !id_match && !name_match {
+            return None;
+        }
+    }
+
     let content_text = d["content"].as_str().unwrap_or("");
     if content_text.is_empty() {
         return None;
     }
 
-    let channel_id = d["channel_id"].as_str()?;
     let message_id = d["id"].as_str().unwrap_or("0");
-    let username = author["username"].as_str().unwrap_or("Unknown");
     let discriminator = author["discriminator"].as_str().unwrap_or("0000");
     let display_name = if discriminator == "0" {
         username.to_string()
@@ -505,6 +547,14 @@ async fn parse_discord_message(
         ChannelContent::Text(content_text.to_string())
     };
 
+    // Build metadata with author info and read-only flag
+    let mut metadata = HashMap::new();
+    metadata.insert("author_id".to_string(), serde_json::Value::String(author_id.to_string()));
+    metadata.insert("author_username".to_string(), serde_json::Value::String(username.to_string()));
+    if is_read_only {
+        metadata.insert("read_only".to_string(), serde_json::Value::Bool(true));
+    }
+
     Some(ChannelMessage {
         channel: ChannelType::Discord,
         platform_message_id: message_id.to_string(),
@@ -518,7 +568,7 @@ async fn parse_discord_message(
         timestamp,
         is_group: true,
         thread_id: None,
-        metadata: HashMap::new(),
+        metadata,
     })
 }
 
@@ -542,7 +592,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[]).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &[]).await.unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
         assert_eq!(msg.sender.display_name, "alice");
         assert_eq!(msg.sender.platform_id, "ch1");
@@ -564,7 +614,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[]).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &[]).await;
         assert!(msg.is_none());
     }
 
@@ -584,7 +634,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[]).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &[]).await;
         assert!(msg.is_none());
     }
 
@@ -605,11 +655,11 @@ mod tests {
         });
 
         // Not in allowed guilds
-        let msg = parse_discord_message(&d, &bot_id, &[111, 222]).await;
+        let msg = parse_discord_message(&d, &bot_id, &[111, 222], &[], &[], &[]).await;
         assert!(msg.is_none());
 
         // In allowed guilds
-        let msg = parse_discord_message(&d, &bot_id, &[999]).await;
+        let msg = parse_discord_message(&d, &bot_id, &[999], &[], &[], &[]).await;
         assert!(msg.is_some());
     }
 
@@ -628,7 +678,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[]).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &[]).await.unwrap();
         match &msg.content {
             ChannelContent::Command { name, args } => {
                 assert_eq!(name, "agent");
@@ -653,7 +703,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[]).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &[]).await;
         assert!(msg.is_none());
     }
 
@@ -672,7 +722,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[]).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &[]).await.unwrap();
         assert_eq!(msg.sender.display_name, "alice#1234");
     }
 
@@ -693,8 +743,7 @@ mod tests {
             "edited_timestamp": "2024-01-01T00:01:00+00:00"
         });
 
-        // MESSAGE_UPDATE uses the same parse function as MESSAGE_CREATE
-        let msg = parse_discord_message(&d, &bot_id, &[]).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &[]).await.unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
         assert!(
             matches!(msg.content, ChannelContent::Text(ref t) if t == "Edited message content")
@@ -703,8 +752,133 @@ mod tests {
 
     #[test]
     fn test_discord_adapter_creation() {
-        let adapter = DiscordAdapter::new("test-token".to_string(), vec![123, 456], 33280);
+        let adapter = DiscordAdapter::new(
+            "test-token".to_string(),
+            vec![123, 456],
+            vec![],
+            vec![],
+            vec![],
+            33280,
+        );
         assert_eq!(adapter.name(), "discord");
         assert_eq!(adapter.channel_type(), ChannelType::Discord);
+    }
+
+    // --- New tests for channel/user/read-only filtering ---
+
+    #[tokio::test]
+    async fn test_channel_filter_blocks_unlisted_channel() {
+        let bot_id = Arc::new(RwLock::new(None));
+        let d = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "ch999",
+            "content": "Hello",
+            "author": { "id": "u1", "username": "alice", "discriminator": "0" },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+        let allowed_ch = vec!["ch1".to_string(), "ch2".to_string()];
+        let msg = parse_discord_message(&d, &bot_id, &[], &allowed_ch, &[], &[]).await;
+        assert!(msg.is_none());
+
+        // Allowed channel passes
+        let d2 = serde_json::json!({
+            "id": "msg2",
+            "channel_id": "ch1",
+            "content": "Hello",
+            "author": { "id": "u1", "username": "alice", "discriminator": "0" },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+        let msg = parse_discord_message(&d2, &bot_id, &[], &allowed_ch, &[], &[]).await;
+        assert!(msg.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_user_filter_by_id() {
+        let bot_id = Arc::new(RwLock::new(None));
+        let d = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "ch1",
+            "content": "Hello",
+            "author": { "id": "u999", "username": "stranger", "discriminator": "0" },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+        let allowed_users = vec!["u1".to_string(), "u2".to_string()];
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &allowed_users, &[]).await;
+        assert!(msg.is_none());
+
+        // Matching ID passes
+        let d2 = serde_json::json!({
+            "id": "msg2",
+            "channel_id": "ch1",
+            "content": "Hello",
+            "author": { "id": "u1", "username": "stranger", "discriminator": "0" },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+        let msg = parse_discord_message(&d2, &bot_id, &[], &[], &allowed_users, &[]).await;
+        assert!(msg.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_user_filter_by_username() {
+        let bot_id = Arc::new(RwLock::new(None));
+        let d = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "ch1",
+            "content": "Hello",
+            "author": { "id": "u999", "username": "xomclovin", "discriminator": "0" },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+        let allowed_users = vec!["xomclovin".to_string(), "iso.cry".to_string()];
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &allowed_users, &[]).await;
+        assert!(msg.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_read_only_channel_metadata() {
+        let bot_id = Arc::new(RwLock::new(None));
+        let d = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "ro_ch",
+            "content": "Transcribed audio",
+            "author": { "id": "bot_transcriber", "username": "transcriber", "discriminator": "0", "bot": true },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+        let read_only = vec!["ro_ch".to_string()];
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &read_only).await.unwrap();
+        assert_eq!(msg.metadata.get("read_only").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(msg.metadata.get("author_id").and_then(|v| v.as_str()), Some("bot_transcriber"));
+    }
+
+    #[tokio::test]
+    async fn test_read_only_bypasses_allowed_channels() {
+        let bot_id = Arc::new(RwLock::new(None));
+        let d = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "ro_ch",
+            "content": "Transcribed text",
+            "author": { "id": "bot_t", "username": "transcriber", "discriminator": "0", "bot": true },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+        // ro_ch is NOT in allowed_channels, but IS in read_only_channels — should pass
+        let allowed_ch = vec!["ch1".to_string()];
+        let read_only = vec!["ro_ch".to_string()];
+        let msg = parse_discord_message(&d, &bot_id, &[], &allowed_ch, &[], &read_only).await;
+        assert!(msg.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_metadata_contains_author_info() {
+        let bot_id = Arc::new(RwLock::new(None));
+        let d = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "ch1",
+            "content": "Hi",
+            "author": { "id": "u42", "username": "alice", "discriminator": "0" },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &[]).await.unwrap();
+        assert_eq!(msg.metadata.get("author_id").and_then(|v| v.as_str()), Some("u42"));
+        assert_eq!(msg.metadata.get("author_username").and_then(|v| v.as_str()), Some("alice"));
+        assert!(!msg.metadata.contains_key("read_only"));
     }
 }

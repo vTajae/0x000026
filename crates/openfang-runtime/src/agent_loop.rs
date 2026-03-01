@@ -91,6 +91,79 @@ pub struct AgentLoopResult {
     pub directives: openfang_types::message::ReplyDirectives,
 }
 
+/// Heuristic response quality issues detected after EndTurn.
+#[derive(Debug)]
+enum ResponseIssue {
+    /// Long user query got a very short answer.
+    TooShort { query_len: usize, response_len: usize },
+    /// Tool errors occurred but the response doesn't acknowledge them.
+    UnaddressedToolErrors(usize),
+    /// The response appears to be a template/fallback rather than genuine output.
+    FallbackResponse,
+}
+
+/// Detect response quality issues using lightweight heuristics (no LLM call).
+fn detect_response_issues(
+    user_message: &str,
+    response: &str,
+    tool_error_count: usize,
+) -> Vec<ResponseIssue> {
+    let mut issues = Vec::new();
+
+    // Too short: user sent >100 chars but response is <30 chars
+    if user_message.len() > 100 && response.len() < 30 && !response.trim().is_empty() {
+        issues.push(ResponseIssue::TooShort {
+            query_len: user_message.len(),
+            response_len: response.len(),
+        });
+    }
+
+    // Unaddressed tool errors: errors happened but response doesn't mention "error"/"fail"/"issue"
+    if tool_error_count > 0 {
+        let lower = response.to_lowercase();
+        let mentions_error =
+            lower.contains("error") || lower.contains("fail") || lower.contains("issue")
+                || lower.contains("couldn't") || lower.contains("unable");
+        if !mentions_error {
+            issues.push(ResponseIssue::UnaddressedToolErrors(tool_error_count));
+        }
+    }
+
+    // Fallback detection: generic placeholder text
+    let fallback_patterns = [
+        "I don't have enough context",
+        "I'm not sure what you're asking",
+        "Could you please clarify",
+    ];
+    for pattern in &fallback_patterns {
+        if response.contains(pattern) && user_message.len() > 50 {
+            issues.push(ResponseIssue::FallbackResponse);
+            break;
+        }
+    }
+
+    issues
+}
+
+/// Format detected issues as a critique string for procedural memory storage.
+fn format_critique(issues: &[ResponseIssue]) -> String {
+    let parts: Vec<String> = issues
+        .iter()
+        .map(|issue| match issue {
+            ResponseIssue::TooShort { query_len, response_len } => {
+                format!("Response too short ({response_len} chars) for a {query_len}-char query — provide more detail")
+            }
+            ResponseIssue::UnaddressedToolErrors(n) => {
+                format!("{n} tool error(s) occurred but response didn't acknowledge them — always report tool failures to the user")
+            }
+            ResponseIssue::FallbackResponse => {
+                "Used a generic fallback response — try harder to address the specific request".to_string()
+            }
+        })
+        .collect();
+    format!("Response quality issue: {}", parts.join("; "))
+}
+
 /// Run the agent execution loop for a single user message.
 ///
 /// This is the core of OpenFang: it loads session context, recalls memories,
@@ -117,6 +190,7 @@ pub async fn run_agent_loop(
     hooks: Option<&crate::hooks::HookRegistry>,
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
+    cooldown: Option<&ProviderCooldown>,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting agent loop");
 
@@ -127,52 +201,8 @@ pub async fn run_agent_loop(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
-    // Recall relevant memories — prefer vector similarity search when embedding driver is available
-    let memories = if let Some(emb) = embedding_driver {
-        match emb.embed_one(user_message).await {
-            Ok(query_vec) => {
-                debug!("Using vector recall (dims={})", query_vec.len());
-                memory
-                    .recall_with_embedding_async(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                        Some(&query_vec),
-                    )
-                    .await
-                    .unwrap_or_default()
-            }
-            Err(e) => {
-                warn!("Embedding recall failed, falling back to text search: {e}");
-                memory
-                    .recall(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                    .unwrap_or_default()
-            }
-        }
-    } else {
-        memory
-            .recall(
-                user_message,
-                5,
-                Some(MemoryFilter {
-                    agent_id: Some(session.agent_id),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap_or_default()
-    };
+    // Recall relevant memories — unified recall from private (3) + shared (2) pools
+    let memories = recall_unified(memory, session.agent_id, user_message, embedding_driver).await;
 
     // Fire BeforePromptBuild hook
     let agent_id_str = session.agent_id.0.to_string();
@@ -201,6 +231,45 @@ pub async fn run_agent_loop(
         system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
     }
 
+    // Inject knowledge graph context: find entities mentioned in user message
+    {
+        let kg_entities = memory
+            .knowledge_find_entities_in_text(user_message)
+            .unwrap_or_default();
+        if !kg_entities.is_empty() {
+            let mut facts_section = String::from("\n\n## Known Facts\n");
+            let mut fact_count = 0;
+            for entity in &kg_entities {
+                if fact_count >= 5 {
+                    break;
+                }
+                // Query 1-hop relations for this entity
+                let matches = memory
+                    .query_graph(openfang_types::memory::GraphPattern {
+                        source: Some(entity.id.clone()),
+                        relation: None,
+                        target: None,
+                        max_depth: 1,
+                    })
+                    .await
+                    .unwrap_or_default();
+                for m in &matches {
+                    if fact_count >= 5 {
+                        break;
+                    }
+                    facts_section.push_str(&format!(
+                        "- {} {:?} {}\n",
+                        m.source.name, m.relation.relation, m.target.name
+                    ));
+                    fact_count += 1;
+                }
+            }
+            if fact_count > 0 {
+                system_prompt.push_str(&facts_section);
+            }
+        }
+    }
+
     // Add the user message to session history
     session.messages.push(Message::user(user_message));
 
@@ -217,6 +286,7 @@ pub async fn run_agent_loop(
     let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
     let mut total_usage = TokenUsage::default();
     let final_response;
+    let mut tool_error_count: usize = 0;
 
     // Safety valve: trim excessively long message histories to prevent context overflow.
     // The full compaction system handles sophisticated summarization, but this prevents
@@ -284,7 +354,30 @@ pub async fn run_agent_loop(
 
         // Call LLM with retry, error classification, and circuit breaker
         let provider_name = manifest.model.provider.as_str();
-        let mut response = call_with_retry(&*driver, request, Some(provider_name), None).await?;
+        let llm_start = std::time::Instant::now();
+        let llm_result = call_with_retry(&*driver, request, Some(provider_name), cooldown).await;
+
+        // Record model observation for scoring ledger
+        if let Some(ref k) = kernel {
+            let latency = llm_start.elapsed().as_millis() as u64;
+            let (success, total_tokens, error_cat) = match &llm_result {
+                Ok(resp) => (true, resp.usage.input_tokens + resp.usage.output_tokens, None),
+                Err(e) => (false, 0, Some(format!("{e}"))),
+            };
+            k.record_model_observation(
+                &manifest.model.model,
+                crate::model_scoring::ModelObservation {
+                    timestamp: std::time::SystemTime::now(),
+                    success,
+                    latency_ms: Some(latency),
+                    total_tokens,
+                    task_category: None,
+                    error_category: error_cat,
+                },
+            );
+        }
+
+        let mut response = llm_result?;
 
         total_usage.input_tokens += response.usage.input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;
@@ -433,9 +526,99 @@ pub async fn run_agent_loop(
                         .await;
                 }
 
+                // Auto-promote to shared semantic pool for cross-agent learning
+                if interaction_text.len() > 200 && iteration > 0 {
+                    let mut promo_meta = HashMap::new();
+                    promo_meta.insert(
+                        "source_agent".to_string(),
+                        serde_json::Value::String(session.agent_id.to_string()),
+                    );
+                    promo_meta.insert(
+                        "source_agent_name".to_string(),
+                        serde_json::Value::String(manifest.name.clone()),
+                    );
+                    if let Some(emb) = embedding_driver {
+                        if let Ok(vec) = emb.embed_one(&interaction_text).await {
+                            let _ = memory
+                                .promote_to_shared_async(
+                                    &interaction_text,
+                                    MemorySource::Conversation,
+                                    promo_meta,
+                                    Some(&vec),
+                                )
+                                .await;
+                        }
+                    }
+                }
+
+                // Auto-extract knowledge graph entities from conversation
+                {
+                    let facts =
+                        openfang_memory::knowledge::extract_facts_from_text(&interaction_text);
+                    if !facts.is_empty() {
+                        debug!(
+                            count = facts.len(),
+                            "Auto-extracted {} knowledge graph entities",
+                            facts.len()
+                        );
+                        for fact in &facts {
+                            let subject = openfang_types::memory::Entity {
+                                id: String::new(),
+                                entity_type: fact.subject_type.clone(),
+                                name: fact.subject_name.clone(),
+                                properties: HashMap::new(),
+                                created_at: chrono::Utc::now(),
+                                updated_at: chrono::Utc::now(),
+                            };
+                            let object = openfang_types::memory::Entity {
+                                id: String::new(),
+                                entity_type: fact.object_type.clone(),
+                                name: fact.object_name.clone(),
+                                properties: HashMap::new(),
+                                created_at: chrono::Utc::now(),
+                                updated_at: chrono::Utc::now(),
+                            };
+                            if let (Ok(subj_id), Ok(obj_id)) = (
+                                memory.knowledge_find_or_create(subject),
+                                memory.knowledge_find_or_create(object),
+                            ) {
+                                let relation = openfang_types::memory::Relation {
+                                    source: subj_id,
+                                    relation: fact.relation.clone(),
+                                    target: obj_id,
+                                    properties: HashMap::new(),
+                                    confidence: fact.confidence,
+                                    created_at: chrono::Utc::now(),
+                                };
+                                let _ = memory.add_relation(relation).await;
+                            }
+                        }
+                    }
+                }
+
                 // Notify phase: Done
                 if let Some(cb) = on_phase {
                     cb(LoopPhase::Done);
+                }
+
+                // Reflexion: detect response quality issues and store critiques
+                {
+                    let issues = detect_response_issues(user_message, &final_response, tool_error_count);
+                    if !issues.is_empty() {
+                        let critique = format_critique(&issues);
+                        debug!(agent = %manifest.name, critique = %critique, "Reflexion: storing self-correction");
+                        let mut meta = HashMap::new();
+                        meta.insert("type".to_string(), serde_json::Value::String("self_correction".to_string()));
+                        let _ = memory
+                            .remember(
+                                session.agent_id,
+                                &critique,
+                                MemorySource::System,
+                                "procedural",
+                                meta,
+                            )
+                            .await;
+                    }
                 }
 
                 info!(
@@ -639,6 +822,9 @@ pub async fn run_agent_loop(
                         content
                     };
 
+                    if result.is_error {
+                        tool_error_count += 1;
+                    }
                     tool_result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: result.tool_use_id,
                         content: final_content,
@@ -979,6 +1165,7 @@ pub async fn run_agent_loop_streaming(
     hooks: Option<&crate::hooks::HookRegistry>,
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
+    cooldown: Option<&ProviderCooldown>,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting streaming agent loop");
 
@@ -989,52 +1176,8 @@ pub async fn run_agent_loop_streaming(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
-    // Recall relevant memories — prefer vector similarity search when embedding driver is available
-    let memories = if let Some(emb) = embedding_driver {
-        match emb.embed_one(user_message).await {
-            Ok(query_vec) => {
-                debug!("Using vector recall (streaming, dims={})", query_vec.len());
-                memory
-                    .recall_with_embedding_async(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                        Some(&query_vec),
-                    )
-                    .await
-                    .unwrap_or_default()
-            }
-            Err(e) => {
-                warn!("Embedding recall failed (streaming), falling back to text search: {e}");
-                memory
-                    .recall(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                    .unwrap_or_default()
-            }
-        }
-    } else {
-        memory
-            .recall(
-                user_message,
-                5,
-                Some(MemoryFilter {
-                    agent_id: Some(session.agent_id),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap_or_default()
-    };
+    // Recall relevant memories — unified recall from private (3) + shared (2) pools
+    let memories = recall_unified(memory, session.agent_id, user_message, embedding_driver).await;
 
     // Fire BeforePromptBuild hook
     let agent_id_str = session.agent_id.0.to_string();
@@ -1063,6 +1206,44 @@ pub async fn run_agent_loop_streaming(
         system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
     }
 
+    // Inject knowledge graph context: find entities mentioned in user message (streaming)
+    {
+        let kg_entities = memory
+            .knowledge_find_entities_in_text(user_message)
+            .unwrap_or_default();
+        if !kg_entities.is_empty() {
+            let mut facts_section = String::from("\n\n## Known Facts\n");
+            let mut fact_count = 0;
+            for entity in &kg_entities {
+                if fact_count >= 5 {
+                    break;
+                }
+                let matches = memory
+                    .query_graph(openfang_types::memory::GraphPattern {
+                        source: Some(entity.id.clone()),
+                        relation: None,
+                        target: None,
+                        max_depth: 1,
+                    })
+                    .await
+                    .unwrap_or_default();
+                for m in &matches {
+                    if fact_count >= 5 {
+                        break;
+                    }
+                    facts_section.push_str(&format!(
+                        "- {} {:?} {}\n",
+                        m.source.name, m.relation.relation, m.target.name
+                    ));
+                    fact_count += 1;
+                }
+            }
+            if fact_count > 0 {
+                system_prompt.push_str(&facts_section);
+            }
+        }
+    }
+
     // Add the user message to session history
     session.messages.push(Message::user(user_message));
 
@@ -1077,6 +1258,7 @@ pub async fn run_agent_loop_streaming(
     let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
     let mut total_usage = TokenUsage::default();
     let final_response;
+    let mut tool_error_count: usize = 0;
 
     // Safety valve: trim excessively long message histories to prevent context overflow.
     if messages.len() > MAX_HISTORY_MESSAGES {
@@ -1158,14 +1340,37 @@ pub async fn run_agent_loop_streaming(
 
         // Stream LLM call with retry, error classification, and circuit breaker
         let provider_name = manifest.model.provider.as_str();
-        let mut response = stream_with_retry(
+        let llm_start = std::time::Instant::now();
+        let llm_result = stream_with_retry(
             &*driver,
             request,
             stream_tx.clone(),
             Some(provider_name),
-            None,
+            cooldown,
         )
-        .await?;
+        .await;
+
+        // Record model observation for scoring ledger
+        if let Some(ref k) = kernel {
+            let latency = llm_start.elapsed().as_millis() as u64;
+            let (success, total_tokens, error_cat) = match &llm_result {
+                Ok(resp) => (true, resp.usage.input_tokens + resp.usage.output_tokens, None),
+                Err(e) => (false, 0, Some(format!("{e}"))),
+            };
+            k.record_model_observation(
+                &manifest.model.model,
+                crate::model_scoring::ModelObservation {
+                    timestamp: std::time::SystemTime::now(),
+                    success,
+                    latency_ms: Some(latency),
+                    total_tokens,
+                    task_category: None,
+                    error_category: error_cat,
+                },
+            );
+        }
+
+        let mut response = llm_result?;
 
         total_usage.input_tokens += response.usage.input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;
@@ -1309,9 +1514,99 @@ pub async fn run_agent_loop_streaming(
                         .await;
                 }
 
+                // Auto-promote to shared semantic pool for cross-agent learning (streaming)
+                if interaction_text.len() > 200 && iteration > 0 {
+                    let mut promo_meta = HashMap::new();
+                    promo_meta.insert(
+                        "source_agent".to_string(),
+                        serde_json::Value::String(session.agent_id.to_string()),
+                    );
+                    promo_meta.insert(
+                        "source_agent_name".to_string(),
+                        serde_json::Value::String(manifest.name.clone()),
+                    );
+                    if let Some(emb) = embedding_driver {
+                        if let Ok(vec) = emb.embed_one(&interaction_text).await {
+                            let _ = memory
+                                .promote_to_shared_async(
+                                    &interaction_text,
+                                    MemorySource::Conversation,
+                                    promo_meta,
+                                    Some(&vec),
+                                )
+                                .await;
+                        }
+                    }
+                }
+
+                // Auto-extract knowledge graph entities from conversation (streaming)
+                {
+                    let facts =
+                        openfang_memory::knowledge::extract_facts_from_text(&interaction_text);
+                    if !facts.is_empty() {
+                        debug!(
+                            count = facts.len(),
+                            "Auto-extracted {} knowledge graph entities (streaming)",
+                            facts.len()
+                        );
+                        for fact in &facts {
+                            let subject = openfang_types::memory::Entity {
+                                id: String::new(),
+                                entity_type: fact.subject_type.clone(),
+                                name: fact.subject_name.clone(),
+                                properties: HashMap::new(),
+                                created_at: chrono::Utc::now(),
+                                updated_at: chrono::Utc::now(),
+                            };
+                            let object = openfang_types::memory::Entity {
+                                id: String::new(),
+                                entity_type: fact.object_type.clone(),
+                                name: fact.object_name.clone(),
+                                properties: HashMap::new(),
+                                created_at: chrono::Utc::now(),
+                                updated_at: chrono::Utc::now(),
+                            };
+                            if let (Ok(subj_id), Ok(obj_id)) = (
+                                memory.knowledge_find_or_create(subject),
+                                memory.knowledge_find_or_create(object),
+                            ) {
+                                let relation = openfang_types::memory::Relation {
+                                    source: subj_id,
+                                    relation: fact.relation.clone(),
+                                    target: obj_id,
+                                    properties: HashMap::new(),
+                                    confidence: fact.confidence,
+                                    created_at: chrono::Utc::now(),
+                                };
+                                let _ = memory.add_relation(relation).await;
+                            }
+                        }
+                    }
+                }
+
                 // Notify phase: Done
                 if let Some(cb) = on_phase {
                     cb(LoopPhase::Done);
+                }
+
+                // Reflexion: detect response quality issues and store critiques (streaming)
+                {
+                    let issues = detect_response_issues(user_message, &final_response, tool_error_count);
+                    if !issues.is_empty() {
+                        let critique = format_critique(&issues);
+                        debug!(agent = %manifest.name, critique = %critique, "Reflexion: storing self-correction (streaming)");
+                        let mut meta = HashMap::new();
+                        meta.insert("type".to_string(), serde_json::Value::String("self_correction".to_string()));
+                        let _ = memory
+                            .remember(
+                                session.agent_id,
+                                &critique,
+                                MemorySource::System,
+                                "procedural",
+                                meta,
+                            )
+                            .await;
+                    }
                 }
 
                 info!(
@@ -1525,6 +1820,9 @@ pub async fn run_agent_loop_streaming(
                         warn!(agent = %manifest.name, "Stream consumer disconnected — continuing tool loop but will not stream further");
                     }
 
+                    if result.is_error {
+                        tool_error_count += 1;
+                    }
                     tool_result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: result.tool_use_id,
                         content: final_content,
@@ -1615,6 +1913,97 @@ pub async fn run_agent_loop_streaming(
 }
 
 /// Recover tool calls that LLMs (Groq/Llama, DeepSeek) output as plain text
+/// Unified memory recall: fetches from both private (3 slots) and shared (2 slots) pools,
+/// merges results and deduplicates by cosine similarity > 0.90.
+async fn recall_unified(
+    memory: &MemorySubstrate,
+    agent_id: openfang_types::agent::AgentId,
+    user_message: &str,
+    embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
+) -> Vec<openfang_types::memory::MemoryFragment> {
+    let shared_id = MemorySubstrate::shared_semantic_agent_id();
+
+    if let Some(emb) = embedding_driver {
+        match emb.embed_one(user_message).await {
+            Ok(query_vec) => {
+                debug!("Using unified vector recall (dims={})", query_vec.len());
+
+                // Private memories (3 slots)
+                let private = memory
+                    .recall_with_embedding_async(
+                        user_message,
+                        3,
+                        Some(MemoryFilter {
+                            agent_id: Some(agent_id),
+                            ..Default::default()
+                        }),
+                        Some(&query_vec),
+                    )
+                    .await
+                    .unwrap_or_default();
+
+                // Shared memories (2 slots)
+                let shared = memory
+                    .recall_with_embedding_async(
+                        user_message,
+                        2,
+                        Some(MemoryFilter {
+                            agent_id: Some(shared_id),
+                            ..Default::default()
+                        }),
+                        Some(&query_vec),
+                    )
+                    .await
+                    .unwrap_or_default();
+
+                // Merge and deduplicate by cosine similarity > 0.90
+                let mut merged = private;
+                for s in shared {
+                    let is_dup = merged.iter().any(|m| {
+                        if let (Some(ref me), Some(ref se)) = (&m.embedding, &s.embedding) {
+                            openfang_memory::semantic::cosine_similarity(me, se) > 0.90
+                        } else {
+                            m.content == s.content
+                        }
+                    });
+                    if !is_dup {
+                        merged.push(s);
+                    }
+                }
+                // Keep total to 5
+                merged.truncate(5);
+                merged
+            }
+            Err(e) => {
+                warn!("Embedding recall failed, falling back to text search: {e}");
+                memory
+                    .recall(
+                        user_message,
+                        5,
+                        Some(MemoryFilter {
+                            agent_id: Some(agent_id),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .unwrap_or_default()
+            }
+        }
+    } else {
+        memory
+            .recall(
+                user_message,
+                5,
+                Some(MemoryFilter {
+                    agent_id: Some(agent_id),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_or_default()
+    }
+}
+
 /// instead of the proper `tool_calls` API field.
 ///
 /// Parses patterns like `<function=tool_name>{"key":"value"}</function>` from
@@ -1958,6 +2347,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // cooldown
         )
         .await
         .expect("Loop should complete without error");
@@ -2010,6 +2400,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // cooldown
         )
         .await
         .expect("Loop should complete without error");
@@ -2062,6 +2453,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // cooldown
         )
         .await
         .expect("Loop should complete without error");
@@ -2107,6 +2499,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // cooldown
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -2229,6 +2622,7 @@ mod tests {
             None,
             None, // context_window_tokens
             None, // process_manager
+            None, // cooldown
         )
         .await
         .expect("Loop should recover via retry");
@@ -2275,6 +2669,7 @@ mod tests {
             None,
             None, // context_window_tokens
             None, // process_manager
+            None, // cooldown
         )
         .await
         .expect("Loop should complete with fallback");
@@ -2329,6 +2724,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // cooldown
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -2699,6 +3095,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // cooldown
         )
         .await
         .expect("Agent loop should complete");
@@ -2765,6 +3162,7 @@ mod tests {
             None,
             None,
             None,
+            None, // cooldown
         )
         .await
         .expect("Normal loop should complete");
@@ -2827,6 +3225,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // cooldown
         )
         .await
         .expect("Streaming loop should complete");

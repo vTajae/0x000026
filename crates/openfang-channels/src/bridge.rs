@@ -434,6 +434,12 @@ async fn dispatch_message(
         }
     }
 
+    // Suppress responses for read-only channels (message is logged but no reply sent)
+    if message.metadata.get("read_only").and_then(|v| v.as_bool()) == Some(true) {
+        debug!("Skipping response for read-only channel message");
+        return;
+    }
+
     let text = match &message.content {
         ChannelContent::Text(t) => t.clone(),
         ChannelContent::Command { name, args } => {

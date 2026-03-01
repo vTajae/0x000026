@@ -239,6 +239,24 @@ pub async fn build_router(
             "/api/templates/{name}",
             axum::routing::get(routes::get_template),
         )
+        // Context pressure endpoints
+        .route(
+            "/api/agents/{id}/context",
+            axum::routing::get(routes::get_agent_context),
+        )
+        .route(
+            "/api/context/pressure",
+            axum::routing::get(routes::context_pressure_all),
+        )
+        // Memory export/import endpoints
+        .route(
+            "/api/memory/export",
+            axum::routing::get(routes::memory_export),
+        )
+        .route(
+            "/api/memory/import",
+            axum::routing::post(routes::memory_import),
+        )
         // Memory endpoints
         .route(
             "/api/memory/agents/{id}/kv",
@@ -463,6 +481,18 @@ pub async fn build_router(
         .route(
             "/api/providers/{name}/url",
             axum::routing::put(routes::set_provider_url),
+        )
+        .route(
+            "/api/providers/health",
+            axum::routing::get(routes::providers_health),
+        )
+        .route(
+            "/api/models/scores",
+            axum::routing::get(routes::model_scores),
+        )
+        .route(
+            "/api/models/rank/{category}",
+            axum::routing::get(routes::model_rank_for_task),
         )
         .route(
             "/api/skills/create",

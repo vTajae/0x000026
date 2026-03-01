@@ -33,9 +33,12 @@ listen_addr = "127.0.0.1:4200"           # OFP listen address
 # bot_token_env = "TELEGRAM_BOT_TOKEN"
 # allowed_users = []                      # Empty = allow all
 
-# [discord]
+# [channels.discord]
 # bot_token_env = "DISCORD_BOT_TOKEN"
-# guild_ids = []                          # Empty = all guilds
+# allowed_guilds = []                     # Empty = all guilds
+# allowed_channels = []                   # Channel IDs to interact in (empty = all)
+# allowed_users = []                      # User IDs or usernames allowed (empty = all)
+# read_only_channels = []                 # Channel IDs where bot reads but never responds
 
 # [slack]
 # bot_token_env = "SLACK_BOT_TOKEN"

@@ -13,6 +13,14 @@ use std::path::Path;
 /// Environment variables considered safe to inherit on all platforms.
 pub const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "TERM",
+    // XDG dirs — needed by CLI tools for config/credential lookup
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CACHE_HOME",
+    // User identity — needed for OAuth token paths
+    "USER", "LOGNAME",
+    // Display — needed for browser-based OAuth redirect
+    "DISPLAY", "WAYLAND_DISPLAY",
+    // Locale extras
+    "LC_CTYPE",
 ];
 
 /// Additional environment variables considered safe on Windows.

@@ -1,0 +1,89 @@
+id = "monitor"
+name = "Monitor Hand"
+description = "System health monitor — tracks provider health, budget usage, and delivers alerts to configured channels."
+category = "productivity"
+max_iterations = 20
+
+tools = [
+    "web_fetch",
+    "memory_store",
+    "memory_recall",
+    "schedule_create",
+    "schedule_list",
+    "schedule_delete",
+    "knowledge_add_entity",
+    "knowledge_add_relation",
+    "knowledge_query",
+    "agent_send",
+    "agent_list",
+]
+
+[[settings]]
+key = "alert_channel"
+setting_type = "text"
+label = "Alert Channel"
+description = "Channel to send alerts to (e.g., 'discord')"
+default = "discord"
+required = false
+
+[[settings]]
+key = "alert_recipient"
+setting_type = "text"
+label = "Alert Recipient"
+description = "Channel ID or user to send alerts to"
+default = "1477001928155070578"
+required = false
+
+[[settings]]
+key = "check_interval_minutes"
+setting_type = "text"
+label = "Health Check Interval (minutes)"
+description = "How often to run provider health checks"
+default = "15"
+required = false
+
+[[settings]]
+key = "budget_alert_threshold"
+setting_type = "text"
+label = "Budget Alert Threshold (%)"
+description = "Alert when budget usage exceeds this percentage"
+default = "75"
+required = false
+
+[[settings]]
+key = "api_base_url"
+setting_type = "text"
+label = "API Base URL"
+description = "OpenFang API base URL for health checks"
+default = "http://127.0.0.1:4200"
+required = false
+
+# ─── Agent configuration ─────────────────────────────────────────────────────
+
+[agent]
+name = "monitor-hand"
+description = "System health monitor — tracks provider health, budget usage, and delivers alerts to configured channels"
+module = "builtin:chat"
+provider = "default"
+model = "default"
+max_tokens = 4096
+temperature = 0.2
+max_iterations = 20
+system_prompt = """You are the Monitor Hand for the OpenFang Agent OS. Your job is to keep the system healthy, track provider availability, monitor budget usage, and alert operators when something needs attention.
+
+## Core Tasks
+
+1. **Health Check**: Fetch {api_base_url}/api/providers/health and {api_base_url}/api/budget
+2. **Alert**: Use agent_send to notify the configured channel when providers go down or budget thresholds are exceeded
+3. **Track**: Store health observations in memory and knowledge graph for trend analysis
+4. **Report**: Generate hourly and daily summaries of system health and spend
+
+## Alert Format
+
+[Monitor] {severity} — {title}
+{description}
+Time: {timestamp}
+Action: {recommendation}
+
+Severity levels: INFO, WARN, CRITICAL
+"""

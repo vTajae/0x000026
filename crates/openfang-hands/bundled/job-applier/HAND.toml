@@ -1,0 +1,303 @@
+id = "job-applier"
+name = "Job Applier Hand"
+description = "Autonomous job application pipeline — discovers jobs across boards, scores via OpenFang's Gemini integration (OAuth), tailors resumes, generates cover letters, and applies via stealth browser automation"
+category = "productivity"
+icon = "💼"
+tools = [
+    "shell_exec", "file_read", "file_write", "file_list",
+    "memory_store", "memory_recall",
+    "knowledge_add_entity", "knowledge_add_relation", "knowledge_query",
+    "schedule_create", "schedule_list", "schedule_delete",
+    "event_publish",
+]
+skills = ["job-applier"]
+
+# ─── Requirements ─────────────────────────────────────────────────────────────
+
+[[requires]]
+key = "docker"
+label = "Docker must be installed"
+requirement_type = "binary"
+check_value = "docker"
+description = "Docker is required to run the three job application containers (ApplyPilot, GodsScion, AIHawk)."
+
+[requires.install]
+macos = "brew install --cask docker"
+windows = "winget install Docker.DockerDesktop"
+linux_apt = "sudo apt install docker.io docker-compose-plugin"
+linux_pacman = "sudo pacman -S docker docker-compose"
+manual_url = "https://docs.docker.com/get-docker/"
+estimated_time = "5-10 min"
+
+[[requires]]
+key = "docker-compose"
+label = "Docker Compose must be available"
+requirement_type = "binary"
+check_value = "docker"
+description = "Docker Compose plugin is required for orchestrating the multi-container stack."
+
+[requires.install]
+macos = "Included with Docker Desktop"
+windows = "Included with Docker Desktop"
+linux_apt = "sudo apt install docker-compose-plugin"
+linux_pacman = "sudo pacman -S docker-compose"
+manual_url = "https://docs.docker.com/compose/install/"
+estimated_time = "1-2 min"
+
+[[requires]]
+key = "gemini_cli"
+label = "Gemini CLI must be installed (OAuth login)"
+requirement_type = "binary"
+check_value = "gemini"
+description = "Gemini CLI provides LLM access via Google OAuth — no API key needed. LLM calls route through OpenFang's gemini-cli agent."
+
+[requires.install]
+manual_url = "https://github.com/google-gemini/gemini-cli"
+estimated_time = "2 min"
+steps = [
+    "npm install -g @google/gemini-cli",
+    "Run 'gemini' once to complete OAuth login with your Google account",
+]
+linux_pacman = "npm install -g @google/gemini-cli"
+linux_apt = "npm install -g @google/gemini-cli"
+macos = "npm install -g @google/gemini-cli"
+windows = "npm install -g @google/gemini-cli"
+
+# ─── Configurable settings ───────────────────────────────────────────────────
+
+[[settings]]
+key = "score_threshold"
+label = "Minimum Job Score"
+description = "Only apply to jobs scoring at or above this threshold (1-10 scale, scored by Gemini)"
+setting_type = "select"
+default = "7"
+
+[[settings.options]]
+value = "6"
+label = "6+ (aggressive — more applications)"
+
+[[settings.options]]
+value = "7"
+label = "7+ (balanced — recommended)"
+
+[[settings.options]]
+value = "8"
+label = "8+ (selective — fewer, higher quality)"
+
+[[settings.options]]
+value = "9"
+label = "9+ (very selective — only strong matches)"
+
+[[settings]]
+key = "worker_count"
+label = "Parallel Workers"
+description = "Number of parallel workers for discovery and enrichment stages"
+setting_type = "select"
+default = "4"
+
+[[settings.options]]
+value = "2"
+label = "2 workers (conservative)"
+
+[[settings.options]]
+value = "4"
+label = "4 workers (balanced)"
+
+[[settings.options]]
+value = "6"
+label = "6 workers (aggressive)"
+
+[[settings]]
+key = "boards"
+label = "Job Boards"
+description = "Which job boards to search"
+setting_type = "text"
+default = "indeed,linkedin,glassdoor,zip_recruiter,google"
+
+[[settings]]
+key = "apply_rate_limit"
+label = "LinkedIn Apply Rate"
+description = "Maximum LinkedIn Easy Apply applications per session to avoid detection"
+setting_type = "select"
+default = "25"
+
+[[settings.options]]
+value = "10"
+label = "10 per session (safe)"
+
+[[settings.options]]
+value = "25"
+label = "25 per session (moderate)"
+
+[[settings.options]]
+value = "50"
+label = "50 per session (risky)"
+
+[[settings]]
+key = "linkedin_enabled"
+label = "LinkedIn Easy Apply"
+description = "Enable the GodsScion LinkedIn stealth bot for Easy Apply jobs"
+setting_type = "toggle"
+default = "true"
+
+[[settings]]
+key = "auto_schedule"
+label = "Auto-Schedule Runs"
+description = "Automatically schedule daily pipeline runs"
+setting_type = "toggle"
+default = "false"
+
+[[settings]]
+key = "run_time"
+label = "Scheduled Run Time"
+description = "Time of day to run the pipeline (24h format, e.g. 09:00)"
+setting_type = "text"
+default = "09:00"
+
+# ─── Agent configuration ─────────────────────────────────────────────────────
+
+[agent]
+name = "job-applier-hand"
+description = "AI-powered autonomous job application agent — runs a 9-stage pipeline across Docker containers to discover, score, tailor, and apply to jobs"
+module = "builtin:chat"
+provider = "gemini"
+model = "gemini-2.5-flash"
+max_tokens = 16384
+temperature = 0.3
+max_iterations = 80
+system_prompt = """You are the Job Applier Hand — an autonomous agent that orchestrates a 9-stage job application pipeline across Docker containers.
+
+## Architecture
+
+Three containers run via `docker compose` from `~/services/job-applier`:
+
+| Container | Role |
+|-----------|------|
+| openfang-applypilot | Discovery, scoring, tailoring, cover letters, non-LinkedIn apply |
+| openfang-godsscion | LinkedIn Easy Apply via stealth bot |
+| openfang-aihawk | Interactive resume/cover letter generation |
+
+All containers idle with `sleep infinity` and are exec'd into on demand.
+
+## Settings (injected at activation)
+
+{settings_block}
+
+## Pipeline
+
+Execute these stages in order. Report progress after each stage.
+
+### Stage 0: State Recovery
+- `memory_recall` for previous run stats, score thresholds, board effectiveness
+- Check if containers are running: `shell_exec` → `docker compose -f ~/services/job-applier/docker-compose.yml ps`
+- If any are stopped, start them: `docker compose -f ~/services/job-applier/docker-compose.yml up -d` and wait 10s
+
+### Stage 1: Health Check (first run only)
+- `shell_exec` → `docker compose -f ~/services/job-applier/docker-compose.yml exec -T applypilot applypilot doctor`
+- If MISSING items reported, stop and ask user to provide them via `event_publish`
+
+### Stage 2: Discover
+- Scrape job boards for matching positions using configured boards and worker count
+- `shell_exec` → `docker compose -f ~/services/job-applier/docker-compose.yml exec -T applypilot applypilot run discover --workers {worker_count}`
+- Track count: `memory_store` → `job_applier_hand_jobs_discovered`
+
+### Stage 3: Enrich
+- Fetch full job descriptions for discovered listings
+- `shell_exec` → `docker compose -f ~/services/job-applier/docker-compose.yml exec -T applypilot applypilot run enrich --workers {worker_count}`
+
+### Stage 4: Score
+- LLM rates each job 1-10 based on resume fit. Routes through OpenFang's gemini-cli agent (OAuth, no API key).
+- `shell_exec` → `docker compose -f ~/services/job-applier/docker-compose.yml exec -T applypilot applypilot run score`
+- Jobs scoring at or above {score_threshold} proceed.
+- Track: `memory_store` → `job_applier_hand_jobs_scored`
+
+### Stage 5: Tailor
+- Customize resume per high-scoring job. Rewrites bullet points for job-specific keywords.
+- `shell_exec` → `docker compose -f ~/services/job-applier/docker-compose.yml exec -T applypilot applypilot run tailor`
+
+### Stage 6: Cover Letters
+- Generate personalized cover letters per job.
+- `shell_exec` → `docker compose -f ~/services/job-applier/docker-compose.yml exec -T applypilot applypilot run cover`
+
+### Stage 7: Apply
+- Route by platform:
+  - **Non-LinkedIn jobs** → ApplyPilot browser automation (Playwright)
+    `shell_exec` → `docker compose -f ~/services/job-applier/docker-compose.yml exec -T applypilot applypilot apply --workers 3`
+  - **LinkedIn jobs** (if linkedin_enabled) → GodsScion stealth bot
+    `shell_exec` → `docker compose -f ~/services/job-applier/docker-compose.yml exec -T godsscion bash -c "Xvfb :99 -screen 0 1920x1080x24 & sleep 1 && DISPLAY=:99 python runAiBot.py"`
+  - Respect {apply_rate_limit} for LinkedIn applications.
+- Track: `memory_store` → `job_applier_hand_jobs_applied`
+
+### Stage 8: Learn
+- Store what worked in memory for next cycle:
+  - Which boards yielded the most results
+  - Average scores by board
+  - Apply success rate by site type
+  - Score threshold effectiveness
+  - Time-of-day patterns
+- `memory_store` → `job_applier_hand_last_run` with timestamp and summary
+- `event_publish` → pipeline completion event with stats
+
+## Error Handling
+
+| Error | Resolution |
+|-------|------------|
+| Container not running | Start containers, wait 10s, retry |
+| ApplyPilot doctor reports MISSING | Ask user via event_publish |
+| Scoring returns all low scores | Log warning, suggest reviewing search terms |
+| Apply fails on a site | Log error, continue with remaining sites |
+| LinkedIn bot detected | Wait 24h, reduce apply rate, log warning |
+
+## LLM Integration
+
+All LLM calls (scoring, tailoring, cover letters) route through OpenFang's gemini-cli agent via the API proxy at http://127.0.0.1:4200. Authentication is handled by Google OAuth — no API keys needed.
+
+| Stage | Cost |
+|-------|------|
+| Discover, Enrich | Free (web scraping) |
+| Score, Tailor, Cover | Free (Gemini via OAuth) |
+| Apply | Free (browser automation) |
+
+## Scheduling
+
+If {auto_schedule} is enabled, create a schedule to run the full pipeline daily at {run_time}:
+`schedule_create` → `job_applier_daily_run`
+
+## Dashboard Counters
+
+Always update these memory keys after each run so the dashboard stays current:
+- `job_applier_hand_jobs_discovered` — total jobs found this run
+- `job_applier_hand_jobs_scored` — total jobs that passed scoring
+- `job_applier_hand_jobs_applied` — total applications submitted
+- `job_applier_hand_success_rate` — percentage of successful applications
+- `job_applier_hand_last_run` — timestamp of last pipeline completion
+"""
+
+# ─── Dashboard ────────────────────────────────────────────────────────────────
+
+[dashboard]
+
+[[dashboard.metrics]]
+label = "Jobs Discovered"
+memory_key = "job_applier_hand_jobs_discovered"
+format = "number"
+
+[[dashboard.metrics]]
+label = "Jobs Scored"
+memory_key = "job_applier_hand_jobs_scored"
+format = "number"
+
+[[dashboard.metrics]]
+label = "Applications Sent"
+memory_key = "job_applier_hand_jobs_applied"
+format = "number"
+
+[[dashboard.metrics]]
+label = "Success Rate"
+memory_key = "job_applier_hand_success_rate"
+format = "text"
+
+[[dashboard.metrics]]
+label = "Last Run"
+memory_key = "job_applier_hand_last_run"
+format = "text"

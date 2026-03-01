@@ -73,6 +73,9 @@ pub enum SkillSource {
     OpenClaw,
     /// Downloaded from ClawHub marketplace.
     ClawHub { slug: String, version: String },
+    /// Locally developed skill. When `path` is absent, the loader uses the
+    /// skill directory itself.
+    Local { path: Option<String> },
 }
 
 /// A tool provided by a skill.
@@ -246,5 +249,40 @@ capabilities = ["NetConnect(*)"]
         let json = serde_json::to_string(&native).unwrap();
         let back: SkillSource = serde_json::from_str(&json).unwrap();
         assert_eq!(back, SkillSource::Native);
+    }
+
+    #[test]
+    fn test_skill_source_local_serde() {
+        // Local with explicit path
+        let src = SkillSource::Local {
+            path: Some("/home/user/skills/job-applier".to_string()),
+        };
+        let json = serde_json::to_string(&src).unwrap();
+        let back: SkillSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, src);
+
+        // Local with no path (uses skill directory)
+        let src_no_path = SkillSource::Local { path: None };
+        let json = serde_json::to_string(&src_no_path).unwrap();
+        let back: SkillSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, src_no_path);
+    }
+
+    #[test]
+    fn test_skill_source_local_from_toml() {
+        let toml_str = r#"
+[skill]
+name = "job-applier"
+version = "0.1.0"
+description = "Applies to jobs"
+
+[source]
+type = "local"
+"#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            manifest.source,
+            Some(SkillSource::Local { path: None })
+        );
     }
 }

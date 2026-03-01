@@ -1069,6 +1069,9 @@ pub async fn start_channel_bridge_with_config(
             let adapter = Arc::new(DiscordAdapter::new(
                 token,
                 dc_config.allowed_guilds.clone(),
+                dc_config.allowed_channels.clone(),
+                dc_config.allowed_users.clone(),
+                dc_config.read_only_channels.clone(),
                 dc_config.intents,
             ));
             adapters.push((adapter, dc_config.default_agent.clone()));

@@ -7,6 +7,7 @@ use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{
     Entity, EntityType, GraphMatch, GraphPattern, Relation, RelationType,
 };
+use regex_lite::Regex;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -183,6 +184,326 @@ impl KnowledgeStore {
         }
         Ok(matches)
     }
+
+    /// Find or create an entity by (name, entity_type).
+    /// If found, updates the timestamp and returns the existing ID.
+    /// If not found, creates a new entity.
+    pub fn find_or_create_entity(&self, entity: Entity) -> OpenFangResult<String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let entity_type_str = serde_json::to_string(&entity.entity_type)
+            .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+
+        // Look up by (name, entity_type)
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM entities WHERE name = ?1 AND entity_type = ?2",
+                rusqlite::params![entity.name, entity_type_str],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if let Some(id) = existing {
+            // Update timestamp on existing entity
+            let now = Utc::now().to_rfc3339();
+            let _ = conn.execute(
+                "UPDATE entities SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![now, id],
+            );
+            Ok(id)
+        } else {
+            // Create new entity
+            drop(conn);
+            self.add_entity(entity)
+        }
+    }
+
+    /// Export all entities from the knowledge graph.
+    pub fn export_entities(&self) -> OpenFangResult<Vec<Entity>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare("SELECT id, entity_type, name, properties, created_at, updated_at FROM entities ORDER BY created_at")
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let mut entities = Vec::new();
+        for r in rows {
+            let (id, etype, name, props, created, updated) =
+                r.map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            entities.push(parse_entity(&id, &etype, &name, &props, &created, &updated));
+        }
+        Ok(entities)
+    }
+
+    /// Export all relations from the knowledge graph.
+    pub fn export_relations(&self) -> OpenFangResult<Vec<Relation>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare("SELECT source_entity, relation_type, target_entity, properties, confidence, created_at FROM relations ORDER BY created_at")
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, f64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let mut relations = Vec::new();
+        for r in rows {
+            let (source, rtype, target, props, conf, created) =
+                r.map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            relations.push(parse_relation(&source, &rtype, &target, &props, conf, &created));
+        }
+        Ok(relations)
+    }
+
+    /// Import an entity (upsert by name + entity_type).
+    pub fn import_entity(&self, entity: &Entity) -> OpenFangResult<()> {
+        let _ = self.find_or_create_entity(entity.clone())?;
+        Ok(())
+    }
+
+    /// Import a relation (upsert by source + relation + target).
+    pub fn import_relation(&self, relation: &Relation) -> OpenFangResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let rel_type_str = serde_json::to_string(&relation.relation)
+            .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+        // Check for existing
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM relations WHERE source_entity = ?1 AND relation_type = ?2 AND target_entity = ?3",
+                rusqlite::params![relation.source, rel_type_str, relation.target],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if exists {
+            return Ok(());
+        }
+        drop(conn);
+        let _ = self.add_relation(relation.clone())?;
+        Ok(())
+    }
+
+    /// Find entities whose names appear in the given text (case-insensitive substring match).
+    /// Returns up to 10 matching entities.
+    pub fn find_entities_in_text(&self, text: &str) -> OpenFangResult<Vec<Entity>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+
+        let text_lower = text.to_lowercase();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, entity_type, name, properties, created_at, updated_at
+                 FROM entities
+                 WHERE LENGTH(name) >= 2
+                 ORDER BY updated_at DESC
+                 LIMIT 100",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let mut entities = Vec::new();
+        for row_result in rows {
+            let (id, etype, name, props, created, updated) =
+                row_result.map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+            // Check if entity name appears in text (case-insensitive)
+            if text_lower.contains(&name.to_lowercase()) {
+                entities.push(parse_entity(&id, &etype, &name, &props, &created, &updated));
+                if entities.len() >= 10 {
+                    break;
+                }
+            }
+        }
+
+        Ok(entities)
+    }
+}
+
+/// An extracted fact from text (subject-relation-object triple).
+#[derive(Debug, Clone)]
+pub struct ExtractedFact {
+    pub subject_name: String,
+    pub subject_type: EntityType,
+    pub relation: RelationType,
+    pub object_name: String,
+    pub object_type: EntityType,
+    pub confidence: f32,
+}
+
+/// Extract facts from text using pattern matching.
+/// No LLM call — pure regex, zero latency/cost.
+pub fn extract_facts_from_text(text: &str) -> Vec<ExtractedFact> {
+    let mut facts = Vec::new();
+
+    // Name capture: uppercase letter followed by lowercase letters, optionally
+    // followed by more capitalized words. NO (?i) flag — [A-Z] must be literal
+    // uppercase to avoid capturing common words like "and", "the", "is".
+    const NAME: &str = r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)";
+
+    // Pattern: "X works at Y" / "X work at Y" / "X is working at Y"
+    let works_at = Regex::new(&format!(
+        r"\b{NAME}\s+(?:[Ww]orks?|[Ii]s [Ww]orking|[Aa]m [Ww]orking)\s+[Aa]t\s+{NAME}"
+    )).unwrap();
+    for cap in works_at.captures_iter(text) {
+        facts.push(ExtractedFact {
+            subject_name: cap[1].to_string(),
+            subject_type: EntityType::Person,
+            relation: RelationType::WorksAt,
+            object_name: cap[2].to_string(),
+            object_type: EntityType::Organization,
+            confidence: 0.7,
+        });
+    }
+
+    // Pattern: "I work at Y" / "I'm working at Y"
+    let i_work_at = Regex::new(&format!(
+        r"\b[Ii]\s+(?:[Ww]ork|[Aa]m [Ww]orking|'m [Ww]orking)\s+[Aa]t\s+{NAME}"
+    )).unwrap();
+    for cap in i_work_at.captures_iter(text) {
+        facts.push(ExtractedFact {
+            subject_name: "User".to_string(),
+            subject_type: EntityType::Person,
+            relation: RelationType::WorksAt,
+            object_name: cap[1].to_string(),
+            object_type: EntityType::Organization,
+            confidence: 0.7,
+        });
+    }
+
+    // Pattern: "X is located in Y" / "X is based in Y"
+    let located_in = Regex::new(&format!(
+        r"\b{NAME}\s+(?:[Ii]s\s+)?(?:[Ll]ocated|[Bb]ased)\s+[Ii]n\s+{NAME}"
+    )).unwrap();
+    for cap in located_in.captures_iter(text) {
+        facts.push(ExtractedFact {
+            subject_name: cap[1].to_string(),
+            subject_type: EntityType::Organization,
+            relation: RelationType::LocatedIn,
+            object_name: cap[2].to_string(),
+            object_type: EntityType::Location,
+            confidence: 0.7,
+        });
+    }
+
+    // Pattern: "I'm from Y" / "I am from Y"
+    let from_place = Regex::new(&format!(
+        r"\b(?:[Ii]'m|[Ii] [Aa]m)\s+[Ff]rom\s+{NAME}"
+    )).unwrap();
+    for cap in from_place.captures_iter(text) {
+        facts.push(ExtractedFact {
+            subject_name: "User".to_string(),
+            subject_type: EntityType::Person,
+            relation: RelationType::LocatedIn,
+            object_name: cap[1].to_string(),
+            object_type: EntityType::Location,
+            confidence: 0.7,
+        });
+    }
+
+    // Pattern: "X uses Y" / "X is using Y"
+    let uses = Regex::new(&format!(
+        r"\b{NAME}\s+(?:[Uu]ses?|[Ii]s [Uu]sing)\s+{NAME}"
+    )).unwrap();
+    for cap in uses.captures_iter(text) {
+        facts.push(ExtractedFact {
+            subject_name: cap[1].to_string(),
+            subject_type: EntityType::Person,
+            relation: RelationType::Uses,
+            object_name: cap[2].to_string(),
+            object_type: EntityType::Tool,
+            confidence: 0.7,
+        });
+    }
+
+    // Pattern: "X depends on Y"
+    let depends = Regex::new(&format!(
+        r"\b{NAME}\s+[Dd]epends?\s+[Oo]n\s+{NAME}"
+    )).unwrap();
+    for cap in depends.captures_iter(text) {
+        facts.push(ExtractedFact {
+            subject_name: cap[1].to_string(),
+            subject_type: EntityType::Project,
+            relation: RelationType::DependsOn,
+            object_name: cap[2].to_string(),
+            object_type: EntityType::Project,
+            confidence: 0.7,
+        });
+    }
+
+    // Pattern: "my name is X" / "My name is X"
+    let my_name = Regex::new(&format!(
+        r"\b[Mm]y\s+[Nn]ame\s+[Ii]s\s+{NAME}"
+    )).unwrap();
+    for cap in my_name.captures_iter(text) {
+        facts.push(ExtractedFact {
+            subject_name: "User".to_string(),
+            subject_type: EntityType::Person,
+            relation: RelationType::Custom("named".to_string()),
+            object_name: cap[1].to_string(),
+            object_type: EntityType::Person,
+            confidence: 0.8,
+        });
+    }
+
+    // Pattern: "X prefers Y"
+    let prefers = Regex::new(&format!(
+        r"\b{NAME}\s+[Pp]refers?\s+{NAME}"
+    )).unwrap();
+    for cap in prefers.captures_iter(text) {
+        facts.push(ExtractedFact {
+            subject_name: cap[1].to_string(),
+            subject_type: EntityType::Person,
+            relation: RelationType::Custom("prefers".to_string()),
+            object_name: cap[2].to_string(),
+            object_type: EntityType::Concept,
+            confidence: 0.7,
+        });
+    }
+
+    facts
 }
 
 /// Raw row from a graph query.

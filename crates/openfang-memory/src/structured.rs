@@ -106,6 +106,41 @@ impl StructuredStore {
         Ok(pairs)
     }
 
+    /// Export all key-value entries across all agents.
+    pub fn export_all_kv(&self) -> OpenFangResult<Vec<openfang_types::memory::KvEntry>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare("SELECT agent_id, key, value FROM kv_store ORDER BY agent_id, key")
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let mut entries = Vec::new();
+        for r in rows {
+            let (agent_id, key, blob) = r.map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let value: serde_json::Value = serde_json::from_slice(&blob).unwrap_or(serde_json::Value::Null);
+            entries.push(openfang_types::memory::KvEntry { agent_id, key, value });
+        }
+        Ok(entries)
+    }
+
+    /// Import a key-value entry (overwrite by agent_id + key).
+    pub fn import_kv(&self, entry: &openfang_types::memory::KvEntry) -> OpenFangResult<()> {
+        let agent_id = uuid::Uuid::parse_str(&entry.agent_id)
+            .map(AgentId)
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        self.set(agent_id, &entry.key, entry.value.clone())
+    }
+
     /// Save an agent entry to the database.
     pub fn save_agent(&self, entry: &AgentEntry) -> OpenFangResult<()> {
         let conn = self

@@ -10,8 +10,8 @@ use tracing::warn;
 
 /// A driver that wraps multiple LLM drivers and tries each in order.
 ///
-/// On failure, moves to the next driver. Rate-limit and overload errors
-/// are bubbled up for retry logic to handle.
+/// On failure — including rate-limit and overload errors — moves to the
+/// next driver. Only returns an error if ALL drivers in the chain fail.
 pub struct FallbackDriver {
     drivers: Vec<Arc<dyn LlmDriver>>,
 }
@@ -33,15 +33,17 @@ impl LlmDriver for FallbackDriver {
         for (i, driver) in self.drivers.iter().enumerate() {
             match driver.complete(request.clone()).await {
                 Ok(response) => return Ok(response),
-                Err(e @ LlmError::RateLimited { .. }) | Err(e @ LlmError::Overloaded { .. }) => {
-                    // Retryable errors — bubble up for the retry loop to handle
-                    return Err(e);
-                }
                 Err(e) => {
+                    let is_last = i + 1 == self.drivers.len();
+                    if is_last {
+                        // Last driver — nothing left to fall through to
+                        return Err(e);
+                    }
                     warn!(
                         driver_index = i,
                         error = %e,
-                        "Fallback driver failed, trying next"
+                        remaining = self.drivers.len() - i - 1,
+                        "Fallback driver failed, cascading to next"
                     );
                     last_error = Some(e);
                 }
@@ -64,14 +66,16 @@ impl LlmDriver for FallbackDriver {
         for (i, driver) in self.drivers.iter().enumerate() {
             match driver.stream(request.clone(), tx.clone()).await {
                 Ok(response) => return Ok(response),
-                Err(e @ LlmError::RateLimited { .. }) | Err(e @ LlmError::Overloaded { .. }) => {
-                    return Err(e);
-                }
                 Err(e) => {
+                    let is_last = i + 1 == self.drivers.len();
+                    if is_last {
+                        return Err(e);
+                    }
                     warn!(
                         driver_index = i,
                         error = %e,
-                        "Fallback driver (stream) failed, trying next"
+                        remaining = self.drivers.len() - i - 1,
+                        "Fallback driver (stream) failed, cascading to next"
                     );
                     last_error = Some(e);
                 }
@@ -166,7 +170,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rate_limit_bubbles_up() {
+    async fn test_rate_limit_cascades_to_fallback() {
         struct RateLimitDriver;
 
         #[async_trait]
@@ -186,7 +190,32 @@ mod tests {
             Arc::new(OkDriver) as Arc<dyn LlmDriver>,
         ]);
         let result = driver.complete(test_request()).await;
-        // Rate limit should NOT fall through to next driver
+        // Rate limit should cascade to next driver (OkDriver)
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().text(), "OK");
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_returns_error_when_last_driver() {
+        struct RateLimitDriver;
+
+        #[async_trait]
+        impl LlmDriver for RateLimitDriver {
+            async fn complete(
+                &self,
+                _req: CompletionRequest,
+            ) -> Result<CompletionResponse, LlmError> {
+                Err(LlmError::RateLimited {
+                    retry_after_ms: 5000,
+                })
+            }
+        }
+
+        // Only one driver — rate limit must be returned
+        let driver = FallbackDriver::new(vec![
+            Arc::new(RateLimitDriver) as Arc<dyn LlmDriver>,
+        ]);
+        let result = driver.complete(test_request()).await;
         assert!(matches!(result, Err(LlmError::RateLimited { .. })));
     }
 }

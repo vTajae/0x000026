@@ -290,6 +290,107 @@ impl SemanticStore {
         Ok(())
     }
 
+    /// Export all non-deleted memories.
+    pub fn export_all(&self) -> OpenFangResult<Vec<MemoryFragment>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, embedding
+                 FROM memories WHERE deleted = 0 ORDER BY created_at",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, f64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<Vec<u8>>>(10)?,
+                ))
+            })
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let mut fragments = Vec::new();
+        for row_result in rows {
+            let (id_str, agent_str, content, source_str, scope, confidence, meta_str, created_str, accessed_str, access_count, emb_bytes) =
+                row_result.map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let id = uuid::Uuid::parse_str(&id_str)
+                .map(MemoryId)
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let agent_id = uuid::Uuid::parse_str(&agent_str)
+                .map(openfang_types::agent::AgentId)
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let source: MemorySource = serde_json::from_str(&source_str).unwrap_or(MemorySource::System);
+            let metadata: HashMap<String, serde_json::Value> = serde_json::from_str(&meta_str).unwrap_or_default();
+            let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now());
+            let accessed_at = chrono::DateTime::parse_from_rfc3339(&accessed_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now());
+            let embedding = emb_bytes.as_deref().map(embedding_from_bytes);
+            fragments.push(MemoryFragment {
+                id, agent_id, content, embedding, metadata, source,
+                confidence: confidence as f32, created_at, accessed_at,
+                access_count: access_count as u64, scope,
+            });
+        }
+        Ok(fragments)
+    }
+
+    /// Import a memory fragment, deduplicating by content+agent_id.
+    pub fn import_memory(&self, fragment: &MemoryFragment) -> OpenFangResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        // Check if a memory with the same content and agent_id already exists
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE agent_id = ?1 AND content = ?2 AND deleted = 0",
+                rusqlite::params![fragment.agent_id.0.to_string(), fragment.content],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if exists {
+            return Ok(());
+        }
+        let source_str = serde_json::to_string(&fragment.source)
+            .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+        let meta_str = serde_json::to_string(&fragment.metadata)
+            .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+        let emb_bytes: Option<Vec<u8>> = fragment.embedding.as_deref().map(embedding_to_bytes);
+        conn.execute(
+            "INSERT INTO memories (id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, deleted, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11)",
+            rusqlite::params![
+                fragment.id.0.to_string(),
+                fragment.agent_id.0.to_string(),
+                fragment.content,
+                source_str,
+                fragment.scope,
+                fragment.confidence as f64,
+                meta_str,
+                fragment.created_at.to_rfc3339(),
+                fragment.accessed_at.to_rfc3339(),
+                fragment.access_count as i64,
+                emb_bytes,
+            ],
+        ).map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(())
+    }
+
     /// Update the embedding for an existing memory.
     pub fn update_embedding(&self, id: MemoryId, embedding: &[f32]) -> OpenFangResult<()> {
         let conn = self
@@ -307,7 +408,7 @@ impl SemanticStore {
 }
 
 /// Compute cosine similarity between two vectors.
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
@@ -337,7 +438,7 @@ fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
 }
 
 /// Deserialize embedding from bytes.
-fn embedding_from_bytes(bytes: &[u8]) -> Vec<f32> {
+pub fn embedding_from_bytes(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))

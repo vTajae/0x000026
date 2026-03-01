@@ -229,6 +229,8 @@ pub struct ConsolidationReport {
     pub memories_merged: u64,
     /// Number of memories whose confidence decayed.
     pub memories_decayed: u64,
+    /// Number of memories whose confidence was boosted by access count.
+    pub memories_boosted: u64,
     /// How long the consolidation took.
     pub duration_ms: u64,
 }
@@ -253,6 +255,34 @@ pub struct ImportReport {
     pub memories_imported: u64,
     /// Errors encountered during import.
     pub errors: Vec<String>,
+}
+
+/// Serializable container for a full memory export.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryExportData {
+    /// Export format version.
+    pub version: u32,
+    /// ISO 8601 timestamp of when the export was created.
+    pub exported_at: String,
+    /// All semantic memory fragments.
+    pub memories: Vec<MemoryFragment>,
+    /// All knowledge graph entities.
+    pub entities: Vec<Entity>,
+    /// All knowledge graph relations.
+    pub relations: Vec<Relation>,
+    /// All key-value store entries.
+    pub kv_data: Vec<KvEntry>,
+}
+
+/// A single key-value entry from the structured store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvEntry {
+    /// The agent that owns this entry.
+    pub agent_id: String,
+    /// The key.
+    pub key: String,
+    /// The value.
+    pub value: serde_json::Value,
 }
 
 /// The unified Memory trait that agents interact with.

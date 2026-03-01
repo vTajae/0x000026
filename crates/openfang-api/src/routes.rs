@@ -11,6 +11,7 @@ use openfang_kernel::workflow::{
     ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowStep,
 };
 use openfang_kernel::OpenFangKernel;
+use openfang_types::memory::Memory as MemoryTrait;
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
@@ -2642,8 +2643,11 @@ pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoRespons
                 Some(openfang_skills::SkillSource::Bundled) => {
                     serde_json::json!({"type": "bundled"})
                 }
+                Some(openfang_skills::SkillSource::Local { ref path }) => {
+                    serde_json::json!({"type": "local", "path": path})
+                }
                 Some(openfang_skills::SkillSource::Native) | None => {
-                    serde_json::json!({"type": "local"})
+                    serde_json::json!({"type": "native"})
                 }
             };
             serde_json::json!({
@@ -4828,6 +4832,66 @@ pub async fn get_model(
             Json(serde_json::json!({"error": format!("Model '{}' not found", id)})),
         ),
     }
+}
+
+/// GET /api/providers/health — Provider circuit breaker health snapshot.
+///
+/// Returns the current cooldown state for all tracked providers.
+pub async fn providers_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let snapshot = state.kernel.cooldown.snapshot();
+    Json(serde_json::json!({
+        "providers": snapshot,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+/// GET /api/models/scores — Model performance ledger snapshot.
+///
+/// Returns quality scores for all tracked models.
+pub async fn model_scores(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let scores = state.kernel.model_ledger.snapshot();
+    let entries: Vec<serde_json::Value> = scores
+        .into_iter()
+        .map(|(id, score)| {
+            serde_json::json!({
+                "model_id": id,
+                "score": score.score,
+                "success_rate": score.success_rate,
+                "latency_p50_ms": score.latency_p50_ms,
+                "total_observations": score.total_observations,
+                "recent_observations": score.recent_observations,
+                "category_scores": score.category_scores,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "models": entries,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+/// GET /api/models/rank/{category} — Rank models for a task category.
+///
+/// Returns models ranked by their quality score for the given task type.
+pub async fn model_rank_for_task(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(category): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let ranked = state.kernel.model_ledger.rank_for_task(&category);
+    let entries: Vec<serde_json::Value> = ranked
+        .into_iter()
+        .map(|(id, score)| {
+            serde_json::json!({
+                "model_id": id,
+                "category_score": score,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "category": category,
+        "ranking": entries,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    }))
 }
 
 /// GET /api/providers — List all providers with auth status.
@@ -8648,6 +8712,116 @@ pub async fn list_commands(State(state): State<Arc<AppState>>) -> impl IntoRespo
     }
 
     Json(serde_json::json!({"commands": commands}))
+}
+
+/// GET /api/memory/export — Export all memory data as JSON.
+pub async fn memory_export(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let format = match params.get("format").map(|s| s.as_str()) {
+        Some("msgpack") => openfang_types::memory::ExportFormat::MessagePack,
+        _ => openfang_types::memory::ExportFormat::Json,
+    };
+    match state.kernel.memory.export(format).await {
+        Ok(data) => {
+            let content_type = match format {
+                openfang_types::memory::ExportFormat::Json => "application/json",
+                openfang_types::memory::ExportFormat::MessagePack => "application/octet-stream",
+            };
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, content_type)],
+                data,
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/memory/import — Import memory data.
+pub async fn memory_import(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let format = match params.get("format").map(|s| s.as_str()) {
+        Some("msgpack") => openfang_types::memory::ExportFormat::MessagePack,
+        _ => openfang_types::memory::ExportFormat::Json,
+    };
+    match state.kernel.memory.import(&body, format).await {
+        Ok(report) => Json(serde_json::json!(report)).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/agents/{id}/context — Per-agent context window usage report.
+pub async fn get_agent_context(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            )
+                .into_response();
+        }
+    };
+
+    match state.kernel.context_report(agent_id) {
+        Ok(report) => Json(serde_json::json!({
+            "agent_id": agent_id.0.to_string(),
+            "estimated_tokens": report.estimated_tokens,
+            "context_window": report.context_window,
+            "usage_percent": report.usage_percent,
+            "pressure": report.pressure,
+            "message_count": report.message_count,
+            "breakdown": report.breakdown,
+            "recommendation": report.recommendation,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/context/pressure — Bulk context pressure for all agents (dashboard).
+pub async fn context_pressure_all(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let agents = state.kernel.list_agents();
+    let mut results = Vec::new();
+    for agent in &agents {
+        let agent_id = match uuid::Uuid::parse_str(&agent.id) {
+            Ok(u) => openfang_types::agent::AgentId(u),
+            Err(_) => continue,
+        };
+        if let Ok(report) = state.kernel.context_report(agent_id) {
+            results.push(serde_json::json!({
+                "agent_id": agent.id,
+                "agent_name": agent.name,
+                "pressure": report.pressure,
+                "usage_percent": report.usage_percent,
+                "estimated_tokens": report.estimated_tokens,
+            }));
+        }
+    }
+    Json(serde_json::json!(results))
 }
 
 /// SECURITY: Validate webhook bearer token using constant-time comparison.
