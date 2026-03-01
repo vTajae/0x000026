@@ -1849,7 +1849,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             display_name: "Qwen 3 14B (Ollama)".into(),
             provider: "ollama".into(),
             tier: ModelTier::Local,
-            context_window: 180_000,
+            context_window: 32_768,
             max_output_tokens: 8_192,
             input_cost_per_m: 0.0,
             output_cost_per_m: 0.0,

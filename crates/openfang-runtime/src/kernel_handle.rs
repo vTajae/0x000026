@@ -42,20 +42,16 @@ pub trait KernelHandle: Send + Sync {
     /// Kill an agent by ID.
     fn kill_agent(&self, agent_id: &str) -> Result<(), String>;
 
-    /// Store a value in memory, scoped to `caller_agent_id`.
-    /// If `caller_agent_id` is empty or invalid, falls back to the shared namespace.
+    /// Store a value in shared memory.
     fn memory_store(
         &self,
-        caller_agent_id: &str,
         key: &str,
         value: serde_json::Value,
     ) -> Result<(), String>;
 
-    /// Recall a value from memory, scoped to `caller_agent_id`.
-    /// If `caller_agent_id` is empty or invalid, falls back to the shared namespace.
+    /// Recall a value from shared memory.
     fn memory_recall(
         &self,
-        caller_agent_id: &str,
         key: &str,
     ) -> Result<Option<serde_json::Value>, String>;
 

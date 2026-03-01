@@ -40,9 +40,10 @@ const MAX_RETRIES: u32 = 3;
 /// Base delay for exponential backoff (milliseconds).
 const BASE_RETRY_DELAY_MS: u64 = 1000;
 
-/// Timeout for individual tool executions (seconds).
-/// Raised from 60s to 120s for browser automation and long-running builds.
-const TOOL_TIMEOUT_SECS: u64 = 120;
+/// Default timeout for individual tool executions (seconds).
+/// Used as a floor; if the agent's exec_policy specifies a higher timeout,
+/// that value is used instead (via `effective_tool_timeout()`).
+const TOOL_TIMEOUT_SECS: u64 = 300;
 
 /// Maximum consecutive MaxTokens continuations before returning partial response.
 /// Raised from 3 to 5 to allow longer-form generation.
@@ -50,6 +51,21 @@ const MAX_CONTINUATIONS: u32 = 5;
 
 /// Maximum message history size before auto-trimming to prevent context overflow.
 const MAX_HISTORY_MESSAGES: usize = 20;
+
+/// Compute the effective tool timeout for an agent.
+///
+/// Takes the maximum of the global default (`TOOL_TIMEOUT_SECS`) and the
+/// agent's per-manifest `exec_policy.timeout_secs` (if present). This ensures
+/// agents that declare longer timeouts (e.g. claude-cli at 300s) are not
+/// prematurely killed by the global constant.
+fn effective_tool_timeout(manifest: &AgentManifest) -> u64 {
+    let manifest_timeout = manifest
+        .exec_policy
+        .as_ref()
+        .map(|p| p.timeout_secs)
+        .unwrap_or(0);
+    std::cmp::max(TOOL_TIMEOUT_SECS, manifest_timeout)
+}
 
 /// Strip a provider prefix from a model ID before sending to the API.
 ///
@@ -788,9 +804,10 @@ pub async fn run_agent_loop(
                     // Resolve effective exec policy (per-agent override or global)
                     let effective_exec_policy = manifest.exec_policy.as_ref();
 
-                    // Timeout-wrapped execution
+                    // Timeout-wrapped execution — respect per-agent exec_policy timeout
+                    let tool_timeout = effective_tool_timeout(manifest);
                     let result = match tokio::time::timeout(
-                        Duration::from_secs(TOOL_TIMEOUT_SECS),
+                        Duration::from_secs(tool_timeout),
                         tool_runner::execute_tool(
                             &tool_call.id,
                             &tool_call.name,
@@ -819,12 +836,12 @@ pub async fn run_agent_loop(
                     {
                         Ok(result) => result,
                         Err(_) => {
-                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s", TOOL_TIMEOUT_SECS);
+                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s", tool_timeout);
                             openfang_types::tool::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
                                 content: format!(
                                     "Tool '{}' timed out after {}s.",
-                                    tool_call.name, TOOL_TIMEOUT_SECS
+                                    tool_call.name, tool_timeout
                                 ),
                                 is_error: true,
                             }
@@ -1809,9 +1826,10 @@ pub async fn run_agent_loop_streaming(
                     // Resolve effective exec policy (per-agent override or global)
                     let effective_exec_policy = manifest.exec_policy.as_ref();
 
-                    // Timeout-wrapped execution
+                    // Timeout-wrapped execution — respect per-agent exec_policy timeout
+                    let tool_timeout = effective_tool_timeout(manifest);
                     let result = match tokio::time::timeout(
-                        Duration::from_secs(TOOL_TIMEOUT_SECS),
+                        Duration::from_secs(tool_timeout),
                         tool_runner::execute_tool(
                             &tool_call.id,
                             &tool_call.name,
@@ -1840,12 +1858,12 @@ pub async fn run_agent_loop_streaming(
                     {
                         Ok(result) => result,
                         Err(_) => {
-                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s (streaming)", TOOL_TIMEOUT_SECS);
+                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s (streaming)", tool_timeout);
                             openfang_types::tool::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
                                 content: format!(
                                     "Tool '{}' timed out after {}s.",
-                                    tool_call.name, TOOL_TIMEOUT_SECS
+                                    tool_call.name, tool_timeout
                                 ),
                                 is_error: true,
                             }
@@ -2278,7 +2296,7 @@ mod tests {
 
     #[test]
     fn test_tool_timeout_constant() {
-        assert_eq!(TOOL_TIMEOUT_SECS, 120);
+        assert_eq!(TOOL_TIMEOUT_SECS, 300);
     }
 
     #[test]

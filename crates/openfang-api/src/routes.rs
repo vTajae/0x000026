@@ -4962,61 +4962,38 @@ pub async fn get_model(
 
 /// GET /api/providers/health — Provider circuit breaker health snapshot.
 ///
-/// Returns the current cooldown state for all tracked providers.
-pub async fn providers_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let snapshot = state.kernel.cooldown.snapshot();
+/// Deprecated: cooldown/circuit breaker was removed in v0.2.5.
+pub async fn providers_health(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(serde_json::json!({
-        "providers": snapshot,
+        "providers": [],
         "timestamp": chrono::Utc::now().to_rfc3339(),
+        "note": "Provider cooldown was removed in v0.2.5",
     }))
 }
 
 /// GET /api/models/scores — Model performance ledger snapshot.
 ///
-/// Returns quality scores for all tracked models.
-pub async fn model_scores(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let scores = state.kernel.model_ledger.snapshot();
-    let entries: Vec<serde_json::Value> = scores
-        .into_iter()
-        .map(|(id, score)| {
-            serde_json::json!({
-                "model_id": id,
-                "score": score.score,
-                "success_rate": score.success_rate,
-                "latency_p50_ms": score.latency_p50_ms,
-                "total_observations": score.total_observations,
-                "recent_observations": score.recent_observations,
-                "category_scores": score.category_scores,
-            })
-        })
-        .collect();
+/// Deprecated: model scoring ledger was removed in v0.2.5.
+pub async fn model_scores(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(serde_json::json!({
-        "models": entries,
+        "models": [],
         "timestamp": chrono::Utc::now().to_rfc3339(),
+        "note": "Model scoring ledger was removed in v0.2.5",
     }))
 }
 
 /// GET /api/models/rank/{category} — Rank models for a task category.
 ///
-/// Returns models ranked by their quality score for the given task type.
+/// Deprecated: model scoring ledger was removed in v0.2.5.
 pub async fn model_rank_for_task(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     axum::extract::Path(category): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let ranked = state.kernel.model_ledger.rank_for_task(&category);
-    let entries: Vec<serde_json::Value> = ranked
-        .into_iter()
-        .map(|(id, score)| {
-            serde_json::json!({
-                "model_id": id,
-                "category_score": score,
-            })
-        })
-        .collect();
     Json(serde_json::json!({
         "category": category,
-        "ranking": entries,
+        "ranking": [],
         "timestamp": chrono::Utc::now().to_rfc3339(),
+        "note": "Model scoring ledger was removed in v0.2.5",
     }))
 }
 

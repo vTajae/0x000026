@@ -245,12 +245,9 @@ pub async fn execute_tool(
         "agent_list" => tool_agent_list(kernel),
         "agent_kill" => tool_agent_kill(input, kernel),
 
-        // Per-agent scoped memory tools
-        "memory_store" => tool_memory_store(input, kernel, caller_agent_id),
-        "memory_recall" => tool_memory_recall(input, kernel, caller_agent_id),
-        // Explicitly shared (cross-agent) memory tools
-        "memory_store_shared" => tool_memory_store_shared(input, kernel),
-        "memory_recall_shared" => tool_memory_recall_shared(input, kernel),
+        // Shared memory tools
+        "memory_store" => tool_memory_store(input, kernel),
+        "memory_recall" => tool_memory_recall(input, kernel),
 
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
@@ -587,7 +584,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Shared memory tools ---
         ToolDefinition {
             name: "memory_store".to_string(),
-            description: "Store a value in your agent-scoped memory. Private to this agent; use memory_store_shared for cross-agent data.".to_string(),
+            description: "Store a value in shared memory accessible by all agents. Use for cross-agent coordination and data sharing.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -599,30 +596,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "memory_recall".to_string(),
-            description: "Recall a value from memory by key (agent-scoped, falls back to shared).".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "key": { "type": "string", "description": "The storage key to recall" }
-                },
-                "required": ["key"]
-            }),
-        },
-        ToolDefinition {
-            name: "memory_store_shared".to_string(),
-            description: "Store a value in the shared memory namespace accessible by ALL agents. Use for cross-agent coordination.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "key": { "type": "string", "description": "The storage key" },
-                    "value": { "description": "The JSON value to store (any type)" }
-                },
-                "required": ["key", "value"]
-            }),
-        },
-        ToolDefinition {
-            name: "memory_recall_shared".to_string(),
-            description: "Recall a value from the shared memory namespace by key.".to_string(),
+            description: "Recall a value from shared memory by key.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1341,9 +1315,12 @@ async fn tool_shell_exec(
     workspace_root: Option<&Path>,
     exec_policy: Option<&openfang_types::config::ExecPolicy>,
 ) -> Result<String, String> {
-    let command = input["command"]
+    let raw_command = input["command"]
         .as_str()
         .ok_or("Missing 'command' parameter")?;
+    // Sanitize shell command: remove null bytes as defense-in-depth
+    let command = raw_command.replace('\0', "");
+    let command = command.as_str();
     // Use LLM-specified timeout, or fall back to exec policy timeout, or default 30s
     let policy_timeout = exec_policy.map(|p| p.timeout_secs).unwrap_or(30);
     let timeout_secs = input["timeout_seconds"].as_u64().unwrap_or(policy_timeout);
@@ -1525,63 +1502,26 @@ fn tool_agent_kill(
 // Shared memory tools
 // ---------------------------------------------------------------------------
 
-/// Shared namespace ID: 00000000-0000-0000-0000-000000000001
-const SHARED_MEMORY_ID: &str = "00000000-0000-0000-0000-000000000001";
-
 fn tool_memory_store(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
-    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let key = input["key"].as_str().ok_or("Missing 'key' parameter")?;
     let value = input.get("value").ok_or("Missing 'value' parameter")?;
-    let agent_id = caller_agent_id.unwrap_or(SHARED_MEMORY_ID);
-    kh.memory_store(agent_id, key, value.clone())?;
+    kh.memory_store(key, value.clone())?;
     Ok(format!("Stored value under key '{key}'."))
 }
 
 fn tool_memory_recall(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
-    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let key = input["key"].as_str().ok_or("Missing 'key' parameter")?;
-    let agent_id = caller_agent_id.unwrap_or(SHARED_MEMORY_ID);
-    // Try agent-scoped first
-    if let Some(val) = kh.memory_recall(agent_id, key)? {
-        return Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string()));
-    }
-    // Fall back to shared namespace for backward compatibility
-    if agent_id != SHARED_MEMORY_ID {
-        if let Some(val) = kh.memory_recall(SHARED_MEMORY_ID, key)? {
-            return Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string()));
-        }
-    }
-    Ok(format!("No value found for key '{key}'."))
-}
-
-fn tool_memory_store_shared(
-    input: &serde_json::Value,
-    kernel: Option<&Arc<dyn KernelHandle>>,
-) -> Result<String, String> {
-    let kh = require_kernel(kernel)?;
-    let key = input["key"].as_str().ok_or("Missing 'key' parameter")?;
-    let value = input.get("value").ok_or("Missing 'value' parameter")?;
-    kh.memory_store(SHARED_MEMORY_ID, key, value.clone())?;
-    Ok(format!("Stored value in shared memory under key '{key}'."))
-}
-
-fn tool_memory_recall_shared(
-    input: &serde_json::Value,
-    kernel: Option<&Arc<dyn KernelHandle>>,
-) -> Result<String, String> {
-    let kh = require_kernel(kernel)?;
-    let key = input["key"].as_str().ok_or("Missing 'key' parameter")?;
-    match kh.memory_recall(SHARED_MEMORY_ID, key)? {
+    match kh.memory_recall(key)? {
         Some(val) => Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string())),
-        None => Ok(format!("No value found in shared memory for key '{key}'.")),
+        None => Ok(format!("No value found for key '{key}'.")),
     }
 }
 
@@ -1981,19 +1921,14 @@ async fn tool_schedule_create(
         "enabled": true,
     });
 
-    // Load existing schedules from shared memory (schedules are always in the shared namespace)
-    let mut schedules: Vec<serde_json::Value> =
-        match kh.memory_recall(SHARED_MEMORY_ID, SCHEDULES_KEY)? {
-            Some(serde_json::Value::Array(arr)) => arr,
-            _ => Vec::new(),
-        };
+    // Load existing schedules from shared memory
+    let mut schedules: Vec<serde_json::Value> = match kh.memory_recall(SCHEDULES_KEY)? {
+        Some(serde_json::Value::Array(arr)) => arr,
+        _ => Vec::new(),
+    };
 
     schedules.push(entry);
-    kh.memory_store(
-        SHARED_MEMORY_ID,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules),
-    )?;
+    kh.memory_store(SCHEDULES_KEY, serde_json::Value::Array(schedules))?;
 
     Ok(format!(
         "Schedule created:\n  ID: {schedule_id}\n  Description: {description}\n  Cron: {cron_expr}\n  Original: {schedule_str}"
@@ -2003,11 +1938,10 @@ async fn tool_schedule_create(
 async fn tool_schedule_list(kernel: Option<&Arc<dyn KernelHandle>>) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
 
-    let schedules: Vec<serde_json::Value> =
-        match kh.memory_recall(SHARED_MEMORY_ID, SCHEDULES_KEY)? {
-            Some(serde_json::Value::Array(arr)) => arr,
-            _ => Vec::new(),
-        };
+    let schedules: Vec<serde_json::Value> = match kh.memory_recall(SCHEDULES_KEY)? {
+        Some(serde_json::Value::Array(arr)) => arr,
+        _ => Vec::new(),
+    };
 
     if schedules.is_empty() {
         return Ok("No scheduled tasks.".to_string());
@@ -2037,11 +1971,10 @@ async fn tool_schedule_delete(
     let kh = require_kernel(kernel)?;
     let id = input["id"].as_str().ok_or("Missing 'id' parameter")?;
 
-    let mut schedules: Vec<serde_json::Value> =
-        match kh.memory_recall(SHARED_MEMORY_ID, SCHEDULES_KEY)? {
-            Some(serde_json::Value::Array(arr)) => arr,
-            _ => Vec::new(),
-        };
+    let mut schedules: Vec<serde_json::Value> = match kh.memory_recall(SCHEDULES_KEY)? {
+        Some(serde_json::Value::Array(arr)) => arr,
+        _ => Vec::new(),
+    };
 
     let before = schedules.len();
     schedules.retain(|s| s["id"].as_str() != Some(id));
@@ -2050,11 +1983,7 @@ async fn tool_schedule_delete(
         return Err(format!("Schedule '{id}' not found."));
     }
 
-    kh.memory_store(
-        SHARED_MEMORY_ID,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules),
-    )?;
+    kh.memory_store(SCHEDULES_KEY, serde_json::Value::Array(schedules))?;
     Ok(format!("Schedule '{id}' deleted."))
 }
 
