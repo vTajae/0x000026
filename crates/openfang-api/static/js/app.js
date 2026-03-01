@@ -87,6 +87,10 @@ function toolIcon(toolName) {
 
 // Alpine.js global store
 document.addEventListener('alpine:init', function() {
+  // Restore saved API key on load
+  var savedKey = localStorage.getItem('openfang-api-key');
+  if (savedKey) OpenFangAPI.setAuthToken(savedKey);
+
   Alpine.store('app', {
     agents: [],
     connected: false,
@@ -99,6 +103,7 @@ document.addEventListener('alpine:init', function() {
     pendingAgent: null,
     focusMode: localStorage.getItem('openfang-focus') === 'true',
     showOnboarding: false,
+    showAuthPrompt: false,
 
     toggleFocusMode() {
       this.focusMode = !this.focusMode;
@@ -146,6 +151,39 @@ document.addEventListener('alpine:init', function() {
     dismissOnboarding() {
       this.showOnboarding = false;
       localStorage.setItem('openfang-onboarded', 'true');
+    },
+
+    async checkAuth() {
+      try {
+        // Use a protected endpoint (not in the public allowlist) to detect
+        // whether the server requires an API key.
+        await OpenFangAPI.get('/api/tools');
+        this.showAuthPrompt = false;
+      } catch(e) {
+        if (e.message && (e.message.indexOf('Not authorized') >= 0 || e.message.indexOf('401') >= 0 || e.message.indexOf('Missing Authorization') >= 0 || e.message.indexOf('Unauthorized') >= 0)) {
+          // Only show prompt if we don't already have a saved key
+          var saved = localStorage.getItem('openfang-api-key');
+          if (saved) {
+            // Saved key might be stale — clear it and show prompt
+            OpenFangAPI.setAuthToken('');
+            localStorage.removeItem('openfang-api-key');
+          }
+          this.showAuthPrompt = true;
+        }
+      }
+    },
+
+    submitApiKey(key) {
+      if (!key || !key.trim()) return;
+      OpenFangAPI.setAuthToken(key.trim());
+      localStorage.setItem('openfang-api-key', key.trim());
+      this.showAuthPrompt = false;
+      this.refreshAgents();
+    },
+
+    clearApiKey() {
+      OpenFangAPI.setAuthToken('');
+      localStorage.removeItem('openfang-api-key');
     }
   });
 });
@@ -180,7 +218,7 @@ function app() {
       });
 
       // Hash routing
-      var validPages = ['overview','agents','sessions','approvals','workflows','scheduler','channels','skills','hands','analytics','logs','settings','wizard'];
+      var validPages = ['overview','agents','sessions','approvals','comms','workflows','scheduler','channels','skills','hands','analytics','logs','settings','wizard'];
       var pageRedirects = {
         'chat': 'agents',
         'templates': 'agents',
@@ -237,6 +275,7 @@ function app() {
       // Initial data load
       this.pollStatus();
       Alpine.store('app').checkOnboarding();
+      Alpine.store('app').checkAuth();
       setInterval(function() { self.pollStatus(); }, 5000);
     },
 

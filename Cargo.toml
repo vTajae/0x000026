@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.7"
+version = "0.2.5"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/RightNow-AI/openfang"
@@ -121,6 +121,12 @@ argon2 = "0.5"
 
 # Lightweight regex
 regex-lite = "0.1"
+
+# Email (SMTP + IMAP)
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
+imap = "2"
+native-tls = "0.2"
+mailparse = "0.15"
 
 # Testing
 tokio-test = "0.4"

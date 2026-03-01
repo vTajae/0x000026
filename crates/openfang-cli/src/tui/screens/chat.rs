@@ -58,6 +58,8 @@ pub struct ChatState {
     pub scroll_offset: u16,
     /// Token usage from last response.
     pub last_tokens: Option<(u64, u64)>,
+    /// Cost in USD from last response.
+    pub last_cost_usd: Option<f64>,
     /// Characters received during current stream (~4 chars ≈ 1 token).
     pub streaming_chars: usize,
     /// Status message (errors, etc.)
@@ -90,6 +92,7 @@ impl ChatState {
             input: String::new(),
             scroll_offset: 0,
             last_tokens: None,
+            last_cost_usd: None,
             streaming_chars: 0,
             status_msg: None,
             staged_messages: Vec::new(),
@@ -107,6 +110,7 @@ impl ChatState {
         self.input.clear();
         self.scroll_offset = 0;
         self.last_tokens = None;
+        self.last_cost_usd = None;
         self.streaming_chars = 0;
         self.status_msg = None;
         self.staged_messages.clear();
@@ -547,11 +551,15 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &ChatState) {
         )]));
     }
 
-    // Add token usage if available
+    // Add token usage and cost if available
     if let Some((input, output)) = state.last_tokens {
         if input > 0 || output > 0 {
+            let cost_str = match state.last_cost_usd {
+                Some(c) if c > 0.0 => format!(" | ${:.4}", c),
+                _ => String::new(),
+            };
             lines.push(Line::from(vec![Span::styled(
-                format!("  [tokens: {} in / {} out]", input, output),
+                format!("  [tokens: {} in / {} out{}]", input, output, cost_str),
                 theme::dim_style(),
             )]));
         }
@@ -653,6 +661,6 @@ fn truncate_line(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        format!("{}\u{2026}", &s[..max_len.saturating_sub(1)])
+        format!("{}\u{2026}", openfang_types::truncate_str(s, max_len.saturating_sub(1)))
     }
 }

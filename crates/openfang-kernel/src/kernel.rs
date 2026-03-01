@@ -14,8 +14,9 @@ use crate::triggers::{TriggerEngine, TriggerId, TriggerPattern};
 use crate::workflow::{StepAgent, Workflow, WorkflowEngine, WorkflowId, WorkflowRunId};
 
 use openfang_memory::MemorySubstrate;
-use openfang_runtime::agent_loop::{run_agent_loop, run_agent_loop_streaming, AgentLoopResult};
-use openfang_runtime::auth_cooldown::ProviderCooldown;
+use openfang_runtime::agent_loop::{
+    run_agent_loop, run_agent_loop_streaming, strip_provider_prefix, AgentLoopResult,
+};
 use openfang_runtime::audit::AuditLog;
 use openfang_runtime::drivers;
 use openfang_runtime::kernel_handle::{self, KernelHandle};
@@ -33,7 +34,6 @@ use openfang_types::memory::Memory;
 use openfang_types::tool::ToolDefinition;
 
 use async_trait::async_trait;
-use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, info, warn};
@@ -125,14 +125,12 @@ pub struct OpenFangKernel {
     pub peer_registry: Option<openfang_wire::PeerRegistry>,
     /// OFP peer node — the local networking node.
     pub peer_node: Option<Arc<openfang_wire::PeerNode>>,
-    /// Provider circuit breaker with exponential cooldown.
-    pub cooldown: Arc<ProviderCooldown>,
-    /// Model performance ledger for quality-based routing.
-    pub model_ledger: Arc<openfang_runtime::model_scoring::ModelLedger>,
     /// Boot timestamp for uptime calculation.
     pub booted_at: std::time::Instant,
     /// WhatsApp Web gateway child process PID (for shutdown cleanup).
     pub whatsapp_gateway_pid: Arc<std::sync::Mutex<Option<u32>>>,
+    /// Channel adapters registered at bridge startup (for proactive `channel_send` tool).
+    pub channel_adapters: dashmap::DashMap<String, Arc<dyn openfang_channels::types::ChannelAdapter>>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
 }
@@ -417,12 +415,8 @@ fn append_daily_memory_log(workspace: &Path, response: &str) {
             return;
         }
     }
-    // Truncate long responses for the log
-    let summary = if trimmed.len() > 500 {
-        &trimmed[..500]
-    } else {
-        trimmed
-    };
+    // Truncate long responses for the log (UTF-8 safe)
+    let summary = openfang_types::truncate_str(trimmed, 500);
     let timestamp = chrono::Utc::now().format("%H:%M:%S").to_string();
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -454,7 +448,7 @@ fn read_identity_file(workspace: &Path, filename: &str) -> Option<String> {
         return None;
     }
     if content.len() > MAX_IDENTITY_FILE_BYTES {
-        Some(content[..MAX_IDENTITY_FILE_BYTES].to_string())
+        Some(openfang_types::truncate_str(&content, MAX_IDENTITY_FILE_BYTES).to_string())
     } else {
         Some(content)
     }
@@ -490,6 +484,11 @@ impl OpenFangKernel {
     /// Boot the kernel with an explicit configuration.
     pub fn boot_with_config(mut config: KernelConfig) -> KernelResult<Self> {
         use openfang_types::config::KernelMode;
+
+        // Env var overrides — useful for Docker where config.toml is baked in.
+        if let Ok(listen) = std::env::var("OPENFANG_LISTEN") {
+            config.api_listen = listen;
+        }
 
         // Clamp configuration bounds to prevent zero-value or unbounded misconfigs
         config.clamp_bounds();
@@ -606,6 +605,9 @@ impl OpenFangKernel {
                 config.provider_urls.len()
             );
         }
+        // Load user's custom models from ~/.openfang/custom_models.json
+        let custom_models_path = config.home_dir.join("custom_models.json");
+        model_catalog.load_custom_models(&custom_models_path);
         let available_count = model_catalog.available_models().len();
         let total_count = model_catalog.list_models().len();
         let local_count = model_catalog
@@ -616,48 +618,6 @@ impl OpenFangKernel {
         info!(
             "Model catalog: {total_count} models, {available_count} available from configured providers ({local_count} local)"
         );
-
-        // Ollama health check (warn-only, non-blocking)
-        {
-            let ollama_url = config
-                .provider_urls
-                .get("ollama")
-                .cloned()
-                .or_else(|| {
-                    config
-                        .default_model
-                        .base_url
-                        .as_ref()
-                        .filter(|_| config.default_model.provider == "ollama")
-                        .cloned()
-                })
-                .unwrap_or_else(|| "http://localhost:11434/v1".to_string());
-            // Extract host:port for TCP probe
-            let probe_addr = ollama_url
-                .trim_start_matches("http://")
-                .trim_start_matches("https://")
-                .trim_end_matches("/v1")
-                .trim_end_matches('/');
-            match std::net::TcpStream::connect_timeout(
-                &probe_addr
-                    .to_socket_addrs()
-                    .ok()
-                    .and_then(|mut a| a.next())
-                    .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 11434))),
-                std::time::Duration::from_secs(2),
-            ) {
-                Ok(_) => {
-                    info!(url = %ollama_url, "Ollama is reachable");
-                }
-                Err(e) => {
-                    warn!(
-                        url = %ollama_url,
-                        error = %e,
-                        "Ollama is unreachable — local fallback will be unavailable until it comes online"
-                    );
-                }
-            }
-        }
 
         // Initialize skill registry
         let skills_dir = config.home_dir.join("skills");
@@ -753,12 +713,10 @@ impl OpenFangKernel {
             Arc<dyn openfang_runtime::embedding::EmbeddingDriver + Send + Sync>,
         > = {
             use openfang_runtime::embedding::create_embedding_driver;
-            let base_url_override = config.memory.embedding_base_url.as_deref();
-            let embedding_model = &config.memory.embedding_model;
             if let Some(ref provider) = config.memory.embedding_provider {
                 // Explicit config takes priority
                 let api_key_env = config.memory.embedding_api_key_env.as_deref().unwrap_or("");
-                match create_embedding_driver(provider, embedding_model, api_key_env, base_url_override) {
+                match create_embedding_driver(provider, "text-embedding-3-small", api_key_env) {
                     Ok(d) => {
                         info!(provider = %provider, "Embedding driver configured from memory config");
                         Some(Arc::from(d))
@@ -769,7 +727,7 @@ impl OpenFangKernel {
                     }
                 }
             } else if std::env::var("OPENAI_API_KEY").is_ok() {
-                match create_embedding_driver("openai", "text-embedding-3-small", "OPENAI_API_KEY", base_url_override)
+                match create_embedding_driver("openai", "text-embedding-3-small", "OPENAI_API_KEY")
                 {
                     Ok(d) => {
                         info!("Embedding driver auto-detected: OpenAI");
@@ -782,7 +740,7 @@ impl OpenFangKernel {
                 }
             } else {
                 // Try Ollama (local, no key needed)
-                match create_embedding_driver("ollama", "nomic-embed-text", "", base_url_override) {
+                match create_embedding_driver("ollama", "nomic-embed-text", "") {
                     Ok(d) => {
                         info!("Embedding driver auto-detected: Ollama (local)");
                         Some(Arc::from(d))
@@ -922,10 +880,9 @@ impl OpenFangKernel {
             process_manager: Arc::new(openfang_runtime::process_manager::ProcessManager::new(5)),
             peer_registry: None,
             peer_node: None,
-            cooldown: Arc::new(ProviderCooldown::new(Default::default())),
-            model_ledger: Arc::new(openfang_runtime::model_scoring::ModelLedger::new()),
             booted_at: std::time::Instant::now(),
             whatsapp_gateway_pid: Arc::new(std::sync::Mutex::new(None)),
+            channel_adapters: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
         };
 
@@ -955,6 +912,29 @@ impl OpenFangKernel {
                         restored_entry.manifest.exec_policy =
                             Some(kernel.config.exec_policy.clone());
                     }
+
+                    // Apply global budget defaults to restored agents
+                    apply_budget_defaults(
+                        &kernel.config.budget,
+                        &mut restored_entry.manifest.resources,
+                    );
+
+                    // Apply default_model to restored agents (same logic as spawn)
+                    if restored_entry.manifest.model.api_key_env.is_none()
+                        && restored_entry.manifest.model.base_url.is_none()
+                    {
+                        let dm = &kernel.config.default_model;
+                        if !dm.provider.is_empty() {
+                            restored_entry.manifest.model.provider = dm.provider.clone();
+                        }
+                        if !dm.model.is_empty() {
+                            restored_entry.manifest.model.model = dm.model.clone();
+                        }
+                        if dm.base_url.is_some() {
+                            restored_entry.manifest.model.base_url = dm.base_url.clone();
+                        }
+                    }
+
                     if let Err(e) = kernel.registry.register(restored_entry) {
                         tracing::warn!(agent = %name, "Failed to restore agent: {e}");
                     } else {
@@ -1031,6 +1011,15 @@ impl OpenFangKernel {
                 manifest.model.base_url = dm.base_url.clone();
             }
         }
+
+        // Normalize: strip provider prefix from model name if present
+        let normalized = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
+        if normalized != manifest.model.model {
+            manifest.model.model = normalized;
+        }
+
+        // Apply global budget defaults to agent resource quotas
+        apply_budget_defaults(&self.config.budget, &mut manifest.resources);
 
         // Create workspace directory for the agent
         let workspace_dir = manifest.workspace.clone().unwrap_or_else(|| {
@@ -1322,23 +1311,13 @@ impl OpenFangKernel {
                 label: None,
             });
 
-        let tools = self.available_tools(agent_id);
-        let tools = entry.mode.filter_tools(tools);
-        let driver = self.resolve_driver(&entry.manifest)?;
-
-        // Look up model's actual context window from the catalog
-        let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
-            cat.find_model(&entry.manifest.model.model)
-                .map(|m| m.context_window as usize)
-        });
-
         // Check if auto-compaction is needed: message-count OR token-count trigger
         let needs_compact = {
             use openfang_runtime::compactor::{
                 estimate_token_count, needs_compaction as check_compact,
                 needs_compaction_by_tokens, CompactionConfig,
             };
-            let config = CompactionConfig::for_context_window(ctx_window.unwrap_or(200_000));
+            let config = CompactionConfig::default();
             let by_messages = check_compact(&session, &config);
             let estimated = estimate_token_count(
                 &session.messages,
@@ -1356,6 +1335,16 @@ impl OpenFangKernel {
             }
             by_messages || by_tokens
         };
+
+        let tools = self.available_tools(agent_id);
+        let tools = entry.mode.filter_tools(tools);
+        let driver = self.resolve_driver(&entry.manifest)?;
+
+        // Look up model's actual context window from the catalog
+        let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
+            cat.find_model(&entry.manifest.model.model)
+                .map(|m| m.context_window as usize)
+        });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
         let mut manifest = entry.manifest.clone();
@@ -1388,16 +1377,24 @@ impl OpenFangKernel {
                 .flatten()
                 .and_then(|v| v.as_str().map(String::from));
 
-            let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
-            let is_passthrough = openfang_runtime::prompt_builder::detect_passthrough(
-                &tool_names,
-                &manifest.model.system_prompt,
-            );
+            let peer_agents: Vec<(String, String, String)> = self
+                .registry
+                .list()
+                .iter()
+                .map(|a| {
+                    (
+                        a.name.clone(),
+                        format!("{:?}", a.state),
+                        a.manifest.model.model.clone(),
+                    )
+                })
+                .collect();
+
             let prompt_ctx = openfang_runtime::prompt_builder::PromptContext {
                 agent_name: manifest.name.clone(),
                 agent_description: manifest.description.clone(),
                 base_system_prompt: manifest.model.system_prompt.clone(),
-                granted_tools: tool_names,
+                granted_tools: tools.iter().map(|t| t.name.clone()).collect(),
                 recalled_memories: vec![],
                 skill_summary: self.build_skill_summary(&manifest.skills),
                 skill_prompt_context: self.collect_prompt_context(&manifest.skills),
@@ -1457,28 +1454,20 @@ impl OpenFangKernel {
                 } else {
                     None
                 },
-                is_passthrough,
-                self_corrections: if !is_passthrough {
-                    self.memory
-                        .recall_sync(
-                            "Response quality issue",
-                            3,
-                            Some(openfang_types::memory::MemoryFilter {
-                                agent_id: Some(agent_id),
-                                scope: Some("procedural".to_string()),
-                                ..Default::default()
-                            }),
-                        )
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|m| m.content)
-                        .collect()
-                } else {
-                    vec![]
-                },
+                peer_agents,
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
+            // Store canonical context separately for injection as user message
+            // (keeps system prompt stable across turns for provider prompt caching)
+            if let Some(cc_msg) =
+                openfang_runtime::prompt_builder::build_canonical_context_message(&prompt_ctx)
+            {
+                manifest.metadata.insert(
+                    "canonical_context_msg".to_string(),
+                    serde_json::Value::String(cc_msg),
+                );
+            }
         }
 
         let memory = Arc::clone(&self.memory);
@@ -1578,7 +1567,6 @@ impl OpenFangKernel {
                 Some(&kernel_clone.hooks),
                 ctx_window,
                 Some(&kernel_clone.process_manager),
-                Some(&kernel_clone.cooldown),
             )
             .await;
 
@@ -1616,7 +1604,7 @@ impl OpenFangKernel {
                         use openfang_runtime::compactor::{
                             estimate_token_count, needs_compaction_by_tokens, CompactionConfig,
                         };
-                        let config = CompactionConfig::for_context_window(ctx_window.unwrap_or(200_000));
+                        let config = CompactionConfig::default();
                         let estimated = estimate_token_count(&session.messages, None, None);
                         if needs_compaction_by_tokens(estimated, &config) {
                             let kc = kernel_clone.clone();
@@ -1861,16 +1849,24 @@ impl OpenFangKernel {
                 .flatten()
                 .and_then(|v| v.as_str().map(String::from));
 
-            let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
-            let is_passthrough = openfang_runtime::prompt_builder::detect_passthrough(
-                &tool_names,
-                &manifest.model.system_prompt,
-            );
+            let peer_agents: Vec<(String, String, String)> = self
+                .registry
+                .list()
+                .iter()
+                .map(|a| {
+                    (
+                        a.name.clone(),
+                        format!("{:?}", a.state),
+                        a.manifest.model.model.clone(),
+                    )
+                })
+                .collect();
+
             let prompt_ctx = openfang_runtime::prompt_builder::PromptContext {
                 agent_name: manifest.name.clone(),
                 agent_description: manifest.description.clone(),
                 base_system_prompt: manifest.model.system_prompt.clone(),
-                granted_tools: tool_names,
+                granted_tools: tools.iter().map(|t| t.name.clone()).collect(),
                 recalled_memories: vec![], // Recalled in agent_loop, not here
                 skill_summary: self.build_skill_summary(&manifest.skills),
                 skill_prompt_context: self.collect_prompt_context(&manifest.skills),
@@ -1930,28 +1926,20 @@ impl OpenFangKernel {
                 } else {
                     None
                 },
-                is_passthrough,
-                self_corrections: if !is_passthrough {
-                    self.memory
-                        .recall_sync(
-                            "Response quality issue",
-                            3,
-                            Some(openfang_types::memory::MemoryFilter {
-                                agent_id: Some(agent_id),
-                                scope: Some("procedural".to_string()),
-                                ..Default::default()
-                            }),
-                        )
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|m| m.content)
-                        .collect()
-                } else {
-                    vec![]
-                },
+                peer_agents,
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
+            // Store canonical context separately for injection as user message
+            // (keeps system prompt stable across turns for provider prompt caching)
+            if let Some(cc_msg) =
+                openfang_runtime::prompt_builder::build_canonical_context_message(&prompt_ctx)
+            {
+                manifest.metadata.insert(
+                    "canonical_context_msg".to_string(),
+                    serde_json::Value::String(cc_msg),
+                );
+            }
         }
 
         let is_stable = self.config.mode == openfang_types::config::KernelMode::Stable;
@@ -1972,7 +1960,7 @@ impl OpenFangKernel {
             router.resolve_aliases(&self.model_catalog.read().unwrap_or_else(|e| e.into_inner()));
             // Build a probe request to score complexity
             let probe = CompletionRequest {
-                model: manifest.model.model.clone(),
+                model: strip_provider_prefix(&manifest.model.model, &manifest.model.provider),
                 messages: vec![openfang_types::message::Message::user(message)],
                 tools: tools.clone(),
                 max_tokens: manifest.model.max_tokens,
@@ -2053,7 +2041,6 @@ impl OpenFangKernel {
             Some(&self.hooks),
             ctx_window,
             Some(&self.process_manager),
-            Some(&self.cooldown),
         )
         .await
         .map_err(KernelError::OpenFang)?;
@@ -2156,6 +2143,35 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
 
         info!(agent_id = %agent_id, "Session reset (summary saved to memory)");
+        Ok(())
+    }
+
+    /// Clear ALL conversation history for an agent (sessions + canonical).
+    ///
+    /// Creates a fresh empty session afterward so the agent is still usable.
+    pub fn clear_agent_history(&self, agent_id: AgentId) -> KernelResult<()> {
+        let _entry = self.registry.get(agent_id).ok_or_else(|| {
+            KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+
+        // Delete all regular sessions
+        let _ = self.memory.delete_agent_sessions(agent_id);
+
+        // Delete canonical (cross-channel) session
+        let _ = self.memory.delete_canonical_session(agent_id);
+
+        // Create a fresh session
+        let new_session = self
+            .memory
+            .create_session(agent_id)
+            .map_err(KernelError::OpenFang)?;
+
+        // Update registry with new session ID
+        self.registry
+            .update_session_id(agent_id, new_session.id)
+            .map_err(KernelError::OpenFang)?;
+
+        info!(agent_id = %agent_id, "All agent history cleared");
         Ok(())
     }
 
@@ -2335,16 +2351,26 @@ impl OpenFangKernel {
                     .map(|entry| entry.provider.clone())
             });
 
-        if let Some(provider) = resolved_provider {
+        // If catalog lookup failed, try to infer provider from model name prefix
+        let provider = resolved_provider.or_else(|| infer_provider_from_model(model));
+
+        // Strip the provider prefix from the model name (e.g. "openrouter/deepseek/deepseek-chat" → "deepseek/deepseek-chat")
+        let normalized_model = if let Some(ref prov) = provider {
+            strip_provider_prefix(model, prov)
+        } else {
+            model.to_string()
+        };
+
+        if let Some(provider) = provider {
             self.registry
-                .update_model_and_provider(agent_id, model.to_string(), provider.clone())
+                .update_model_and_provider(agent_id, normalized_model.clone(), provider.clone())
                 .map_err(KernelError::OpenFang)?;
-            info!(agent_id = %agent_id, model = %model, provider = %provider, "Agent model+provider updated");
+            info!(agent_id = %agent_id, model = %normalized_model, provider = %provider, "Agent model+provider updated");
         } else {
             self.registry
-                .update_model(agent_id, model.to_string())
+                .update_model(agent_id, normalized_model.clone())
                 .map_err(KernelError::OpenFang)?;
-            info!(agent_id = %agent_id, model = %model, "Agent model updated");
+            info!(agent_id = %agent_id, model = %normalized_model, "Agent model updated (provider unchanged)");
         }
 
         // Persist the updated entry
@@ -2498,12 +2524,7 @@ impl OpenFangKernel {
                 label: None,
             });
 
-        // Look up model context window for appropriate compaction thresholds
-        let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
-            cat.find_model(&entry.manifest.model.model)
-                .map(|m| m.context_window as usize)
-        });
-        let config = CompactionConfig::for_context_window(ctx_window.unwrap_or(200_000));
+        let config = CompactionConfig::default();
 
         if !needs_compaction(&session, &config) {
             return Ok(format!(
@@ -2511,18 +2532,6 @@ impl OpenFangKernel {
                 session.messages.len(),
                 config.threshold
             ));
-        }
-
-        // Pre-compaction: extract knowledge graph facts from messages about to be compacted
-        {
-            let split_at = session.messages.len().saturating_sub(config.keep_recent);
-            let to_compact = &session.messages[..split_at];
-            if !to_compact.is_empty() {
-                openfang_runtime::compactor::pre_compaction_fact_extraction(
-                    to_compact,
-                    &self.memory,
-                );
-            }
         }
 
         let driver = self.resolve_driver(&entry.manifest)?;
@@ -3211,6 +3220,8 @@ impl OpenFangKernel {
             let kernel = Arc::clone(self);
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+                // Use Skip to avoid burst-firing after a long job blocks the loop.
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut persist_counter = 0u32;
                 interval.tick().await; // Skip first immediate tick
                 loop {
@@ -3589,43 +3600,50 @@ impl OpenFangKernel {
         let primary = if agent_provider == default_provider && !has_custom_key && !has_custom_url {
             Arc::clone(&self.default_driver)
         } else {
-            // Create a dedicated driver for this agent
-            // Auth profile rotation: if profiles are configured for this provider,
-            // select the highest-priority profile's key env var.
-            let default_key_env = manifest
-                .model
-                .api_key_env
-                .as_deref()
-                .unwrap_or(&self.config.default_model.api_key_env);
-
-            let api_key_env =
+            // Create a dedicated driver for this agent.
+            //
+            // IMPORTANT: When the agent's provider differs from the default,
+            // we must NOT pass the default provider's API key. Instead, pass None
+            // so create_driver() can look up the correct env var for the target provider.
+            let api_key = if has_custom_key {
+                // Agent explicitly set an API key env var — use it
+                manifest
+                    .model
+                    .api_key_env
+                    .as_ref()
+                    .and_then(|env| std::env::var(env).ok())
+            } else if agent_provider == default_provider {
+                // Same provider — use default key
+                std::env::var(&self.config.default_model.api_key_env).ok()
+            } else {
+                // Different provider — check auth profiles first, then let
+                // create_driver() look up the correct env var automatically.
                 if let Some(profiles) = self.config.auth_profiles.get(agent_provider.as_str()) {
-                    if !profiles.is_empty() {
-                        // Pick highest-priority profile (lowest priority number)
-                        let mut sorted: Vec<_> = profiles.iter().collect();
-                        sorted.sort_by_key(|p| p.priority);
-                        let best = &sorted[0];
-                        // Use the profile's env var if the key exists, otherwise fall back
-                        if std::env::var(&best.api_key_env).is_ok() {
-                            best.api_key_env.clone()
-                        } else {
-                            default_key_env.to_string()
-                        }
-                    } else {
-                        default_key_env.to_string()
-                    }
+                    let mut sorted: Vec<_> = profiles.iter().collect();
+                    sorted.sort_by_key(|p| p.priority);
+                    sorted
+                        .first()
+                        .and_then(|best| std::env::var(&best.api_key_env).ok())
                 } else {
-                    default_key_env.to_string()
-                };
+                    // Pass None — create_driver() has per-provider env var lookups
+                    None
+                }
+            };
+
+            // Don't inherit default provider's base_url when switching providers
+            let base_url = if has_custom_url {
+                manifest.model.base_url.clone()
+            } else if agent_provider == default_provider {
+                self.config.default_model.base_url.clone()
+            } else {
+                // Let create_driver() use the target provider's default base URL
+                None
+            };
 
             let driver_config = DriverConfig {
                 provider: agent_provider.clone(),
-                api_key: std::env::var(&api_key_env).ok(),
-                base_url: manifest
-                    .model
-                    .base_url
-                    .clone()
-                    .or_else(|| self.config.default_model.base_url.clone()),
+                api_key,
+                base_url,
             };
 
             drivers::create_driver(&driver_config).map_err(|e| {
@@ -4329,22 +4347,89 @@ fn manifest_to_capabilities(manifest: &AgentManifest) -> Vec<Capability> {
     caps
 }
 
+/// Apply global budget defaults to an agent's resource quota.
+///
+/// When the global budget config specifies limits and the agent still has
+/// the built-in defaults, override them so agents respect the user's config.
+fn apply_budget_defaults(
+    budget: &openfang_types::config::BudgetConfig,
+    resources: &mut ResourceQuota,
+) {
+    // Only override hourly if agent has the built-in default (1.0) and global is set
+    if budget.max_hourly_usd > 0.0 && resources.max_cost_per_hour_usd == 1.0 {
+        resources.max_cost_per_hour_usd = budget.max_hourly_usd;
+    }
+    // Only override daily/monthly if agent has unlimited (0.0) and global is set
+    if budget.max_daily_usd > 0.0 && resources.max_cost_per_day_usd == 0.0 {
+        resources.max_cost_per_day_usd = budget.max_daily_usd;
+    }
+    if budget.max_monthly_usd > 0.0 && resources.max_cost_per_month_usd == 0.0 {
+        resources.max_cost_per_month_usd = budget.max_monthly_usd;
+    }
+}
+
+/// Infer provider from a model name when catalog lookup fails.
+///
+/// Uses well-known model name prefixes to map to the correct provider.
+/// This is a defense-in-depth fallback — models should ideally be in the catalog.
+fn infer_provider_from_model(model: &str) -> Option<String> {
+    let lower = model.to_lowercase();
+    // Check for explicit provider prefix (e.g., "minimax/MiniMax-M2.5")
+    if let Some(prefix) = lower.split('/').next() {
+        match prefix {
+            "minimax" | "gemini" | "anthropic" | "openai" | "groq" | "deepseek" | "mistral"
+            | "cohere" | "xai" | "ollama" | "together" | "fireworks" | "perplexity"
+            | "cerebras" | "sambanova" | "replicate" | "huggingface" | "ai21" | "codex"
+            | "claude-code" | "copilot" | "github-copilot" | "qwen" | "zhipu" | "moonshot"
+            | "openrouter" => {
+                if model.contains('/') {
+                    return Some(prefix.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    // Infer from well-known model name patterns
+    if lower.starts_with("minimax") {
+        Some("minimax".to_string())
+    } else if lower.starts_with("gemini") {
+        Some("gemini".to_string())
+    } else if lower.starts_with("claude") {
+        Some("anthropic".to_string())
+    } else if lower.starts_with("gpt") || lower.starts_with("o1") || lower.starts_with("o3") || lower.starts_with("o4") {
+        Some("openai".to_string())
+    } else if lower.starts_with("llama") || lower.starts_with("mixtral") || lower.starts_with("qwen") {
+        // These could be on multiple providers; don't infer
+        None
+    } else if lower.starts_with("grok") {
+        Some("xai".to_string())
+    } else if lower.starts_with("deepseek") {
+        Some("deepseek".to_string())
+    } else if lower.starts_with("mistral") || lower.starts_with("codestral") || lower.starts_with("pixtral") {
+        Some("mistral".to_string())
+    } else if lower.starts_with("command") || lower.starts_with("embed-") {
+        Some("cohere".to_string())
+    } else if lower.starts_with("jamba") {
+        Some("ai21".to_string())
+    } else if lower.starts_with("sonar") {
+        Some("perplexity".to_string())
+    } else if lower.starts_with("glm") {
+        Some("zhipu".to_string())
+    } else if lower.starts_with("ernie") {
+        Some("qianfan".to_string())
+    } else if lower.starts_with("abab") {
+        Some("minimax".to_string())
+    } else {
+        None
+    }
+}
+
 /// A well-known agent ID used for shared memory operations across agents.
 /// This is a fixed UUID so all agents read/write to the same namespace.
 fn shared_memory_agent_id() -> AgentId {
     AgentId(uuid::Uuid::from_bytes([
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x01,
-    ]))
-}
-
-/// A well-known agent ID for the shared semantic memory pool.
-/// Distinct from the KV shared namespace (0x01). High-value memories
-/// promoted from any agent are stored here and recalled by all agents.
-pub fn shared_semantic_agent_id() -> AgentId {
-    AgentId(uuid::Uuid::from_bytes([
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x02,
     ]))
 }
 
@@ -4364,41 +4449,12 @@ async fn cron_deliver_response(
     match delivery {
         CronDelivery::None => {}
         CronDelivery::Channel { channel, to } => {
-            tracing::info!(channel = %channel, to = %to, "Cron: delivering to channel");
+            tracing::debug!(channel = %channel, to = %to, "Cron: delivering to channel");
             // Persist as last channel for this agent (survives restarts)
             let kv_val = serde_json::json!({"channel": channel, "recipient": to});
             let _ = kernel
                 .memory
                 .structured_set(agent_id, "delivery.last_channel", kv_val);
-
-            // Deliver via self-call to the local API (bridge picks up outgoing messages)
-            let api_listen = &kernel.config.api_listen;
-            let url = format!("http://{api_listen}/api/agents/{}/send", agent_id);
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(15))
-                .build();
-            if let Ok(client) = client {
-                let payload = serde_json::json!({
-                    "channel": channel,
-                    "to": to,
-                    "message": response,
-                });
-                match client.post(&url).json(&payload).send().await {
-                    Ok(resp) if resp.status().is_success() => {
-                        tracing::info!(channel = %channel, to = %to, "Cron: channel delivery succeeded");
-                    }
-                    Ok(resp) => {
-                        tracing::warn!(
-                            channel = %channel,
-                            status = %resp.status(),
-                            "Cron: channel delivery returned non-success"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Cron: channel delivery failed");
-                    }
-                }
-            }
         }
         CronDelivery::LastChannel => {
             match kernel
@@ -4414,13 +4470,6 @@ async fn cron_deliver_response(
                             recipient = %recipient,
                             "Cron: delivering to last channel"
                         );
-                        // Re-dispatch as explicit channel delivery
-                        let explicit = openfang_types::scheduler::CronDelivery::Channel {
-                            channel: channel.to_string(),
-                            to: recipient.to_string(),
-                        };
-                        Box::pin(cron_deliver_response(kernel, agent_id, response, &explicit))
-                            .await;
                     }
                 }
                 _ => {
@@ -4514,30 +4563,15 @@ impl KernelHandle for OpenFangKernel {
         OpenFangKernel::kill_agent(self, id).map_err(|e| format!("Kill failed: {e}"))
     }
 
-    fn memory_store(
-        &self,
-        caller_agent_id: &str,
-        key: &str,
-        value: serde_json::Value,
-    ) -> Result<(), String> {
-        let agent_id: AgentId = caller_agent_id
-            .parse()
-            .map(AgentId)
-            .unwrap_or_else(|_| shared_memory_agent_id());
+    fn memory_store(&self, key: &str, value: serde_json::Value) -> Result<(), String> {
+        let agent_id = shared_memory_agent_id();
         self.memory
             .structured_set(agent_id, key, value)
             .map_err(|e| format!("Memory store failed: {e}"))
     }
 
-    fn memory_recall(
-        &self,
-        caller_agent_id: &str,
-        key: &str,
-    ) -> Result<Option<serde_json::Value>, String> {
-        let agent_id: AgentId = caller_agent_id
-            .parse()
-            .map(AgentId)
-            .unwrap_or_else(|_| shared_memory_agent_id());
+    fn memory_recall(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+        let agent_id = shared_memory_agent_id();
         self.memory
             .structured_get(agent_id, key)
             .map_err(|e| format!("Memory recall failed: {e}"))
@@ -4629,9 +4663,9 @@ impl KernelHandle for OpenFangKernel {
         &self,
         entity: openfang_types::memory::Entity,
     ) -> Result<String, String> {
-        // Use find-or-create for deduplication by (name, entity_type)
         self.memory
-            .knowledge_find_or_create(entity)
+            .add_entity(entity)
+            .await
             .map_err(|e| format!("Knowledge add entity failed: {e}"))
     }
 
@@ -4892,6 +4926,42 @@ impl KernelHandle for OpenFangKernel {
             .map(|(url, _)| url.clone())
     }
 
+    async fn send_channel_message(
+        &self,
+        channel: &str,
+        recipient: &str,
+        message: &str,
+    ) -> Result<String, String> {
+        let adapter = self
+            .channel_adapters
+            .get(channel)
+            .ok_or_else(|| {
+                let available: Vec<String> = self
+                    .channel_adapters
+                    .iter()
+                    .map(|e| e.key().clone())
+                    .collect();
+                format!(
+                    "Channel '{}' not found. Available channels: {:?}",
+                    channel, available
+                )
+            })?
+            .clone();
+
+        let user = openfang_channels::types::ChannelUser {
+            platform_id: recipient.to_string(),
+            display_name: recipient.to_string(),
+            openfang_user: None,
+        };
+
+        adapter
+            .send(&user, openfang_channels::types::ChannelContent::Text(message.to_string()))
+            .await
+            .map_err(|e| format!("Channel send failed: {e}"))?;
+
+        Ok(format!("Message sent to {} via {}", recipient, channel))
+    }
+
     async fn spawn_agent_checked(
         &self,
         manifest_toml: &str,
@@ -4915,14 +4985,6 @@ impl KernelHandle for OpenFangKernel {
 
         // Delegate to the normal spawn path (use trait method via KernelHandle::)
         KernelHandle::spawn_agent(self, manifest_toml, parent_id).await
-    }
-
-    fn record_model_observation(
-        &self,
-        model_id: &str,
-        observation: openfang_runtime::model_scoring::ModelObservation,
-    ) {
-        self.model_ledger.record(model_id, observation);
     }
 }
 

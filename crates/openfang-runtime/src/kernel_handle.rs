@@ -183,6 +183,18 @@ pub trait KernelHandle: Send + Sync {
         None
     }
 
+    /// Send a message to a user on a named channel adapter (e.g., "email", "telegram").
+    /// Returns a confirmation string on success.
+    async fn send_channel_message(
+        &self,
+        channel: &str,
+        recipient: &str,
+        message: &str,
+    ) -> Result<String, String> {
+        let _ = (channel, recipient, message);
+        Err("Channel send not available".to_string())
+    }
+
     /// Spawn an agent with capability inheritance enforcement.
     /// `parent_caps` are the parent's granted capabilities. The kernel MUST verify
     /// that every capability in the child manifest is covered by `parent_caps`.

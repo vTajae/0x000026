@@ -175,6 +175,7 @@ impl StandaloneChat {
                     self.chat.last_tokens =
                         Some((r.total_usage.input_tokens, r.total_usage.output_tokens));
                 }
+                self.chat.last_cost_usd = r.cost_usd;
             }
             Err(e) => {
                 self.chat.status_msg = Some(format!("Error: {e}"));
@@ -227,6 +228,7 @@ impl StandaloneChat {
         self.chat.thinking = true;
         self.chat.streaming_chars = 0;
         self.chat.last_tokens = None;
+        self.chat.last_cost_usd = None;
         self.chat.status_msg = None;
 
         match &self.backend {
