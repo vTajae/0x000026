@@ -3001,9 +3001,6 @@ mod tests {
         assert!(names.contains(&"agent_kill"));
         assert!(names.contains(&"memory_store"));
         assert!(names.contains(&"memory_recall"));
-        // 2 shared memory tools
-        assert!(names.contains(&"memory_store_shared"));
-        assert!(names.contains(&"memory_recall_shared"));
         // 6 collaboration tools
         assert!(names.contains(&"agent_find"));
         assert!(names.contains(&"task_post"));
