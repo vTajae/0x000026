@@ -1,0 +1,22 @@
+[Unit]
+Description=OpenFang Agent OS Daemon (user)
+Documentation=https://github.com/openfang-ai/openfang
+
+[Service]
+Type=simple
+ExecStart=/home/kronic/Desktop/openfang/target/release/openfang start
+Restart=on-failure
+RestartSec=3
+StartLimitIntervalSec=30
+StartLimitBurst=5
+EnvironmentFile=-/home/kronic/.openfang/.env
+WorkingDirectory=/home/kronic/Desktop/openfang
+TimeoutStopSec=120
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openfang
+WatchdogSec=60
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

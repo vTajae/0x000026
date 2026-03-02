@@ -781,6 +781,10 @@ pub struct ExecPolicy {
     /// Used by the primary agent to access system directories like `~/.openfang/`.
     #[serde(default)]
     pub allowed_paths: Vec<PathBuf>,
+    /// Commands denied even in full mode (self-protection).
+    /// These patterns are checked as substring matches against the raw command string.
+    #[serde(default)]
+    pub deny_patterns: Vec<String>,
 }
 
 fn default_no_output_timeout() -> u64 {
@@ -803,6 +807,7 @@ impl Default for ExecPolicy {
             max_output_bytes: 100 * 1024,
             no_output_timeout_secs: default_no_output_timeout(),
             allowed_paths: Vec::new(),
+            deny_patterns: Vec::new(),
         }
     }
 }

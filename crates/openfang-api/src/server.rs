@@ -577,6 +577,10 @@ pub async fn build_router(
         .route("/hooks/wake", axum::routing::post(routes::webhook_wake))
         .route("/hooks/agent", axum::routing::post(routes::webhook_agent))
         .route("/api/shutdown", axum::routing::post(routes::shutdown))
+        .route(
+            "/api/graceful-restart",
+            axum::routing::post(routes::graceful_restart),
+        )
         // Chat commands endpoint (dynamic slash menu)
         .route("/api/commands", axum::routing::get(routes::list_commands))
         // Config reload endpoint
@@ -782,6 +786,45 @@ pub async fn run_daemon(
             // SECURITY: Restrict daemon info file permissions (contains PID and port).
             restrict_permissions(info_path);
         }
+    }
+
+    // Start systemd watchdog (no-op if WATCHDOG_USEC is not set)
+    {
+        let k = kernel.clone();
+        openfang_runtime::watchdog::start_watchdog(move || !k.supervisor.is_shutting_down());
+    }
+    openfang_runtime::watchdog::notify_ready();
+
+    // Heartbeat monitor: check agent liveness every 30s
+    {
+        let k = kernel.clone();
+        tokio::spawn(async move {
+            let config = openfang_kernel::heartbeat::HeartbeatConfig::default();
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(config.check_interval_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if k.supervisor.is_shutting_down() {
+                    break;
+                }
+                let statuses = openfang_kernel::heartbeat::check_agents(&k.registry, &config);
+                let summary = openfang_kernel::heartbeat::summarize(&statuses);
+                if summary.unresponsive > 0 {
+                    tracing::warn!(
+                        total = summary.total_checked,
+                        responsive = summary.responsive,
+                        unresponsive = summary.unresponsive,
+                        "Heartbeat: unresponsive agents detected"
+                    );
+                } else if summary.total_checked > 0 {
+                    tracing::debug!(
+                        total = summary.total_checked,
+                        "Heartbeat: all agents OK"
+                    );
+                }
+            }
+        });
     }
 
     info!("OpenFang API server listening on http://{addr}");

@@ -501,6 +501,32 @@ pub async fn shutdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(serde_json::json!({"status": "shutting_down"}))
 }
 
+/// POST /api/graceful-restart — Graceful restart (for systemd-managed daemon).
+///
+/// Logs an audit entry, responds immediately, then triggers kernel shutdown
+/// after a short delay to flush the HTTP response. systemd `Restart=on-failure`
+/// brings the daemon back with the new binary.
+pub async fn graceful_restart(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    tracing::info!("Graceful restart requested via API");
+    state.kernel.audit_log.record(
+        "system",
+        openfang_runtime::audit::AuditAction::ConfigChange,
+        "graceful restart requested via API",
+        "ok",
+    );
+
+    // Spawn a delayed shutdown so the HTTP response can flush first.
+    let shutdown_notify = state.shutdown_notify.clone();
+    let kernel = state.kernel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        kernel.shutdown();
+        shutdown_notify.notify_one();
+    });
+
+    Json(serde_json::json!({"status": "restarting"}))
+}
+
 // ---------------------------------------------------------------------------
 // Workflow routes
 // ---------------------------------------------------------------------------

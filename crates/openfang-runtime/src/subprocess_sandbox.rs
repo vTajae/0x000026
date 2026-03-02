@@ -144,6 +144,118 @@ fn extract_all_commands(command: &str) -> Vec<&str> {
     commands
 }
 
+// ---------------------------------------------------------------------------
+// Self-protection: destructive command detection (Full mode)
+// ---------------------------------------------------------------------------
+
+/// Check a command string against hardcoded destructive patterns.
+/// Returns `Some(description)` if blocked, `None` if safe.
+///
+/// These are always active in Full mode and cannot be disabled via config.
+/// Uses simple string matching — no regex — for reliability.
+fn check_destructive_patterns(command: &str) -> Option<&'static str> {
+    let cmd = command.trim();
+    let lower = cmd.to_lowercase();
+
+    // --- Filesystem nukes ---
+    // rm -rf / (with optional flags between rm and the path)
+    if lower.contains("rm ")
+        && lower.contains("-rf")
+        && (lower.contains(" /\n")
+            || lower.contains(" / ")
+            || lower.ends_with(" /")
+            || lower.contains(" /*")
+            || lower.contains(" ~/"))
+    {
+        // Allow "rm -rf /some/specific/path" but block root-level nukes
+        let is_root_nuke = lower
+            .split_whitespace()
+            .any(|w| w == "/" || w == "/*" || w == "~/" || w == "~/.");
+        if is_root_nuke {
+            return Some("rm -rf on root or home directory");
+        }
+    }
+
+    // --- Fork bombs ---
+    if lower.contains(":(){ :|:&") || lower.contains(":(){:|:&") {
+        return Some("fork bomb (bash)");
+    }
+    // Perl/Python fork bombs
+    if lower.contains("fork while fork") || lower.contains("while true; do :; done &") {
+        return Some("fork bomb variant");
+    }
+
+    // --- Disk/device destruction ---
+    if lower.contains("mkfs.") || lower.contains("mkfs ") {
+        return Some("disk format (mkfs)");
+    }
+    // dd writing to block devices
+    if lower.contains("dd ") && lower.contains("of=/dev/") {
+        return Some("dd write to block device");
+    }
+    // Direct device writes
+    if lower.contains("> /dev/sd") || lower.contains("> /dev/nvme") || lower.contains("> /dev/vd")
+    {
+        return Some("direct write to block device");
+    }
+
+    // --- Permission/ownership nukes ---
+    if lower.contains("chmod") && lower.contains("-r") && lower.contains(" 000") {
+        // Check if targeting root
+        if lower.split_whitespace().any(|w| w == "/") {
+            return Some("recursive permission nuke on /");
+        }
+    }
+    if lower.contains("chown")
+        && lower.contains("-r")
+        && lower.split_whitespace().last() == Some("/")
+    {
+        return Some("recursive ownership nuke on /");
+    }
+
+    // --- Kill all processes ---
+    if lower.contains("kill -9 -1") || lower.contains("kill -s kill -1") {
+        return Some("kill all processes (kill -9 -1)");
+    }
+
+    // --- Service self-destruction (systemd) ---
+    // Block stopping/disabling the openfang service (restart is allowed)
+    if lower.contains("systemctl")
+        && (lower.contains("stop openfang") || lower.contains("disable openfang"))
+        && !lower.contains("restart")
+    {
+        return Some("systemctl stop/disable openfang (use restart instead)");
+    }
+
+    None
+}
+
+/// Check if a command attempts to kill the daemon's own process.
+fn command_targets_own_pid(command: &str) -> bool {
+    let own_pid = std::process::id().to_string();
+    let lower = command.to_lowercase();
+
+    // Check "kill <our-pid>" or "kill -9 <our-pid>" etc.
+    if lower.contains("kill") {
+        for word in command.split_whitespace() {
+            if word == own_pid {
+                return true;
+            }
+        }
+    }
+
+    // Check "killall openfang" or "pkill openfang"
+    if lower.contains("killall openfang") || lower.contains("pkill openfang") {
+        return true;
+    }
+    // Also check pgrep piped to kill: "kill $(pgrep openfang)"
+    if lower.contains("pgrep openfang") && lower.contains("kill") {
+        return true;
+    }
+
+    false
+}
+
 /// Validate a shell command against the exec policy.
 ///
 /// Returns `Ok(())` if the command is allowed, `Err(reason)` if blocked.
@@ -153,9 +265,23 @@ pub fn validate_command_allowlist(command: &str, policy: &ExecPolicy) -> Result<
             Err("Shell execution is disabled (exec_policy.mode = deny)".to_string())
         }
         ExecSecurityMode::Full => {
+            // 1. Hardcoded destructive pattern check (always active, not configurable)
+            if let Some(blocked) = check_destructive_patterns(command) {
+                return Err(format!("BLOCKED: destructive command detected — {blocked}"));
+            }
+            // 2. Configurable deny_patterns from config
+            for pattern in &policy.deny_patterns {
+                if command.contains(pattern.as_str()) {
+                    return Err(format!("Blocked by deny pattern: '{pattern}'"));
+                }
+            }
+            // 3. PID self-protection: prevent killing our own daemon process
+            if command_targets_own_pid(command) {
+                return Err("BLOCKED: command targets the daemon's own PID".to_string());
+            }
             tracing::warn!(
                 command = &command[..command.len().min(100)],
-                "Shell exec in full mode — no restrictions"
+                "Shell exec in full mode — passed self-protection checks"
             );
             Ok(())
         }
@@ -649,12 +775,59 @@ mod tests {
     }
 
     #[test]
-    fn test_full_mode_allows_everything() {
+    fn test_full_mode_allows_safe_commands() {
         let policy = ExecPolicy {
             mode: ExecSecurityMode::Full,
             ..ExecPolicy::default()
         };
-        assert!(validate_command_allowlist("rm -rf /", &policy).is_ok());
+        assert!(validate_command_allowlist("cargo build --release", &policy).is_ok());
+        assert!(validate_command_allowlist("curl https://example.com", &policy).is_ok());
+        assert!(validate_command_allowlist("rm -rf /tmp/build-cache", &policy).is_ok());
+    }
+
+    #[test]
+    fn test_full_mode_blocks_destructive() {
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Full,
+            ..ExecPolicy::default()
+        };
+        // Root-level rm -rf
+        assert!(validate_command_allowlist("rm -rf /", &policy).is_err());
+        assert!(validate_command_allowlist("rm -rf /*", &policy).is_err());
+        // Fork bomb
+        assert!(validate_command_allowlist(":(){ :|:& };:", &policy).is_err());
+        // Disk format
+        assert!(validate_command_allowlist("mkfs.ext4 /dev/sda1", &policy).is_err());
+        // dd to block device
+        assert!(validate_command_allowlist("dd if=/dev/zero of=/dev/sda", &policy).is_err());
+        // Kill all
+        assert!(validate_command_allowlist("kill -9 -1", &policy).is_err());
+        // killall openfang
+        assert!(validate_command_allowlist("killall openfang", &policy).is_err());
+        // pkill openfang
+        assert!(validate_command_allowlist("pkill openfang", &policy).is_err());
+        // systemctl stop
+        assert!(validate_command_allowlist("systemctl --user stop openfang", &policy).is_err());
+    }
+
+    #[test]
+    fn test_full_mode_allows_restart() {
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Full,
+            ..ExecPolicy::default()
+        };
+        assert!(validate_command_allowlist("systemctl --user restart openfang", &policy).is_ok());
+    }
+
+    #[test]
+    fn test_full_mode_deny_patterns() {
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Full,
+            deny_patterns: vec!["secret-tool".to_string()],
+            ..ExecPolicy::default()
+        };
+        assert!(validate_command_allowlist("secret-tool store", &policy).is_err());
+        assert!(validate_command_allowlist("echo hello", &policy).is_ok());
     }
 
     #[test]
