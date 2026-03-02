@@ -459,6 +459,31 @@ impl ChannelAdapter for DiscordAdapter {
     }
 }
 
+/// Fetch the text content of a Discord CDN attachment URL.
+///
+/// Used to inline .txt, .md, .json, and other text-based file attachments
+/// so the agent sees the content directly in the message.
+async fn fetch_attachment_text(url: &str) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Fetch failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+
+    resp.text()
+        .await
+        .map_err(|e| format!("Read body failed: {e}"))
+}
+
 /// Parse a Discord MESSAGE_CREATE or MESSAGE_UPDATE payload into a `ChannelMessage`.
 async fn parse_discord_message(
     d: &serde_json::Value,
@@ -512,9 +537,73 @@ async fn parse_discord_message(
     }
 
     let content_text = d["content"].as_str().unwrap_or("");
-    if content_text.is_empty() {
-        return None;
+
+    // Extract attachment info (files, images sent alongside or instead of text)
+    let attachments = d["attachments"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    // For .txt file attachments, download the content inline so the agent sees it
+    let mut attachment_texts: Vec<String> = Vec::new();
+    let mut attachment_metadata: Vec<serde_json::Value> = Vec::new();
+    for att in &attachments {
+        let filename = att["filename"].as_str().unwrap_or("");
+        let url = att["url"].as_str().unwrap_or("");
+        let size = att["size"].as_u64().unwrap_or(0);
+        let content_type = att["content_type"].as_str().unwrap_or("");
+
+        // Store metadata for all attachments
+        attachment_metadata.push(serde_json::json!({
+            "filename": filename,
+            "url": url,
+            "size": size,
+            "content_type": content_type,
+        }));
+
+        // Auto-fetch text-based attachments (txt, md, json, csv, log, yaml, toml, etc.)
+        let is_text_file = filename.ends_with(".txt")
+            || filename.ends_with(".md")
+            || filename.ends_with(".json")
+            || filename.ends_with(".csv")
+            || filename.ends_with(".log")
+            || filename.ends_with(".yaml")
+            || filename.ends_with(".yml")
+            || filename.ends_with(".toml")
+            || filename.ends_with(".xml")
+            || filename.ends_with(".py")
+            || filename.ends_with(".rs")
+            || filename.ends_with(".js")
+            || filename.ends_with(".ts")
+            || content_type.starts_with("text/");
+
+        // Only fetch reasonably sized text files (< 100KB)
+        if is_text_file && !url.is_empty() && size < 100_000 {
+            match fetch_attachment_text(url).await {
+                Ok(text) => {
+                    attachment_texts.push(format!("--- Attached file: {filename} ---\n{text}\n--- End of {filename} ---"));
+                }
+                Err(e) => {
+                    tracing::warn!(filename, url, error = %e, "Failed to fetch Discord attachment");
+                    attachment_texts.push(format!("[Attachment: {filename} ({size} bytes) — fetch failed: {e}]"));
+                }
+            }
+        } else if !url.is_empty() {
+            // Non-text or too large — just note the attachment
+            attachment_texts.push(format!("[Attachment: {filename} ({size} bytes, {content_type})]"));
+        }
     }
+
+    // Build final text: message content + attachment contents
+    let combined_text = if content_text.is_empty() && attachment_texts.is_empty() {
+        return None; // No text and no attachments — nothing to process
+    } else if content_text.is_empty() {
+        attachment_texts.join("\n\n")
+    } else if attachment_texts.is_empty() {
+        content_text.to_string()
+    } else {
+        format!("{content_text}\n\n{}", attachment_texts.join("\n\n"))
+    };
 
     let message_id = d["id"].as_str().unwrap_or("0");
     let discriminator = author["discriminator"].as_str().unwrap_or("0000");
@@ -531,8 +620,8 @@ async fn parse_discord_message(
         .unwrap_or_else(chrono::Utc::now);
 
     // Parse commands (messages starting with /)
-    let content = if content_text.starts_with('/') {
-        let parts: Vec<&str> = content_text.splitn(2, ' ').collect();
+    let content = if combined_text.starts_with('/') {
+        let parts: Vec<&str> = combined_text.splitn(2, ' ').collect();
         let cmd_name = &parts[0][1..];
         let args = if parts.len() > 1 {
             parts[1].split_whitespace().map(String::from).collect()
@@ -544,13 +633,16 @@ async fn parse_discord_message(
             args,
         }
     } else {
-        ChannelContent::Text(content_text.to_string())
+        ChannelContent::Text(combined_text)
     };
 
     // Build metadata with author info and read-only flag
     let mut metadata = HashMap::new();
     metadata.insert("author_id".to_string(), serde_json::Value::String(author_id.to_string()));
     metadata.insert("author_username".to_string(), serde_json::Value::String(username.to_string()));
+    if !attachment_metadata.is_empty() {
+        metadata.insert("attachments".to_string(), serde_json::Value::Array(attachment_metadata));
+    }
     if is_read_only {
         metadata.insert("read_only".to_string(), serde_json::Value::Bool(true));
     }

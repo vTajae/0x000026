@@ -171,9 +171,9 @@ pub async fn execute_tool(
     debug!(tool_name, "Executing tool");
     let result = match tool_name {
         // Filesystem tools
-        "file_read" => tool_file_read(input, workspace_root).await,
-        "file_write" => tool_file_write(input, workspace_root).await,
-        "file_list" => tool_file_list(input, workspace_root).await,
+        "file_read" => tool_file_read(input, workspace_root, exec_policy).await,
+        "file_write" => tool_file_write(input, workspace_root, exec_policy).await,
+        "file_list" => tool_file_list(input, workspace_root, exec_policy).await,
         "apply_patch" => tool_apply_patch(input, workspace_root).await,
 
         // Web tools (upgraded: multi-provider search, SSRF-protected fetch)
@@ -241,6 +241,7 @@ pub async fn execute_tool(
 
         // Inter-agent tools (require kernel handle)
         "agent_send" => tool_agent_send(input, kernel).await,
+        "agent_delegate" => tool_agent_delegate(input, kernel).await,
         "agent_spawn" => tool_agent_spawn(input, kernel, caller_agent_id).await,
         "agent_list" => tool_agent_list(kernel),
         "agent_kill" => tool_agent_kill(input, kernel),
@@ -546,6 +547,19 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "message": { "type": "string", "description": "The message to send to the agent" }
                 },
                 "required": ["agent_id", "message"]
+            }),
+        },
+        ToolDefinition {
+            name: "agent_delegate".to_string(),
+            description: "Delegate a task to another agent with a fresh, empty session. Unlike agent_send (which reuses the target's accumulated history), this creates a temporary session for independent subtasks like review, verification, or one-shot queries. The temporary session is cleaned up after the response.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "The target agent's UUID or name" },
+                    "task": { "type": "string", "description": "The task description to delegate" },
+                    "context": { "type": "string", "description": "Optional context to prepend to the task" }
+                },
+                "required": ["agent_id", "task"]
             }),
         },
         ToolDefinition {
@@ -1125,9 +1139,28 @@ fn validate_path(path: &str) -> Result<&str, String> {
 }
 
 /// Resolve a file path through the workspace sandbox (if available) or legacy validation.
-fn resolve_file_path(raw_path: &str, workspace_root: Option<&Path>) -> Result<PathBuf, String> {
+/// When `exec_policy` is provided and has `allowed_paths`, those paths are also permitted.
+fn resolve_file_path(
+    raw_path: &str,
+    workspace_root: Option<&Path>,
+    exec_policy: Option<&openfang_types::config::ExecPolicy>,
+) -> Result<PathBuf, String> {
+    // Full exec mode = no filesystem sandbox (admin agent)
+    let is_full = exec_policy
+        .is_some_and(|p| p.mode == openfang_types::config::ExecSecurityMode::Full);
+    if is_full {
+        let _ = validate_path(raw_path)?;
+        return Ok(PathBuf::from(raw_path));
+    }
     if let Some(root) = workspace_root {
-        crate::workspace_sandbox::resolve_sandbox_path(raw_path, root)
+        let allowed = exec_policy
+            .map(|p| p.allowed_paths.as_slice())
+            .unwrap_or(&[]);
+        if allowed.is_empty() {
+            crate::workspace_sandbox::resolve_sandbox_path(raw_path, root)
+        } else {
+            crate::workspace_sandbox::resolve_sandbox_path_with_allowed(raw_path, root, allowed)
+        }
     } else {
         let _ = validate_path(raw_path)?;
         Ok(PathBuf::from(raw_path))
@@ -1137,9 +1170,10 @@ fn resolve_file_path(raw_path: &str, workspace_root: Option<&Path>) -> Result<Pa
 async fn tool_file_read(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    exec_policy: Option<&openfang_types::config::ExecPolicy>,
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    let resolved = resolve_file_path(raw_path, workspace_root, exec_policy)?;
     tokio::fs::read_to_string(&resolved)
         .await
         .map_err(|e| format!("Failed to read file: {e}"))
@@ -1148,9 +1182,10 @@ async fn tool_file_read(
 async fn tool_file_write(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    exec_policy: Option<&openfang_types::config::ExecPolicy>,
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    let resolved = resolve_file_path(raw_path, workspace_root, exec_policy)?;
     let content = input["content"]
         .as_str()
         .ok_or("Missing 'content' parameter")?;
@@ -1172,9 +1207,10 @@ async fn tool_file_write(
 async fn tool_file_list(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    exec_policy: Option<&openfang_types::config::ExecPolicy>,
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    let resolved = resolve_file_path(raw_path, workspace_root, exec_policy)?;
     let mut entries = tokio::fs::read_dir(&resolved)
         .await
         .map_err(|e| format!("Failed to list directory: {e}"))?;
@@ -1455,6 +1491,36 @@ async fn tool_agent_send(
         .await
 }
 
+async fn tool_agent_delegate(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let agent_id = input["agent_id"]
+        .as_str()
+        .ok_or("Missing 'agent_id' parameter")?;
+    let task = input["task"]
+        .as_str()
+        .ok_or("Missing 'task' parameter")?;
+    let context = input["context"].as_str();
+
+    // Check + increment inter-agent call depth (same guard as agent_send)
+    let current_depth = AGENT_CALL_DEPTH.try_with(|d| d.get()).unwrap_or(0);
+    if current_depth >= MAX_AGENT_CALL_DEPTH {
+        return Err(format!(
+            "Inter-agent call depth exceeded (max {}). \
+             A->B->C chain is too deep. Use the task queue instead.",
+            MAX_AGENT_CALL_DEPTH
+        ));
+    }
+
+    AGENT_CALL_DEPTH
+        .scope(std::cell::Cell::new(current_depth + 1), async {
+            kh.delegate_to_agent(agent_id, task, context).await
+        })
+        .await
+}
+
 async fn tool_agent_spawn(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
@@ -1510,6 +1576,12 @@ fn tool_memory_store(
     let key = input["key"].as_str().ok_or("Missing 'key' parameter")?;
     let value = input.get("value").ok_or("Missing 'value' parameter")?;
     kh.memory_store(key, value.clone())?;
+
+    // Trigger cross-agent profile sync for user_* keys
+    if key.starts_with("user_") {
+        kh.sync_user_profile(key, value);
+    }
+
     Ok(format!("Stored value under key '{key}'."))
 }
 
@@ -2671,7 +2743,7 @@ async fn tool_speech_to_text(
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let _language = input["language"].as_str();
 
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    let resolved = resolve_file_path(raw_path, workspace_root, None)?;
 
     // Read the audio file
     let data = tokio::fs::read(&resolved)
@@ -2987,8 +3059,8 @@ mod tests {
     fn test_builtin_tool_definitions() {
         let tools = builtin_tool_definitions();
         assert!(
-            tools.len() >= 41,
-            "Expected at least 41 tools, got {}",
+            tools.len() >= 42,
+            "Expected at least 42 tools, got {}",
             tools.len()
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -2996,6 +3068,7 @@ mod tests {
         assert!(names.contains(&"file_read"));
         assert!(names.contains(&"shell_exec"));
         assert!(names.contains(&"agent_send"));
+        assert!(names.contains(&"agent_delegate"));
         assert!(names.contains(&"agent_spawn"));
         assert!(names.contains(&"agent_list"));
         assert!(names.contains(&"agent_kill"));

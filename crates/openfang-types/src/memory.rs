@@ -233,6 +233,9 @@ pub struct ConsolidationReport {
     pub memories_boosted: u64,
     /// How long the consolidation took.
     pub duration_ms: u64,
+    /// Number of memories synthesized via LLM (related pairs merged into new knowledge).
+    #[serde(default)]
+    pub memories_synthesized: u64,
 }
 
 /// Format for memory export/import.

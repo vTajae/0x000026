@@ -124,6 +124,7 @@ impl ConsolidationEngine {
             memories_decayed: decayed as u64,
             memories_boosted: total_boosted,
             duration_ms,
+            memories_synthesized: 0,
         })
     }
 

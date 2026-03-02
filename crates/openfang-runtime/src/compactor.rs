@@ -44,6 +44,14 @@ pub struct CompactionConfig {
     pub token_threshold_ratio: f64,
     /// Model context window size in tokens.
     pub context_window_tokens: usize,
+    /// Whether to use relevance-weighted splitting (requires embedding driver).
+    /// When enabled, old-but-relevant messages are preserved based on semantic
+    /// similarity to recent conversation anchors.
+    pub relevance_weighting: bool,
+    /// Extra messages to keep via relevance scoring (on top of keep_recent).
+    pub relevance_keep_extra: usize,
+    /// Weight for relevance vs recency: score = weight * cosine_sim + (1-weight) * recency.
+    pub relevance_weight: f64,
 }
 
 impl CompactionConfig {
@@ -66,6 +74,9 @@ impl CompactionConfig {
                 max_retries: 2,
                 token_threshold_ratio: 0.5,
                 context_window_tokens: window_tokens,
+                relevance_weighting: false,
+                relevance_keep_extra: 3,
+                relevance_weight: 0.6,
             }
         } else if window_tokens <= 65_536 {
             // Moderate: compact at reasonable thresholds
@@ -81,6 +92,9 @@ impl CompactionConfig {
                 max_retries: 3,
                 token_threshold_ratio: 0.6,
                 context_window_tokens: window_tokens,
+                relevance_weighting: false,
+                relevance_keep_extra: 4,
+                relevance_weight: 0.6,
             }
         } else {
             // Large context: default behavior
@@ -106,6 +120,9 @@ impl Default for CompactionConfig {
             max_retries: 3,
             token_threshold_ratio: 0.7,
             context_window_tokens: 200_000,
+            relevance_weighting: false,
+            relevance_keep_extra: 5,
+            relevance_weight: 0.6,
         }
     }
 }
@@ -772,11 +789,106 @@ pub fn pre_compaction_fact_extraction(
     }
 }
 
+/// Relevance-weighted split: instead of purely chronological splitting, score older
+/// messages by semantic similarity to recent conversation anchors and keep the
+/// most relevant ones alongside the most recent.
+///
+/// Falls back to chronological split on any error (embedding failure, etc.).
+async fn relevance_weighted_split(
+    messages: &[Message],
+    config: &CompactionConfig,
+    embedding_driver: &(dyn crate::embedding::EmbeddingDriver + Send + Sync),
+) -> Option<(Vec<Message>, Vec<Message>)> {
+    use crate::embedding::cosine_similarity;
+
+    let msg_count = messages.len();
+    let keep_recent = config.keep_recent;
+    if msg_count <= keep_recent {
+        return None;
+    }
+
+    let split_at = msg_count.saturating_sub(keep_recent);
+    let older = &messages[..split_at];
+    let recent = &messages[split_at..];
+
+    // Extract anchor text from the last few user messages
+    let anchor_texts: Vec<String> = recent
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .map(|m| m.content.text_content())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if anchor_texts.is_empty() {
+        return None;
+    }
+    let anchor = anchor_texts.join(" ");
+
+    // Collect text from older messages
+    let older_texts: Vec<String> = older
+        .iter()
+        .map(|m| m.content.text_content())
+        .collect();
+
+    // Embed anchor and all older messages
+    let mut texts_to_embed: Vec<String> = vec![anchor.clone()];
+    texts_to_embed.extend(older_texts.iter().cloned());
+    let to_embed: Vec<&str> = texts_to_embed.iter().map(|s| s.as_str()).collect();
+
+    let embeddings = match embedding_driver.embed(&to_embed).await {
+        Ok(e) if e.len() == to_embed.len() => e,
+        _ => return None, // Fallback to chronological on any error
+    };
+
+    let anchor_emb = &embeddings[0];
+    let older_embs = &embeddings[1..];
+
+    // Score each older message: score = relevance_weight * cosine_sim + (1 - relevance_weight) * recency
+    let weight = config.relevance_weight;
+    let mut scored: Vec<(usize, f64)> = older_embs
+        .iter()
+        .enumerate()
+        .map(|(i, emb)| {
+            let sim = cosine_similarity(anchor_emb, emb) as f64;
+            let recency = i as f64 / older.len().max(1) as f64; // 0.0 = oldest, ~1.0 = newest
+            let score = weight * sim + (1.0 - weight) * recency;
+            (i, score)
+        })
+        .collect();
+
+    // Sort by score descending — top scores are kept
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let extra_keep = config.relevance_keep_extra.min(older.len());
+    let keep_indices: std::collections::HashSet<usize> =
+        scored.iter().take(extra_keep).map(|(i, _)| *i).collect();
+
+    // Split: kept (relevance-selected + recent), to_compact (the rest)
+    let mut to_compact = Vec::new();
+    let mut relevance_kept = Vec::new();
+    for (i, msg) in older.iter().enumerate() {
+        if keep_indices.contains(&i) {
+            relevance_kept.push(msg.clone());
+        } else {
+            to_compact.push(msg.clone());
+        }
+    }
+
+    // Combine: relevance-kept older messages + recent messages
+    relevance_kept.extend(recent.iter().cloned());
+
+    if to_compact.is_empty() {
+        return None; // Nothing to compact
+    }
+
+    Some((to_compact, relevance_kept))
+}
+
 pub async fn compact_session(
     driver: Arc<dyn LlmDriver>,
     model: &str,
     session: &Session,
     config: &CompactionConfig,
+    embedding_driver: Option<&(dyn crate::embedding::EmbeddingDriver + Send + Sync)>,
 ) -> Result<CompactionResult, String> {
     let msg_count = session.messages.len();
     if msg_count <= config.keep_recent {
@@ -789,22 +901,53 @@ pub async fn compact_session(
         });
     }
 
-    let split_at = msg_count.saturating_sub(config.keep_recent);
-    let to_compact = &session.messages[..split_at];
-    let kept = &session.messages[split_at..];
+    // Determine split strategy: relevance-weighted or chronological
+    let (to_compact, kept_messages) = if config.relevance_weighting {
+        if let Some(emb) = embedding_driver {
+            match relevance_weighted_split(&session.messages, config, emb).await {
+                Some((compact, kept)) => {
+                    info!(
+                        relevance_kept = kept.len(),
+                        to_compact = compact.len(),
+                        "Using relevance-weighted compaction split"
+                    );
+                    (compact, kept)
+                }
+                None => {
+                    // Fallback to chronological
+                    let split_at = msg_count.saturating_sub(config.keep_recent);
+                    (
+                        session.messages[..split_at].to_vec(),
+                        session.messages[split_at..].to_vec(),
+                    )
+                }
+            }
+        } else {
+            let split_at = msg_count.saturating_sub(config.keep_recent);
+            (
+                session.messages[..split_at].to_vec(),
+                session.messages[split_at..].to_vec(),
+            )
+        }
+    } else {
+        let split_at = msg_count.saturating_sub(config.keep_recent);
+        (
+            session.messages[..split_at].to_vec(),
+            session.messages[split_at..].to_vec(),
+        )
+    };
 
     info!(
         total = msg_count,
         compacting = to_compact.len(),
-        keeping = kept.len(),
+        keeping = kept_messages.len(),
         "Compacting session messages"
     );
 
-    let kept_messages = kept.to_vec();
     let compacted_count = to_compact.len();
 
     // Stage 1: Try full single-pass summarization
-    match summarize_messages(driver.clone(), model, to_compact, config).await {
+    match summarize_messages(driver.clone(), model, &to_compact, config).await {
         Ok(summary) => {
             info!(
                 summary_len = summary.len(),
@@ -825,9 +968,9 @@ pub async fn compact_session(
     }
 
     // Stage 2: Chunked summarization with adaptive ratio
-    match summarize_in_chunks(driver.clone(), model, to_compact, config).await {
+    match summarize_in_chunks(driver.clone(), model, &to_compact, config).await {
         Ok(summary) => {
-            let chunk_ratio = compute_adaptive_chunk_ratio(to_compact, config);
+            let chunk_ratio = compute_adaptive_chunk_ratio(&to_compact, config);
             let chunk_size = (to_compact.len() as f64 * chunk_ratio).ceil() as usize;
             let chunk_size = chunk_size.max(5);
             let num_chunks = (to_compact.len() as f64 / chunk_size as f64).ceil() as u32;
@@ -959,7 +1102,7 @@ mod tests {
         };
 
         // With only 2 messages and keep_recent=10, nothing should be compacted
-        let result = compact_session(Arc::new(FakeDriver), "test-model", &session, &config)
+        let result = compact_session(Arc::new(FakeDriver), "test-model", &session, &config, None)
             .await
             .unwrap();
         assert_eq!(result.compacted_count, 0);
@@ -1043,7 +1186,7 @@ mod tests {
             ..CompactionConfig::default()
         };
 
-        let result = compact_session(Arc::new(FakeDriver), "test-model", &session, &config)
+        let result = compact_session(Arc::new(FakeDriver), "test-model", &session, &config, None)
             .await
             .unwrap();
         assert!(result.compacted_count > 0);
@@ -1113,7 +1256,7 @@ mod tests {
             ..CompactionConfig::default()
         };
 
-        let result = compact_session(Arc::new(FakeDriver), "test-model", &session, &config)
+        let result = compact_session(Arc::new(FakeDriver), "test-model", &session, &config, None)
             .await
             .unwrap();
         assert_eq!(result.compacted_count, 90);
@@ -1241,7 +1384,7 @@ mod tests {
             ..CompactionConfig::default()
         };
 
-        let result = compact_session(Arc::new(FailingDriver), "test-model", &session, &config)
+        let result = compact_session(Arc::new(FailingDriver), "test-model", &session, &config, None)
             .await
             .unwrap();
 

@@ -2628,6 +2628,7 @@ pub async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl Into
 pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let skills_dir = state.kernel.config.home_dir.join("skills");
     let mut registry = openfang_skills::registry::SkillRegistry::new(skills_dir);
+    registry.load_bundled();
     let _ = registry.load_all();
 
     let skills: Vec<serde_json::Value> = registry
@@ -2708,6 +2709,7 @@ pub async fn uninstall_skill(
 ) -> impl IntoResponse {
     let skills_dir = state.kernel.config.home_dir.join("skills");
     let mut registry = openfang_skills::registry::SkillRegistry::new(skills_dir);
+    registry.load_bundled();
     let _ = registry.load_all();
 
     match registry.remove(&req.name) {

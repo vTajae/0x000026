@@ -36,6 +36,24 @@ pub trait KernelHandle: Send + Sync {
     /// Send a message to another agent and get the response.
     async fn send_to_agent(&self, agent_id: &str, message: &str) -> Result<String, String>;
 
+    /// Delegate a task to another agent with a fresh (empty) session context.
+    /// Unlike `send_to_agent`, which reuses the target agent's accumulated session,
+    /// this creates a temporary session for the invocation and cleans it up afterward.
+    /// Useful for independent subtasks like review, verification, or one-shot queries.
+    async fn delegate_to_agent(
+        &self,
+        agent_id: &str,
+        task: &str,
+        context: Option<&str>,
+    ) -> Result<String, String> {
+        // Default: fall back to send_to_agent (no fresh-context support)
+        let message = match context {
+            Some(ctx) => format!("Context:\n{ctx}\n\nTask:\n{task}"),
+            None => task.to_string(),
+        };
+        self.send_to_agent(agent_id, &message).await
+    }
+
     /// List all running agents.
     fn list_agents(&self) -> Vec<AgentInfo>;
 
@@ -214,5 +232,15 @@ pub trait KernelHandle: Send + Sync {
     ) {
         let _ = (model_id, observation);
         // Default: no-op. Kernel overrides with real ledger.
+    }
+
+    /// Synchronize a user profile key/value to all active agent workspaces.
+    ///
+    /// Called when a `user_*` key is written to shared memory. The kernel
+    /// implementation updates `USER.md` in every agent workspace so that
+    /// profile data propagates across channels (e.g., main → job agent).
+    fn sync_user_profile(&self, key: &str, value: &serde_json::Value) {
+        let _ = (key, value);
+        // Default: no-op. Kernel overrides with real sync.
     }
 }

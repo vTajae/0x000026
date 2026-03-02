@@ -68,6 +68,74 @@ pub fn resolve_sandbox_path(user_path: &str, workspace_root: &Path) -> Result<Pa
     Ok(canon_candidate)
 }
 
+/// Resolve a user-supplied path within a workspace sandbox, with additional allowed paths.
+///
+/// Like `resolve_sandbox_path`, but also permits access to directories listed in
+/// `allowed_paths` (e.g., for the primary agent to access `~/.openfang/`).
+/// Absolute paths are checked against both the workspace root and each allowed path.
+/// Relative paths are always resolved against the workspace root.
+pub fn resolve_sandbox_path_with_allowed(
+    user_path: &str,
+    workspace_root: &Path,
+    allowed_paths: &[PathBuf],
+) -> Result<PathBuf, String> {
+    let path = Path::new(user_path);
+
+    // Reject any `..` components
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err("Path traversal denied: '..' components are forbidden".to_string());
+        }
+    }
+
+    // Build the candidate path
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    };
+
+    // Canonicalize the candidate (or its parent for new files)
+    let canon_candidate = if candidate.exists() {
+        candidate
+            .canonicalize()
+            .map_err(|e| format!("Failed to resolve path: {e}"))?
+    } else {
+        let parent = candidate
+            .parent()
+            .ok_or_else(|| "Invalid path: no parent directory".to_string())?;
+        let filename = candidate
+            .file_name()
+            .ok_or_else(|| "Invalid path: no filename".to_string())?;
+        let canon_parent = parent
+            .canonicalize()
+            .map_err(|e| format!("Failed to resolve parent directory: {e}"))?;
+        canon_parent.join(filename)
+    };
+
+    // Check workspace root first
+    let canon_root = workspace_root
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve workspace root: {e}"))?;
+    if canon_candidate.starts_with(&canon_root) {
+        return Ok(canon_candidate);
+    }
+
+    // Check each allowed path
+    for allowed in allowed_paths {
+        if let Ok(canon_allowed) = allowed.canonicalize() {
+            if canon_candidate.starts_with(&canon_allowed) {
+                return Ok(canon_candidate);
+            }
+        }
+    }
+
+    Err(format!(
+        "Access denied: path '{}' resolves outside workspace and allowed paths.",
+        user_path
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

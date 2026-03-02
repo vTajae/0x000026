@@ -588,6 +588,113 @@ impl MemorySubstrate {
     }
 
     // -----------------------------------------------------------------
+    // Synthesis & entity extraction helpers
+    // -----------------------------------------------------------------
+
+    /// Fetch all non-deleted memories that have embeddings, for use by LLM synthesis.
+    /// Returns tuples of (memory_id, agent_id, content, embedding_bytes, confidence).
+    #[allow(clippy::type_complexity)]
+    pub fn get_memories_for_synthesis(
+        &self,
+    ) -> OpenFangResult<Vec<(String, String, String, Vec<u8>, f32)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, agent_id, content, embedding, confidence
+                 FROM memories
+                 WHERE deleted = 0 AND embedding IS NOT NULL
+                 ORDER BY agent_id, created_at DESC",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, f32>(4)?,
+                ))
+            })
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let mut result = Vec::new();
+        for r in rows.flatten() {
+            result.push(r);
+        }
+        Ok(result)
+    }
+
+    /// Reduce confidence of a source memory after it has been synthesized.
+    pub fn reduce_confidence(&self, memory_id: &str, new_confidence: f32) -> OpenFangResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE memories SET confidence = ?1 WHERE id = ?2",
+            rusqlite::params![new_confidence, memory_id],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Fetch memories that haven't been through entity extraction yet.
+    /// Checks for absence of "entity_extracted" key in the metadata JSON.
+    pub fn get_unextracted_memories(&self, limit: usize) -> OpenFangResult<Vec<(String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, agent_id, content FROM memories
+                 WHERE deleted = 0
+                 AND (metadata IS NULL OR json_extract(metadata, '$.entity_extracted') IS NULL)
+                 ORDER BY created_at DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map([limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let mut result = Vec::new();
+        for r in rows.flatten() {
+            result.push(r);
+        }
+        Ok(result)
+    }
+
+    /// Set a metadata field on a memory by ID.
+    pub fn set_memory_metadata(
+        &self,
+        memory_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> OpenFangResult<()> {
+        let conn = self.conn.lock().unwrap();
+        // Read current metadata, merge, and write back
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT metadata FROM memories WHERE id = ?1",
+                [memory_id],
+                |row| row.get(0),
+            )
+            .ok();
+        let mut meta: serde_json::Map<String, serde_json::Value> = current
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        meta.insert(key.to_string(), value);
+        let meta_str =
+            serde_json::to_string(&meta).map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        conn.execute(
+            "UPDATE memories SET metadata = ?1 WHERE id = ?2",
+            rusqlite::params![meta_str, memory_id],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
     // Task queue operations
     // -----------------------------------------------------------------
 

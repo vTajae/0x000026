@@ -777,6 +777,10 @@ pub struct ExecPolicy {
     /// produce no stdout/stderr output for this duration. Default: 30.
     #[serde(default = "default_no_output_timeout")]
     pub no_output_timeout_secs: u64,
+    /// Additional filesystem paths the agent is allowed to access outside its workspace.
+    /// Used by the primary agent to access system directories like `~/.openfang/`.
+    #[serde(default)]
+    pub allowed_paths: Vec<PathBuf>,
 }
 
 fn default_no_output_timeout() -> u64 {
@@ -798,6 +802,7 @@ impl Default for ExecPolicy {
             timeout_secs: 30,
             max_output_bytes: 100 * 1024,
             no_output_timeout_secs: default_no_output_timeout(),
+            allowed_paths: Vec::new(),
         }
     }
 }
@@ -1046,6 +1051,15 @@ pub struct KernelConfig {
     /// OAuth client ID overrides for PKCE flows.
     #[serde(default)]
     pub oauth: OAuthConfig,
+    /// Name of the primary agent that gets elevated filesystem access.
+    /// When an agent's name matches this, `system_allowed_paths` are merged
+    /// into its exec_policy.allowed_paths at spawn time.
+    #[serde(default)]
+    pub primary_agent_name: Option<String>,
+    /// Filesystem paths the primary agent is allowed to access outside its workspace.
+    /// Defaults to `[~/.openfang/]` if empty and `primary_agent_name` is set.
+    #[serde(default)]
+    pub system_allowed_paths: Vec<PathBuf>,
 }
 
 /// OAuth client ID overrides for PKCE flows.
@@ -1213,6 +1227,8 @@ impl Default for KernelConfig {
             budget: BudgetConfig::default(),
             provider_urls: HashMap::new(),
             oauth: OAuthConfig::default(),
+            primary_agent_name: None,
+            system_allowed_paths: Vec::new(),
         }
     }
 }

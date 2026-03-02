@@ -1,6 +1,6 @@
 //! Bundled skills — compile-time embedded SKILL.md files.
 //!
-//! Ships 60 prompt-only skills inside the OpenFang binary via `include_str!()`.
+//! Ships 61 prompt-only skills inside the OpenFang binary via `include_str!()`.
 //! User-installed skills with the same name override bundled ones.
 
 use crate::openclaw_compat::convert_skillmd_str;
@@ -179,6 +179,10 @@ pub fn bundled_skills() -> Vec<(&'static str, &'static str)> {
             "wasm-expert",
             include_str!("../bundled/wasm-expert/SKILL.md"),
         ),
+        (
+            "self-check",
+            include_str!("../bundled/self-check/SKILL.md"),
+        ),
     ]
 }
 
@@ -195,7 +199,7 @@ mod tests {
     #[test]
     fn test_bundled_skills_count() {
         let skills = bundled_skills();
-        assert_eq!(skills.len(), 60, "Expected 60 bundled skills");
+        assert_eq!(skills.len(), 61, "Expected 61 bundled skills");
     }
 
     #[test]

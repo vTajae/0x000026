@@ -943,12 +943,12 @@ async fn resolve_default_agent(
 ) {
     match handle.find_agent_by_name(name).await {
         Ok(Some(agent_id)) => {
-            router.set_default(agent_id);
+            router.set_default_named(name.to_string(), agent_id);
             info!("{adapter_name} default agent: {name} ({agent_id})");
         }
         _ => match handle.spawn_agent_by_name(name).await {
             Ok(agent_id) => {
-                router.set_default(agent_id);
+                router.set_default_named(name.to_string(), agent_id);
                 info!("{adapter_name}: spawned default agent {name} ({agent_id})");
             }
             Err(e) => {

@@ -623,16 +623,40 @@ async fn dispatch_message(
     // Send typing indicator (best-effort)
     let _ = adapter.send_typing(&message.sender).await;
 
-    // Send to agent and relay response
-    match handle.send_message(agent_id, &text).await {
+    // Send to agent and relay response.
+    // On "not found" errors, attempt to re-resolve the agent by name and retry once.
+    let mut target_id = agent_id;
+    let result = handle.send_message(target_id, &text).await;
+
+    let result = match &result {
+        Err(e) if e.to_lowercase().contains("not found") => {
+            // Stale UUID — try to re-resolve by stored agent name
+            if let Some(name) = router.default_name() {
+                warn!("Agent {target_id} not found, re-resolving '{name}'...");
+                match handle.find_agent_by_name(&name).await {
+                    Ok(Some(new_id)) => {
+                        router.update_default(new_id);
+                        target_id = new_id;
+                        handle.send_message(new_id, &text).await
+                    }
+                    _ => result, // re-resolution failed, use original error
+                }
+            } else {
+                result
+            }
+        }
+        _ => result,
+    };
+
+    match result {
         Ok(response) => {
             send_response(adapter, &message.sender, response, thread_id, output_format).await;
             handle
-                .record_delivery(agent_id, ct_str, &message.sender.platform_id, true, None)
+                .record_delivery(target_id, ct_str, &message.sender.platform_id, true, None)
                 .await;
         }
         Err(e) => {
-            warn!("Agent error for {agent_id}: {e}");
+            warn!("Agent error for {target_id}: {e}");
             let err_msg = format!("Agent error: {e}");
             send_response(
                 adapter,
@@ -644,7 +668,7 @@ async fn dispatch_message(
             .await;
             handle
                 .record_delivery(
-                    agent_id,
+                    target_id,
                     ct_str,
                     &message.sender.platform_id,
                     false,

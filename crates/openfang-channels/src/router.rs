@@ -30,8 +30,8 @@ pub struct AgentRouter {
     user_defaults: DashMap<String, AgentId>,
     /// Direct routes: (channel_type_key, platform_user_id) -> AgentId.
     direct_routes: DashMap<(String, String), AgentId>,
-    /// System-wide default agent.
-    default_agent: Option<AgentId>,
+    /// System-wide default agent (ID + name for stale-UUID re-resolution).
+    default_agent: Mutex<(Option<AgentId>, Option<String>)>,
     /// Sorted bindings (most specific first). Uses Mutex for runtime updates via Arc.
     bindings: Mutex<Vec<(AgentBinding, String)>>,
     /// Broadcast configuration. Uses Mutex for runtime updates via Arc.
@@ -46,16 +46,32 @@ impl AgentRouter {
         Self {
             user_defaults: DashMap::new(),
             direct_routes: DashMap::new(),
-            default_agent: None,
+            default_agent: Mutex::new((None, None)),
             bindings: Mutex::new(Vec::new()),
             broadcast: Mutex::new(BroadcastConfig::default()),
             agent_name_cache: DashMap::new(),
         }
     }
 
-    /// Set the system-wide default agent.
+    /// Set the system-wide default agent with its name for stale-UUID re-resolution.
     pub fn set_default(&mut self, agent_id: AgentId) {
-        self.default_agent = Some(agent_id);
+        *self.default_agent.lock().unwrap_or_else(|e| e.into_inner()) = (Some(agent_id), None);
+    }
+
+    /// Set the system-wide default agent along with its name.
+    pub fn set_default_named(&mut self, name: String, agent_id: AgentId) {
+        *self.default_agent.lock().unwrap_or_else(|e| e.into_inner()) = (Some(agent_id), Some(name));
+    }
+
+    /// Update the default agent ID at runtime (thread-safe, no &mut self needed).
+    pub fn update_default(&self, agent_id: AgentId) {
+        let mut guard = self.default_agent.lock().unwrap_or_else(|e| e.into_inner());
+        guard.0 = Some(agent_id);
+    }
+
+    /// Get the default agent's name (if stored) for stale-UUID re-resolution.
+    pub fn default_name(&self) -> Option<String> {
+        self.default_agent.lock().unwrap_or_else(|e| e.into_inner()).1.clone()
     }
 
     /// Set a user's default agent.
@@ -142,7 +158,7 @@ impl AgentRouter {
         }
 
         // 3. System default
-        self.default_agent
+        self.default_agent.lock().unwrap_or_else(|e| e.into_inner()).0
     }
 
     /// Resolve with full binding context (supports guild_id, roles, account_id).
@@ -173,7 +189,7 @@ impl AgentRouter {
         if let Some(agent) = self.user_defaults.get(platform_user_id) {
             return Some(*agent);
         }
-        self.default_agent
+        self.default_agent.lock().unwrap_or_else(|e| e.into_inner()).0
     }
 
     /// Resolve broadcast: returns all agents that should receive a message for the given peer.
