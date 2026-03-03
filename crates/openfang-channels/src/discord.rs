@@ -136,6 +136,72 @@ impl DiscordAdapter {
             .await?;
         Ok(())
     }
+
+    /// Fetch messages from a Discord channel.
+    async fn api_get_messages(
+        &self,
+        channel_id: &str,
+        limit: u32,
+        before: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let mut url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages?limit={limit}");
+        if let Some(before_id) = before {
+            url.push_str(&format!("&before={before_id}"));
+        }
+        let resp = self.client
+            .get(&url)
+            .header("Authorization", format!("Bot {}", &*self.token))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Discord API error {status}: {body}").into());
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Bulk delete messages (< 14 days old, max 100 per call).
+    async fn api_bulk_delete_messages(
+        &self,
+        channel_id: &str,
+        message_ids: &[String],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/bulk-delete");
+        let body = serde_json::json!({ "messages": message_ids });
+        let resp = self.client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", &*self.token))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Discord bulk delete error {status}: {body}").into());
+        }
+        Ok(())
+    }
+
+    /// Delete a single message.
+    async fn api_delete_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
+        let resp = self.client
+            .delete(&url)
+            .header("Authorization", format!("Bot {}", &*self.token))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Discord delete message error {status}: {body}").into());
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -361,6 +427,110 @@ impl ChannelAdapter for DiscordAdapter {
                                     }
                                 }
 
+                                "INTERACTION_CREATE" => {
+                                    // Handle Discord slash command interactions
+                                    let interaction_type = d["type"].as_u64().unwrap_or(0);
+                                    if interaction_type == 2 {
+                                        // APPLICATION_COMMAND
+                                        let interaction_id = d["id"].as_str().unwrap_or("").to_string();
+                                        let interaction_token = d["token"].as_str().unwrap_or("").to_string();
+                                        let app_id = d["application_id"].as_str().unwrap_or("").to_string();
+                                        let channel_id = d["channel_id"].as_str().unwrap_or("").to_string();
+                                        let cmd_name = d["data"]["name"].as_str().unwrap_or("").to_string();
+
+                                        // Extract user info
+                                        let user = d["member"]["user"].as_object()
+                                            .or_else(|| d["user"].as_object());
+                                        let user_id = user.and_then(|u| u["id"].as_str()).unwrap_or("unknown").to_string();
+                                        let username = user.and_then(|u| u["username"].as_str()).unwrap_or("unknown").to_string();
+
+                                        // Extract optional string input
+                                        let input_arg = d["data"]["options"]
+                                            .as_array()
+                                            .and_then(|opts| opts.iter().find(|o| o["name"] == "input"))
+                                            .and_then(|o| o["value"].as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+
+                                        // ACK the interaction immediately with DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE (type 5)
+                                        let ack_url = format!("{DISCORD_API_BASE}/interactions/{interaction_id}/{interaction_token}/callback");
+                                        let ack_body = serde_json::json!({"type": 5});
+                                        let ack_client = reqwest::Client::new();
+                                        let ack_result = ack_client
+                                            .post(&ack_url)
+                                            .json(&ack_body)
+                                            .send()
+                                            .await;
+                                        match ack_result {
+                                            Ok(resp) if !resp.status().is_success() => {
+                                                let body = resp.text().await.unwrap_or_default();
+                                                warn!("Discord interaction ACK failed: {body}");
+                                            }
+                                            Err(e) => {
+                                                warn!("Discord interaction ACK error: {e}");
+                                            }
+                                            _ => {
+                                                debug!("Discord interaction ACK sent for /{cmd_name}");
+                                            }
+                                        }
+
+                                        // Check permissions (guild, channel, user)
+                                        let guild_id = d["guild_id"].as_str().and_then(|g| g.parse::<u64>().ok());
+                                        if !allowed_guilds.is_empty() {
+                                            if let Some(gid) = guild_id {
+                                                if !allowed_guilds.contains(&gid) {
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        if !allowed_channels.is_empty() && !allowed_channels.contains(&channel_id) {
+                                            continue;
+                                        }
+                                        if !allowed_users.is_empty() && !allowed_users.contains(&username) {
+                                            continue;
+                                        }
+
+                                        // Build the args list
+                                        let args: Vec<String> = if input_arg.is_empty() {
+                                            vec![]
+                                        } else {
+                                            input_arg.split_whitespace().map(String::from).collect()
+                                        };
+
+                                        // Build metadata with interaction info for response routing
+                                        let mut metadata = std::collections::HashMap::new();
+                                        metadata.insert("interaction_token".to_string(), serde_json::Value::String(interaction_token));
+                                        metadata.insert("app_id".to_string(), serde_json::Value::String(app_id));
+                                        metadata.insert("channel_id".to_string(), serde_json::Value::String(channel_id.clone()));
+                                        metadata.insert("author_id".to_string(), serde_json::Value::String(user_id.clone()));
+                                        metadata.insert("author_username".to_string(), serde_json::Value::String(username.clone()));
+
+                                        let msg = ChannelMessage {
+                                            channel: ChannelType::Discord,
+                                            platform_message_id: interaction_id,
+                                            sender: ChannelUser {
+                                                platform_id: channel_id,
+                                                display_name: username,
+                                                openfang_user: None,
+                                            },
+                                            content: ChannelContent::Command {
+                                                name: cmd_name.clone(),
+                                                args,
+                                            },
+                                            target_agent: None,
+                                            timestamp: chrono::Utc::now(),
+                                            is_group: true,
+                                            thread_id: None,
+                                            metadata,
+                                        };
+
+                                        debug!("Discord INTERACTION_CREATE: /{cmd_name} from {}", msg.sender.display_name);
+                                        if tx.send(msg).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+
                                 "RESUMED" => {
                                     info!("Discord session resumed successfully");
                                 }
@@ -455,6 +625,105 @@ impl ChannelAdapter for DiscordAdapter {
 
     async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self.shutdown_tx.send(true);
+        Ok(())
+    }
+
+    async fn edit_interaction_response(
+        &self,
+        app_id: &str,
+        interaction_token: &str,
+        content: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = format!(
+            "{DISCORD_API_BASE}/webhooks/{app_id}/{interaction_token}/messages/@original"
+        );
+        let body = serde_json::json!({ "content": content });
+        let resp = self
+            .client
+            .patch(&url)
+            .header("Authorization", format!("Bot {}", &*self.token))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(format!("Discord edit interaction error {status}: {body_text}").into());
+        }
+        Ok(())
+    }
+
+    async fn clear_channel_messages(
+        &self,
+        channel_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Discord snowflake epoch: 2015-01-01T00:00:00Z in milliseconds
+        const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
+        let fourteen_days_ms = 14 * 24 * 3600 * 1000;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let cutoff_ms = now_ms.saturating_sub(fourteen_days_ms);
+
+        let mut total_deleted = 0u32;
+        let mut last_id: Option<String> = None;
+
+        loop {
+            let messages = self.api_get_messages(channel_id, 100, last_id.as_deref()).await?;
+            if messages.is_empty() {
+                break;
+            }
+
+            let mut bulk_ids = Vec::new();
+            let mut old_ids = Vec::new();
+
+            for msg in &messages {
+                if let Some(id_str) = msg.get("id").and_then(|v| v.as_str()) {
+                    // Extract timestamp from snowflake: (snowflake >> 22) + DISCORD_EPOCH
+                    let snowflake: u64 = id_str.parse().unwrap_or(0);
+                    let msg_ms = (snowflake >> 22) + DISCORD_EPOCH_MS;
+
+                    if msg_ms > cutoff_ms {
+                        bulk_ids.push(id_str.to_string());
+                    } else {
+                        old_ids.push(id_str.to_string());
+                    }
+                    last_id = Some(id_str.to_string());
+                }
+            }
+
+            // Bulk delete recent messages (need >= 2 for bulk delete)
+            if bulk_ids.len() >= 2 {
+                for chunk in bulk_ids.chunks(100) {
+                    self.api_bulk_delete_messages(channel_id, chunk).await?;
+                    total_deleted += chunk.len() as u32;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            } else {
+                // Single message can't use bulk delete
+                for id in &bulk_ids {
+                    self.api_delete_message(channel_id, id).await?;
+                    total_deleted += 1;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+
+            // Individual delete for old messages
+            for id in &old_ids {
+                if let Err(e) = self.api_delete_message(channel_id, id).await {
+                    warn!("Failed to delete old message {id}: {e}");
+                }
+                total_deleted += 1;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+
+            if messages.len() < 100 {
+                break; // No more messages
+            }
+        }
+
+        debug!("Cleared {total_deleted} messages from channel {channel_id}");
         Ok(())
     }
 }

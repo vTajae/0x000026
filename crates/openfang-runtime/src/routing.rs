@@ -5,7 +5,10 @@
 //! model that can handle the task.
 
 use crate::llm_driver::CompletionRequest;
+use crate::model_scoring::ModelLedger;
+use crate::task_classifier::TaskCategory;
 use openfang_types::agent::ModelRoutingConfig;
+use openfang_types::config::SmartRoutingConfig;
 
 /// Task complexity tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +163,112 @@ impl ModelRouter {
         if let Some(resolved) = catalog.resolve_alias(&self.config.complex_model) {
             self.config.complex_model = resolved.to_string();
         }
+    }
+}
+
+/// Smart routing decision result.
+#[derive(Debug, Clone)]
+pub struct SmartRouteResult {
+    /// The selected model ID.
+    pub model: String,
+    /// Why this model was chosen.
+    pub reason: String,
+    /// Task category detected.
+    pub category: TaskCategory,
+    /// Complexity tier.
+    pub complexity: TaskComplexity,
+}
+
+/// Category-aware model selection using SmartRoutingConfig + ModelLedger.
+///
+/// Priority order:
+/// 1. Large-context override if estimated tokens exceed threshold
+/// 2. Per-category model override from config
+/// 3. Ledger-informed selection (best performer for this category)
+/// 4. Complexity-based fallback (existing Simple/Medium/Complex routing)
+/// 5. Fallback model from config
+pub fn select_model_smart(
+    request: &CompletionRequest,
+    category: TaskCategory,
+    smart_config: &SmartRoutingConfig,
+    ledger: &ModelLedger,
+    complexity_router: Option<&ModelRouter>,
+) -> SmartRouteResult {
+    // Estimate context tokens
+    let est_tokens = crate::task_classifier::estimate_context_tokens(request);
+
+    // 1. Large-context override
+    if est_tokens > smart_config.large_context_threshold {
+        if let Some(ref model) = smart_config.large_context_model {
+            return SmartRouteResult {
+                model: model.clone(),
+                reason: format!(
+                    "large context ({est_tokens} tokens > {} threshold)",
+                    smart_config.large_context_threshold
+                ),
+                category,
+                complexity: TaskComplexity::Complex,
+            };
+        }
+    }
+
+    // 2. Per-category model override from config
+    let category_model = match category {
+        TaskCategory::Code => smart_config.code_model.as_deref(),
+        TaskCategory::Analysis => smart_config.analysis_model.as_deref(),
+        TaskCategory::Writing => smart_config.writing_model.as_deref(),
+        TaskCategory::Planning => smart_config.planning_model.as_deref(),
+        TaskCategory::Research => smart_config.research_model.as_deref(),
+        TaskCategory::Data => smart_config.analysis_model.as_deref(), // data reuses analysis model
+        TaskCategory::Conversation => smart_config.simple_model.as_deref(),
+        TaskCategory::Multimodal => None, // no specific override yet
+    };
+
+    if let Some(model) = category_model {
+        return SmartRouteResult {
+            model: model.to_string(),
+            reason: format!("category override for {category}"),
+            category,
+            complexity: TaskComplexity::Medium,
+        };
+    }
+
+    // 3. Ledger-informed: pick the best-performing model for this category
+    let cat_str = category.to_string();
+    let ranked = ledger.rank_for_task(&cat_str);
+    if let Some((best_model, score)) = ranked.first() {
+        // Only use ledger recommendation if we have enough data (score > 60 = decent confidence)
+        if *score > 60.0 {
+            return SmartRouteResult {
+                model: best_model.clone(),
+                reason: format!("ledger best for {category} (score: {score:.1})"),
+                category,
+                complexity: TaskComplexity::Medium,
+            };
+        }
+    }
+
+    // 4. Complexity-based fallback using existing ModelRouter
+    if let Some(router) = complexity_router {
+        let (complexity, model) = router.select_model(request);
+        return SmartRouteResult {
+            model,
+            reason: format!("complexity routing ({complexity})"),
+            category,
+            complexity,
+        };
+    }
+
+    // 5. Fallback model
+    let model = smart_config
+        .fallback_model
+        .clone()
+        .unwrap_or_else(|| request.model.clone());
+    SmartRouteResult {
+        model,
+        reason: "fallback (no routing data)".to_string(),
+        category,
+        complexity: TaskComplexity::Simple,
     }
 }
 

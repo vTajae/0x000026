@@ -47,6 +47,11 @@ pub enum OutputFormat {
     PlainText,
 }
 
+/// Default read-only context ring buffer size.
+fn default_read_only_context_size() -> usize {
+    50
+}
+
 /// Per-channel behavior overrides.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -69,6 +74,10 @@ pub struct ChannelOverrides {
     pub usage_footer: Option<UsageFooterMode>,
     /// Typing indicator mode override.
     pub typing_mode: Option<TypingMode>,
+    /// Max entries in the read-only context ring buffer per channel source.
+    /// 0 = drop read-only messages (legacy behavior).
+    #[serde(default = "default_read_only_context_size")]
+    pub read_only_context_size: usize,
 }
 
 /// Controls what usage info appears in response footers.
@@ -929,6 +938,88 @@ impl Default for ThinkingConfig {
     }
 }
 
+/// Smart routing strategy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteStrategy {
+    /// Balance cost vs quality using ledger scores.
+    #[default]
+    Balanced,
+    /// Always pick the cheapest capable model.
+    CostFirst,
+    /// Always pick the highest-quality model for the category.
+    QualityFirst,
+}
+
+/// Smart routing configuration — category-aware model selection.
+///
+/// When `auto_route = true`, the router uses task category + ledger scores
+/// to pick the best model. Category overrides let you pin specific models
+/// for specific task types.
+///
+/// ```toml
+/// [routing]
+/// auto_route = true
+/// strategy = "balanced"
+/// code_model = "claude-sonnet-4-6"
+/// code_provider = "anthropic"
+/// analysis_model = "gemini-2.5-pro"
+/// large_context_model = "gemini-2.5-pro"
+/// large_context_threshold = 100000
+/// simple_model = "qwen3:14b"
+/// fallback_model = "qwen3:14b"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SmartRoutingConfig {
+    /// Enable smart auto-routing (default: false).
+    pub auto_route: bool,
+    /// Routing strategy.
+    pub strategy: RouteStrategy,
+    /// Model override for code tasks.
+    pub code_model: Option<String>,
+    /// Provider override for code tasks.
+    pub code_provider: Option<String>,
+    /// Model override for analysis/document tasks.
+    pub analysis_model: Option<String>,
+    /// Model override for writing tasks.
+    pub writing_model: Option<String>,
+    /// Model override for planning tasks.
+    pub planning_model: Option<String>,
+    /// Model override for research tasks.
+    pub research_model: Option<String>,
+    /// Model for large-context requests (> threshold tokens).
+    pub large_context_model: Option<String>,
+    /// Token threshold for switching to large-context model.
+    pub large_context_threshold: usize,
+    /// Model for simple/conversation tasks.
+    pub simple_model: Option<String>,
+    /// Fallback model if nothing else matches (local/cheap).
+    pub fallback_model: Option<String>,
+    /// Fallback provider for the fallback model.
+    pub fallback_provider: Option<String>,
+}
+
+impl Default for SmartRoutingConfig {
+    fn default() -> Self {
+        Self {
+            auto_route: false,
+            strategy: RouteStrategy::default(),
+            code_model: None,
+            code_provider: None,
+            analysis_model: None,
+            writing_model: None,
+            planning_model: None,
+            research_model: None,
+            large_context_model: None,
+            large_context_threshold: 100_000,
+            simple_model: None,
+            fallback_model: None,
+            fallback_provider: None,
+        }
+    }
+}
+
 /// Top-level kernel configuration.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1056,6 +1147,9 @@ pub struct KernelConfig {
     /// OAuth client ID overrides for PKCE flows.
     #[serde(default)]
     pub oauth: OAuthConfig,
+    /// Smart routing configuration — category-aware model selection.
+    #[serde(default)]
+    pub routing: SmartRoutingConfig,
     /// Name of the primary agent that gets elevated filesystem access.
     /// When an agent's name matches this, `system_allowed_paths` are merged
     /// into its exec_policy.allowed_paths at spawn time.
@@ -1232,6 +1326,7 @@ impl Default for KernelConfig {
             budget: BudgetConfig::default(),
             provider_urls: HashMap::new(),
             oauth: OAuthConfig::default(),
+            routing: SmartRoutingConfig::default(),
             primary_agent_name: None,
             system_allowed_paths: Vec::new(),
         }

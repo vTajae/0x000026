@@ -197,6 +197,23 @@ pub trait KernelHandle: Send + Sync {
         None
     }
 
+    /// Read recent messages from a channel adapter.
+    ///
+    /// `channel`: adapter name (e.g., "discord").
+    /// `channel_id`: platform-specific channel identifier.
+    /// `limit`: max messages to return (1-100).
+    /// `before`: optional message ID for pagination.
+    async fn read_channel_messages(
+        &self,
+        channel: &str,
+        channel_id: &str,
+        limit: u32,
+        before: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let _ = (channel, channel_id, limit, before);
+        Err("Channel read not available".to_string())
+    }
+
     /// Send a message to a user on a named channel adapter (e.g., "email", "telegram").
     /// Returns a confirmation string on success.
     async fn send_channel_message(

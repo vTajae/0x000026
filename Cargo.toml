@@ -137,3 +137,13 @@ lto = true
 codegen-units = 1
 strip = true
 opt-level = 3
+
+# Fast development profile: `cargo build --profile dev-test -p openfang-cli`
+# ~1-2 min vs ~13 min for full release. Good enough for live daemon testing.
+[profile.dev-test]
+inherits = "release"
+lto = "thin"           # thin LTO instead of full — 5x faster link
+codegen-units = 16     # parallel codegen
+opt-level = 2          # -O2 instead of -O3
+strip = false          # keep symbols for debugging
+debug = 1              # line-number debug info (no full DWARF)

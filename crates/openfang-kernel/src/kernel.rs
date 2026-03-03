@@ -64,6 +64,8 @@ pub struct OpenFangKernel {
     pub audit_log: Arc<AuditLog>,
     /// Cost metering engine.
     pub metering: Arc<MeteringEngine>,
+    /// Model performance scoring ledger for smart routing.
+    pub model_ledger: Arc<openfang_runtime::model_scoring::ModelLedger>,
     /// Default LLM driver (from kernel config).
     default_driver: Arc<dyn LlmDriver>,
     /// WASM sandbox engine (shared across all WASM agent executions).
@@ -850,6 +852,7 @@ impl OpenFangKernel {
             background,
             audit_log: Arc::new(AuditLog::new()),
             metering,
+            model_ledger: Arc::new(openfang_runtime::model_scoring::ModelLedger::new()),
             default_driver: driver,
             wasm_sandbox,
             auth,
@@ -1061,6 +1064,18 @@ impl OpenFangKernel {
             }
         }
 
+        // Load persisted model routing ledger from memory KV store
+        {
+            let system_agent = AgentId(uuid::Uuid::nil());
+            if let Ok(Some(data)) = kernel.memory.structured_get(system_agent, "routing::ledger") {
+                kernel.model_ledger.import_observations(&data);
+                let count = kernel.model_ledger.snapshot().len();
+                if count > 0 {
+                    info!(models = count, "Loaded model routing ledger from persistent storage");
+                }
+            }
+        }
+
         info!("OpenFang kernel booted successfully");
         Ok(kernel)
     }
@@ -1263,7 +1278,26 @@ impl OpenFangKernel {
             .get()
             .and_then(|w| w.upgrade())
             .map(|arc| arc as Arc<dyn KernelHandle>);
-        self.send_message_with_handle(agent_id, message, handle)
+        self.send_message_with_handle_and_channel(agent_id, message, handle, None)
+            .await
+    }
+
+    /// Send a message with channel type context for prompt awareness.
+    ///
+    /// The `channel_type` is threaded through to the prompt builder so the agent
+    /// knows which platform it's responding on (e.g., "discord", "telegram").
+    pub async fn send_message_with_channel(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        channel_type: Option<String>,
+    ) -> KernelResult<AgentLoopResult> {
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+        self.send_message_with_handle_and_channel(agent_id, message, handle, channel_type)
             .await
     }
 
@@ -1273,6 +1307,18 @@ impl OpenFangKernel {
         agent_id: AgentId,
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
+    ) -> KernelResult<AgentLoopResult> {
+        self.send_message_with_handle_and_channel(agent_id, message, kernel_handle, None)
+            .await
+    }
+
+    /// Core message send with optional kernel handle and channel type.
+    async fn send_message_with_handle_and_channel(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        channel_type: Option<String>,
     ) -> KernelResult<AgentLoopResult> {
         // Enforce quota before running the agent loop
         self.scheduler
@@ -1291,7 +1337,7 @@ impl OpenFangKernel {
             self.execute_python_agent(&entry, agent_id, message).await
         } else {
             // Default: LLM agent loop (builtin:chat or any unrecognized module)
-            self.execute_llm_agent(&entry, agent_id, message, kernel_handle)
+            self.execute_llm_agent(&entry, agent_id, message, kernel_handle, channel_type)
                 .await
         };
 
@@ -1902,6 +1948,7 @@ impl OpenFangKernel {
         agent_id: AgentId,
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
+        channel_type: Option<String>,
     ) -> KernelResult<AgentLoopResult> {
         // Check metering quota before starting
         self.metering
@@ -2010,7 +2057,7 @@ impl OpenFangKernel {
                     .ok()
                     .and_then(|(s, _)| s),
                 user_name,
-                channel_type: None,
+                channel_type,
                 is_subagent: manifest
                     .metadata
                     .get("is_subagent")
@@ -2060,6 +2107,17 @@ impl OpenFangKernel {
 
         let is_stable = self.config.mode == openfang_types::config::KernelMode::Stable;
 
+        // Build a probe request for routing decisions
+        let probe = CompletionRequest {
+            model: strip_provider_prefix(&manifest.model.model, &manifest.model.provider),
+            messages: vec![openfang_types::message::Message::user(message)],
+            tools: tools.clone(),
+            max_tokens: manifest.model.max_tokens,
+            temperature: manifest.model.temperature,
+            system: Some(manifest.model.system_prompt.clone()),
+            thinking: None,
+        };
+
         if is_stable {
             // In Stable mode: use pinned_model if set, otherwise default model
             if let Some(ref pinned) = manifest.pinned_model {
@@ -2070,20 +2128,34 @@ impl OpenFangKernel {
                 );
                 manifest.model.model = pinned.clone();
             }
+        } else if self.config.routing.auto_route {
+            // Smart auto-routing: category-aware model selection
+            let category = openfang_runtime::task_classifier::classify(&probe);
+            let complexity_router = manifest.routing.as_ref().map(|rc| {
+                let mut r = ModelRouter::new(rc.clone());
+                r.resolve_aliases(&self.model_catalog.read().unwrap_or_else(|e| e.into_inner()));
+                r
+            });
+            let result = openfang_runtime::routing::select_model_smart(
+                &probe,
+                category,
+                &self.config.routing,
+                &self.model_ledger,
+                complexity_router.as_ref(),
+            );
+            info!(
+                agent = %manifest.name,
+                category = %result.category,
+                complexity = %result.complexity,
+                routed_model = %result.model,
+                reason = %result.reason,
+                "Smart routing applied"
+            );
+            manifest.model.model = result.model;
         } else if let Some(ref routing_config) = manifest.routing {
+            // Legacy complexity-only routing
             let mut router = ModelRouter::new(routing_config.clone());
-            // Resolve aliases (e.g. "sonnet" -> "claude-sonnet-4-20250514") before scoring
             router.resolve_aliases(&self.model_catalog.read().unwrap_or_else(|e| e.into_inner()));
-            // Build a probe request to score complexity
-            let probe = CompletionRequest {
-                model: strip_provider_prefix(&manifest.model.model, &manifest.model.provider),
-                messages: vec![openfang_types::message::Message::user(message)],
-                tools: tools.clone(),
-                max_tokens: manifest.model.max_tokens,
-                temperature: manifest.model.temperature,
-                system: Some(manifest.model.system_prompt.clone()),
-                thinking: None,
-            };
             let (complexity, routed_model) = router.select_model(&probe);
             info!(
                 agent = %manifest.name,
@@ -2119,13 +2191,18 @@ impl OpenFangKernel {
             }
         }
 
+        // Sanitize user input: strip prompt injection markers before they enter
+        // conversation history or reach the LLM.
+        let sanitized_message =
+            openfang_runtime::session_repair::sanitize_user_input(message);
+
         // Build link context from user message (auto-extract URLs for the agent)
         let message_with_links = if let Some(link_ctx) =
-            openfang_runtime::link_understanding::build_link_context(message, &self.config.links)
+            openfang_runtime::link_understanding::build_link_context(&sanitized_message, &self.config.links)
         {
-            format!("{message}{link_ctx}")
+            format!("{sanitized_message}{link_ctx}")
         } else {
-            message.to_string()
+            sanitized_message
         };
 
         let result = run_agent_loop(
@@ -2258,6 +2335,18 @@ impl OpenFangKernel {
         self.registry
             .update_session_id(agent_id, new_session.id)
             .map_err(KernelError::OpenFang)?;
+
+        // Clean up stale CLI temp directories on session reset
+        let cleanup = openfang_runtime::cli_temp_cleanup::cleanup_all();
+        if cleanup.dirs_removed > 0 || cleanup.files_removed > 0 {
+            info!(
+                agent_id = %agent_id,
+                dirs = cleanup.dirs_removed,
+                files = cleanup.files_removed,
+                bytes_freed = cleanup.bytes_freed,
+                "CLI temp cleanup on session reset"
+            );
+        }
 
         info!(agent_id = %agent_id, "Session reset (summary saved to memory)");
         Ok(())
@@ -3648,6 +3737,62 @@ impl OpenFangKernel {
                 });
                 info!("Memory consolidation scheduled every {interval_hours} hour(s)");
             }
+        }
+
+        // Periodic model routing ledger flush (every 5 minutes → memory KV store)
+        {
+            let kernel = Arc::clone(self);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+                interval.tick().await; // Skip first immediate tick
+                let system_agent = AgentId(uuid::Uuid::nil());
+                loop {
+                    interval.tick().await;
+                    if kernel.supervisor.is_shutting_down() {
+                        // Final flush on shutdown
+                        let data = kernel.model_ledger.export_observations();
+                        let _ = kernel.memory.structured_get(system_agent, "routing::ledger")
+                            .ok(); // just to ensure store is alive
+                        if let Err(e) = kernel.memory.structured_set(system_agent, "routing::ledger", data) {
+                            warn!("Failed to flush model ledger on shutdown: {e}");
+                        }
+                        break;
+                    }
+                    let data = kernel.model_ledger.export_observations();
+                    match kernel.memory.structured_set(system_agent, "routing::ledger", data) {
+                        Ok(()) => {
+                            debug!("Model routing ledger flushed to persistent storage");
+                        }
+                        Err(e) => {
+                            warn!("Failed to flush model ledger: {e}");
+                        }
+                    }
+                }
+            });
+        }
+
+        // Periodic CLI temp directory cleanup (every 24 hours, removes dirs older than 7 days)
+        {
+            let kernel = Arc::clone(self);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+                interval.tick().await; // Skip first immediate tick
+                loop {
+                    interval.tick().await;
+                    if kernel.supervisor.is_shutting_down() {
+                        break;
+                    }
+                    let report = openfang_runtime::cli_temp_cleanup::cleanup_stale(7);
+                    if report.dirs_removed > 0 || report.files_removed > 0 {
+                        info!(
+                            dirs = report.dirs_removed,
+                            files = report.files_removed,
+                            bytes_freed = report.bytes_freed,
+                            "CLI temp cleanup completed"
+                        );
+                    }
+                }
+            });
         }
 
         // Connect to configured + extension MCP servers
@@ -5075,7 +5220,7 @@ impl KernelHandle for OpenFangKernel {
 
         // Execute with the fresh session
         let result = self
-            .execute_llm_agent(&delegate_entry, id, &message, handle)
+            .execute_llm_agent(&delegate_entry, id, &message, handle, None)
             .await
             .map_err(|e| format!("Delegate failed: {e}"))?;
 
@@ -5472,6 +5617,35 @@ impl KernelHandle for OpenFangKernel {
             .map(|(url, _)| url.clone())
     }
 
+    async fn read_channel_messages(
+        &self,
+        channel: &str,
+        channel_id: &str,
+        limit: u32,
+        before: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let adapter = self
+            .channel_adapters
+            .get(channel)
+            .ok_or_else(|| {
+                let available: Vec<String> = self
+                    .channel_adapters
+                    .iter()
+                    .map(|e| e.key().clone())
+                    .collect();
+                format!(
+                    "Channel '{}' not found. Available channels: {:?}",
+                    channel, available
+                )
+            })?
+            .clone();
+
+        adapter
+            .read_messages(channel_id, limit, before)
+            .await
+            .map_err(|e| format!("Channel read failed: {e}"))
+    }
+
     async fn send_channel_message(
         &self,
         channel: &str,
@@ -5612,6 +5786,14 @@ impl KernelHandle for OpenFangKernel {
                 "User profile synced to agent workspaces"
             );
         }
+    }
+
+    fn record_model_observation(
+        &self,
+        model_id: &str,
+        observation: openfang_runtime::model_scoring::ModelObservation,
+    ) {
+        self.model_ledger.record(model_id, observation);
     }
 }
 

@@ -97,6 +97,27 @@ impl ModelLedger {
             .collect()
     }
 
+    /// Export all observations as a JSON-serializable snapshot for persistence.
+    pub fn export_observations(&self) -> serde_json::Value {
+        let map: std::collections::HashMap<String, Vec<ModelObservation>> = self
+            .observations
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        serde_json::to_value(map).unwrap_or_default()
+    }
+
+    /// Import observations from a persisted JSON snapshot, recomputing scores.
+    pub fn import_observations(&self, data: &serde_json::Value) {
+        if let Ok(map) = serde_json::from_value::<std::collections::HashMap<String, Vec<ModelObservation>>>(data.clone()) {
+            for (model_id, obs) in map {
+                let score = Self::compute_score(&obs);
+                self.observations.insert(model_id.clone(), obs);
+                self.scores.insert(model_id, score);
+            }
+        }
+    }
+
     /// Rank models for a given task category, returning model IDs in preference order.
     pub fn rank_for_task(&self, category: &str) -> Vec<(String, f64)> {
         let mut ranked: Vec<(String, f64)> = self

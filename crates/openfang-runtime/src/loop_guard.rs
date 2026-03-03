@@ -51,6 +51,8 @@ pub struct LoopGuardConfig {
     pub ping_pong_min_repeats: u32,
     /// Max warnings per unique tool call hash before upgrading to Block.
     pub max_warnings_per_call: u32,
+    /// When true, detected quality issues trigger retry instead of passthrough.
+    pub ruthless_mode: bool,
 }
 
 impl Default for LoopGuardConfig {
@@ -64,6 +66,7 @@ impl Default for LoopGuardConfig {
             outcome_block_threshold: 3,
             ping_pong_min_repeats: 3,
             max_warnings_per_call: 3,
+            ruthless_mode: false,
         }
     }
 }

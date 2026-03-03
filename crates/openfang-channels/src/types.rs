@@ -252,6 +252,21 @@ pub trait ChannelAdapter: Send + Sync {
         ChannelStatus::default()
     }
 
+    /// Read recent messages from a channel.
+    ///
+    /// Returns a JSON array of message objects. Default: not supported.
+    /// `channel_id`: platform-specific channel identifier.
+    /// `limit`: max messages to return (1-100).
+    /// `before`: optional message ID to fetch messages before (for pagination).
+    async fn read_messages(
+        &self,
+        _channel_id: &str,
+        _limit: u32,
+        _before: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        Err("read_messages not supported by this adapter".into())
+    }
+
     /// Send a response as a thread reply (optional — default falls back to `send()`).
     async fn send_in_thread(
         &self,
@@ -260,6 +275,29 @@ pub trait ChannelAdapter: Send + Sync {
         _thread_id: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.send(user, content).await
+    }
+
+    /// Edit a deferred interaction response (for Discord slash commands).
+    ///
+    /// After a slash command is ACK'd with a deferred response, this method edits
+    /// the original placeholder message with the actual content.
+    /// Default: not supported (returns error).
+    async fn edit_interaction_response(
+        &self,
+        _app_id: &str,
+        _interaction_token: &str,
+        _content: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Err("Interaction responses not supported by this adapter".into())
+    }
+
+    /// Clear all messages from a channel (used by /new to reset visual state).
+    /// Default: no-op for adapters that don't support it.
+    async fn clear_channel_messages(
+        &self,
+        _channel_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
     }
 }
 

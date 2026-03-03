@@ -25,6 +25,20 @@ pub trait ChannelBridgeHandle: Send + Sync {
     /// Send a message to an agent and get the text response.
     async fn send_message(&self, agent_id: AgentId, message: &str) -> Result<String, String>;
 
+    /// Send a message to an agent with channel type context for prompt awareness.
+    ///
+    /// The `channel_type` (e.g., "discord", "telegram") is threaded through to the
+    /// prompt builder so the agent knows which platform it's responding on.
+    async fn send_message_with_channel(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        _channel_type: Option<&str>,
+    ) -> Result<String, String> {
+        // Default: ignore channel_type, delegate to send_message
+        self.send_message(agent_id, message).await
+    }
+
     /// Find an agent by name, returning its ID.
     async fn find_agent_by_name(&self, name: &str) -> Result<Option<AgentId>, String>;
 
@@ -108,6 +122,22 @@ pub trait ChannelBridgeHandle: Send + Sync {
     /// Returns `None` if the channel is not configured or has no overrides.
     async fn channel_overrides(&self, _channel_type: &str) -> Option<ChannelOverrides> {
         None
+    }
+
+    /// Ingest a read-only channel message into agent structured memory.
+    ///
+    /// Stores messages in a capped ring buffer keyed by `channel_context.{source}`.
+    /// The agent can then reference this context via `memory_recall`.
+    async fn ingest_readonly_context(
+        &self,
+        _agent_id: AgentId,
+        _channel_source: &str,
+        _author: &str,
+        _content: &str,
+        _timestamp: &str,
+        _max_entries: usize,
+    ) {
+        // Default: no-op (read-only messages are dropped)
     }
 
     /// Record a delivery result for tracking (optional — default no-op).
@@ -286,7 +316,7 @@ impl BridgeManager {
                                     &message,
                                     &handle,
                                     &router,
-                                    adapter_clone.as_ref(),
+                                    &adapter_clone,
                                     &rate_limiter,
                                 ).await;
                             }
@@ -359,6 +389,44 @@ async fn send_response(
     }
 }
 
+/// Send a response, checking if the original message was a Discord interaction.
+///
+/// If the message metadata contains `interaction_token` and `app_id`, the response
+/// is sent as a Discord interaction follow-up (editing the deferred "thinking" message).
+/// Otherwise, falls back to the standard `send_response` path.
+async fn send_response_with_interaction(
+    adapter: &dyn ChannelAdapter,
+    message: &ChannelMessage,
+    text: String,
+    thread_id: Option<&str>,
+    output_format: OutputFormat,
+) {
+    let interaction_token = message
+        .metadata
+        .get("interaction_token")
+        .and_then(|v| v.as_str());
+    let app_id = message.metadata.get("app_id").and_then(|v| v.as_str());
+
+    if let (Some(token), Some(aid)) = (interaction_token, app_id) {
+        if !token.is_empty() && !aid.is_empty() {
+            let formatted = formatter::format_for_channel(&text, output_format);
+            let edit_ok = adapter
+                .edit_interaction_response(aid, token, &formatted)
+                .await
+                .map_err(|e| {
+                    warn!("Failed to edit interaction response, falling back to channel message: {e}");
+                })
+                .is_ok();
+            if !edit_ok {
+                send_response(adapter, &message.sender, text, thread_id, output_format).await;
+            }
+            return;
+        }
+    }
+
+    send_response(adapter, &message.sender, text, thread_id, output_format).await;
+}
+
 /// Dispatch a single incoming message — handles bot commands or routes to an agent.
 ///
 /// Applies per-channel policies (DM/group filtering, rate limiting, formatting, threading).
@@ -366,9 +434,12 @@ async fn dispatch_message(
     message: &ChannelMessage,
     handle: &Arc<dyn ChannelBridgeHandle>,
     router: &Arc<AgentRouter>,
-    adapter: &dyn ChannelAdapter,
+    adapter: &Arc<dyn ChannelAdapter>,
     rate_limiter: &ChannelRateLimiter,
 ) {
+    // Keep Arc reference for spawning, shadow with &dyn for existing call sites
+    let adapter_arc = adapter;
+    let adapter: &dyn ChannelAdapter = adapter_arc.as_ref();
     let ct_str = channel_type_str(&message.channel);
 
     // Fetch per-channel overrides (if configured)
@@ -434,17 +505,62 @@ async fn dispatch_message(
         }
     }
 
-    // Suppress responses for read-only channels (message is logged but no reply sent)
+    // Read-only channels: ingest into agent memory ring buffer, no reply sent
     if message.metadata.get("read_only").and_then(|v| v.as_bool()) == Some(true) {
-        debug!("Skipping response for read-only channel message");
+        let max_entries = overrides
+            .as_ref()
+            .map(|o| o.read_only_context_size)
+            .unwrap_or(50);
+
+        if max_entries > 0 {
+            // Resolve agent so we know which agent's memory to write to
+            let agent_id = router.resolve(
+                &message.channel,
+                &message.sender.platform_id,
+                message.sender.openfang_user.as_deref(),
+            );
+            if let Some(aid) = agent_id {
+                let author = message
+                    .metadata
+                    .get("author_username")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&message.sender.display_name);
+                let content = match &message.content {
+                    ChannelContent::Text(t) => t.as_str(),
+                    _ => "",
+                };
+                let timestamp = message.timestamp.to_rfc3339();
+                let source = format!("{}:{}", ct_str, message.sender.platform_id);
+
+                handle
+                    .ingest_readonly_context(aid, &source, author, content, &timestamp, max_entries)
+                    .await;
+                debug!("Ingested read-only message into agent {aid} memory (source={source})");
+            }
+        } else {
+            debug!("Skipping read-only message (read_only_context_size=0)");
+        }
         return;
     }
 
     let text = match &message.content {
         ChannelContent::Text(t) => t.clone(),
         ChannelContent::Command { name, args } => {
-            let result = handle_command(name, args, handle, router, &message.sender).await;
-            send_response(adapter, &message.sender, result, thread_id, output_format).await;
+            let result = handle_command(name, args, handle, router, &message.sender, &message.channel).await;
+            // Fire-and-forget channel clearing for /new
+            if name == "new" {
+                let ch_id = message.metadata.get("channel_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&message.sender.platform_id)
+                    .to_string();
+                let a = Arc::clone(adapter_arc);
+                tokio::spawn(async move {
+                    if let Err(e) = a.clear_channel_messages(&ch_id).await {
+                        tracing::warn!("Failed to clear channel messages: {e}");
+                    }
+                });
+            }
+            send_response_with_interaction(adapter, message, result, thread_id, output_format).await;
             return;
         }
         _ => {
@@ -500,8 +616,21 @@ async fn dispatch_message(
                 | "peers"
                 | "a2a"
         ) {
-            let result = handle_command(cmd, &args, handle, router, &message.sender).await;
-            send_response(adapter, &message.sender, result, thread_id, output_format).await;
+            let result = handle_command(cmd, &args, handle, router, &message.sender, &message.channel).await;
+            // Fire-and-forget channel clearing for /new
+            if cmd == "new" {
+                let ch_id = message.metadata.get("channel_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&message.sender.platform_id)
+                    .to_string();
+                let a = Arc::clone(adapter_arc);
+                tokio::spawn(async move {
+                    if let Err(e) = a.clear_channel_messages(&ch_id).await {
+                        tracing::warn!("Failed to clear channel messages: {e}");
+                    }
+                });
+            }
+            send_response_with_interaction(adapter, message, result, thread_id, output_format).await;
             return;
         }
         // Other slash commands pass through to the agent
@@ -538,10 +667,11 @@ async fn dispatch_message(
                         if let Some(aid) = maybe_id {
                             let h = handle.clone();
                             let t = text.clone();
+                            let ct = ct_str.to_string();
                             let aid = *aid;
                             let name = name.clone();
                             handles_vec.push(tokio::spawn(async move {
-                                let result = h.send_message(aid, &t).await;
+                                let result = h.send_message_with_channel(aid, &t, Some(&ct)).await;
                                 (name, aid, result)
                             }));
                         }
@@ -558,7 +688,7 @@ async fn dispatch_message(
                 openfang_types::config::BroadcastStrategy::Sequential => {
                     for (name, maybe_id) in &targets {
                         if let Some(aid) = maybe_id {
-                            match handle.send_message(*aid, &text).await {
+                            match handle.send_message_with_channel(*aid, &text, Some(ct_str)).await {
                                 Ok(r) => responses.push(format!("[{name}]: {r}")),
                                 Err(e) => responses.push(format!("[{name}]: Error: {e}")),
                             }
@@ -568,7 +698,7 @@ async fn dispatch_message(
             }
 
             let combined = responses.join("\n\n");
-            send_response(adapter, &message.sender, combined, thread_id, output_format).await;
+            send_response_with_interaction(adapter, message, combined, thread_id, output_format).await;
             return;
         }
     }
@@ -583,9 +713,9 @@ async fn dispatch_message(
     let agent_id = match agent_id {
         Some(id) => id,
         None => {
-            send_response(
+            send_response_with_interaction(
                 adapter,
-                &message.sender,
+                message,
                 "No agent assigned. Use /agents to list available agents, then /agent <name> to select one.".to_string(),
                 thread_id,
                 output_format,
@@ -626,7 +756,7 @@ async fn dispatch_message(
     // Send to agent and relay response.
     // On "not found" errors, attempt to re-resolve the agent by name and retry once.
     let mut target_id = agent_id;
-    let result = handle.send_message(target_id, &text).await;
+    let result = handle.send_message_with_channel(target_id, &text, Some(ct_str)).await;
 
     let result = match &result {
         Err(e) if e.to_lowercase().contains("not found") => {
@@ -637,7 +767,7 @@ async fn dispatch_message(
                     Ok(Some(new_id)) => {
                         router.update_default(new_id);
                         target_id = new_id;
-                        handle.send_message(new_id, &text).await
+                        handle.send_message_with_channel(new_id, &text, Some(ct_str)).await
                     }
                     _ => result, // re-resolution failed, use original error
                 }
@@ -650,7 +780,7 @@ async fn dispatch_message(
 
     match result {
         Ok(response) => {
-            send_response(adapter, &message.sender, response, thread_id, output_format).await;
+            send_response_with_interaction(adapter, message, response, thread_id, output_format).await;
             handle
                 .record_delivery(target_id, ct_str, &message.sender.platform_id, true, None)
                 .await;
@@ -658,9 +788,9 @@ async fn dispatch_message(
         Err(e) => {
             warn!("Agent error for {target_id}: {e}");
             let err_msg = format!("Agent error: {e}");
-            send_response(
+            send_response_with_interaction(
                 adapter,
-                &message.sender,
+                message,
                 err_msg.clone(),
                 thread_id,
                 output_format,
@@ -686,6 +816,7 @@ async fn handle_command(
     handle: &Arc<dyn ChannelBridgeHandle>,
     router: &Arc<AgentRouter>,
     sender: &ChannelUser,
+    channel: &crate::types::ChannelType,
 ) -> String {
     match name {
         "start" => {
@@ -784,7 +915,7 @@ async fn handle_command(
         "new" => {
             // Need to resolve the user's current agent
             let agent_id = router.resolve(
-                &crate::types::ChannelType::CLI,
+                channel,
                 &sender.platform_id,
                 sender.openfang_user.as_deref(),
             );
@@ -798,7 +929,7 @@ async fn handle_command(
         }
         "compact" => {
             let agent_id = router.resolve(
-                &crate::types::ChannelType::CLI,
+                channel,
                 &sender.platform_id,
                 sender.openfang_user.as_deref(),
             );
@@ -812,7 +943,7 @@ async fn handle_command(
         }
         "model" => {
             let agent_id = router.resolve(
-                &crate::types::ChannelType::CLI,
+                channel,
                 &sender.platform_id,
                 sender.openfang_user.as_deref(),
             );
@@ -836,7 +967,7 @@ async fn handle_command(
         }
         "stop" => {
             let agent_id = router.resolve(
-                &crate::types::ChannelType::CLI,
+                channel,
                 &sender.platform_id,
                 sender.openfang_user.as_deref(),
             );
@@ -850,7 +981,7 @@ async fn handle_command(
         }
         "usage" => {
             let agent_id = router.resolve(
-                &crate::types::ChannelType::CLI,
+                channel,
                 &sender.platform_id,
                 sender.openfang_user.as_deref(),
             );
@@ -864,7 +995,7 @@ async fn handle_command(
         }
         "think" => {
             let agent_id = router.resolve(
-                &crate::types::ChannelType::CLI,
+                channel,
                 &sender.platform_id,
                 sender.openfang_user.as_deref(),
             );
@@ -1031,10 +1162,11 @@ mod tests {
             openfang_user: None,
         };
 
-        let result = handle_command("agents", &[], &handle, &router, &sender).await;
+        let ch = ChannelType::CLI;
+        let result = handle_command("agents", &[], &handle, &router, &sender, &ch).await;
         assert!(result.contains("coder"));
 
-        let result = handle_command("help", &[], &handle, &router, &sender).await;
+        let result = handle_command("help", &[], &handle, &router, &sender, &ch).await;
         assert!(result.contains("/agents"));
     }
 
@@ -1052,8 +1184,9 @@ mod tests {
         };
 
         // Select existing agent
+        let ch = ChannelType::CLI;
         let result =
-            handle_command("agent", &["coder".to_string()], &handle, &router, &sender).await;
+            handle_command("agent", &["coder".to_string()], &handle, &router, &sender, &ch).await;
         assert!(result.contains("Now talking to agent: coder"));
 
         // Verify router was updated

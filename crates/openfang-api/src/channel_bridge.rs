@@ -73,6 +73,20 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         Ok(result.response)
     }
 
+    async fn send_message_with_channel(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        channel_type: Option<&str>,
+    ) -> Result<String, String> {
+        let result = self
+            .kernel
+            .send_message_with_channel(agent_id, message, channel_type.map(String::from))
+            .await
+            .map_err(|e| format!("{e}"))?;
+        Ok(result.response)
+    }
+
     async fn find_agent_by_name(&self, name: &str) -> Result<Option<AgentId>, String> {
         Ok(self.kernel.registry.find_by_name(name).map(|e| e.id))
     }
@@ -765,6 +779,55 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             .auth
             .authorize(user_id, &auth_action)
             .map_err(|e| e.to_string())
+    }
+
+    async fn ingest_readonly_context(
+        &self,
+        agent_id: AgentId,
+        channel_source: &str,
+        author: &str,
+        content: &str,
+        timestamp: &str,
+        max_entries: usize,
+    ) {
+        let key = format!("channel_context.{channel_source}");
+
+        // Read existing ring buffer
+        let mut entries: Vec<serde_json::Value> = self
+            .kernel
+            .memory
+            .structured_get(agent_id, &key)
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+
+        // Append new entry
+        entries.push(serde_json::json!({
+            "author": author,
+            "content": content,
+            "timestamp": timestamp,
+        }));
+
+        // Trim to max_entries (drop oldest)
+        if entries.len() > max_entries {
+            let drain_count = entries.len() - max_entries;
+            entries.drain(..drain_count);
+        }
+
+        // Write back
+        if let Err(e) = self.kernel.memory.structured_set(
+            agent_id,
+            &key,
+            serde_json::Value::Array(entries),
+        ) {
+            tracing::warn!(
+                agent_id = %agent_id,
+                key = %key,
+                error = %e,
+                "Failed to ingest read-only context"
+            );
+        }
     }
 
     async fn record_delivery(

@@ -298,6 +298,9 @@ pub async fn execute_tool(
         // Channel send tool (proactive outbound messaging)
         "channel_send" => tool_channel_send(input, kernel).await,
 
+        // Discord read messages tool
+        "discord_read_messages" => tool_discord_read_messages(input, kernel).await,
+
         // Persistent process tools
         "process_start" => tool_process_start(input, process_manager, caller_agent_id).await,
         "process_poll" => tool_process_poll(input, process_manager).await,
@@ -940,6 +943,20 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "message": { "type": "string", "description": "The message body to send" }
                 },
                 "required": ["channel", "recipient", "message"]
+            }),
+        },
+        // --- Discord read messages tool ---
+        ToolDefinition {
+            name: "discord_read_messages".to_string(),
+            description: "Read recent messages from a Discord channel. Returns message history with author, content, and timestamp. Requires the bot to have access to the channel.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "channel_id": { "type": "string", "description": "Discord channel ID (numeric snowflake)" },
+                    "limit": { "type": "integer", "description": "Number of messages to fetch (1-100, default 50)" },
+                    "before": { "type": "string", "description": "Fetch messages before this message ID (for pagination)" }
+                },
+                "required": ["channel_id"]
             }),
         },
         // --- Hand tools (curated autonomous capability packages) ---
@@ -2150,6 +2167,58 @@ async fn tool_channel_send(
 }
 
 // ---------------------------------------------------------------------------
+// Discord read messages tool
+// ---------------------------------------------------------------------------
+
+async fn tool_discord_read_messages(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+
+    let channel_id = input["channel_id"]
+        .as_str()
+        .ok_or("Missing 'channel_id' parameter")?
+        .trim();
+
+    if channel_id.is_empty() {
+        return Err("channel_id cannot be empty".to_string());
+    }
+
+    let limit = input["limit"].as_u64().unwrap_or(50) as u32;
+    let before = input["before"].as_str();
+
+    let messages = kh
+        .read_channel_messages("discord", channel_id, limit, before)
+        .await?;
+
+    if messages.is_empty() {
+        return Ok("No messages found in this channel.".to_string());
+    }
+
+    // Format as readable text, capped at 30KB
+    let mut output = String::new();
+    let max_bytes = 30_000;
+
+    for msg in &messages {
+        let timestamp = msg["timestamp"].as_str().unwrap_or("?");
+        let author = msg["author"].as_str().unwrap_or("?");
+        let content = msg["content"].as_str().unwrap_or("");
+        let msg_id = msg["message_id"].as_str().unwrap_or("?");
+
+        let line = format!("[{timestamp}] {author}: {content} (id: {msg_id})\n");
+
+        if output.len() + line.len() > max_bytes {
+            output.push_str("... (truncated)\n");
+            break;
+        }
+        output.push_str(&line);
+    }
+
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
 // Hand tools (delegated to kernel via KernelHandle trait)
 // ---------------------------------------------------------------------------
 
@@ -3059,8 +3128,8 @@ mod tests {
     fn test_builtin_tool_definitions() {
         let tools = builtin_tool_definitions();
         assert!(
-            tools.len() >= 42,
-            "Expected at least 42 tools, got {}",
+            tools.len() >= 43,
+            "Expected at least 43 tools, got {}",
             tools.len()
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -3102,8 +3171,9 @@ mod tests {
         assert!(names.contains(&"cron_create"));
         assert!(names.contains(&"cron_list"));
         assert!(names.contains(&"cron_cancel"));
-        // 1 channel send tool
+        // 1 channel send tool + 1 channel read tool
         assert!(names.contains(&"channel_send"));
+        assert!(names.contains(&"discord_read_messages"));
         // 4 hand tools
         assert!(names.contains(&"hand_list"));
         assert!(names.contains(&"hand_activate"));

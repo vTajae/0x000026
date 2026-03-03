@@ -52,6 +52,9 @@ const MAX_CONTINUATIONS: u32 = 5;
 /// Maximum message history size before auto-trimming to prevent context overflow.
 const MAX_HISTORY_MESSAGES: usize = 20;
 
+/// Maximum quality-gate retries in ruthless mode before accepting degraded output.
+const MAX_QUALITY_RETRIES: u32 = 2;
+
 /// Compute the effective tool timeout for an agent.
 ///
 /// Takes the maximum of the global default (`TOOL_TIMEOUT_SECS`) and the
@@ -328,8 +331,9 @@ pub async fn run_agent_loop(
     }
 
     let mut total_usage = TokenUsage::default();
-    let final_response;
+    let mut final_response;
     let mut tool_error_count: usize = 0;
+    let mut quality_retry_count: u32 = 0;
 
     // Safety valve: trim excessively long message histories to prevent context overflow.
     // The full compaction system handles sophisticated summarization, but this prevents
@@ -360,13 +364,27 @@ pub async fn run_agent_loop(
         }
         cfg
     };
-    let mut loop_guard = LoopGuard::new(loop_guard_config);
+    let mut loop_guard = LoopGuard::new(loop_guard_config.clone());
     let mut consecutive_max_tokens: u32 = 0;
 
     // Build context budget from model's actual context window (or fallback to default)
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+
+    // Classify task category for model scoring ledger
+    let task_category_str = {
+        let probe = crate::llm_driver::CompletionRequest {
+            model: manifest.model.model.clone(),
+            messages: vec![Message::user(user_message)],
+            tools: available_tools.to_vec(),
+            max_tokens: manifest.model.max_tokens,
+            temperature: manifest.model.temperature,
+            system: Some(system_prompt.clone()),
+            thinking: None,
+        };
+        Some(crate::task_classifier::classify(&probe).to_string())
+    };
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Agent loop iteration");
@@ -376,6 +394,9 @@ pub async fn run_agent_loop(
             recover_from_overflow(&mut messages, &system_prompt, available_tools, ctx_window);
         if recovery == RecoveryStage::FinalError {
             warn!("Context overflow unrecoverable — suggest /reset or /compact");
+            return Err(OpenFangError::LlmDriver(
+                "Context overflow unrecoverable after all recovery stages — use /reset or /compact".into(),
+            ));
         }
 
         // Context guard: compact oversized tool results before LLM call
@@ -418,7 +439,7 @@ pub async fn run_agent_loop(
                     success,
                     latency_ms: Some(latency),
                     total_tokens,
-                    task_category: None,
+                    task_category: task_category_str.clone(),
                     error_category: error_cat,
                 },
             );
@@ -649,24 +670,45 @@ pub async fn run_agent_loop(
                 }
 
                 // Reflexion: detect response quality issues and store critiques
-                {
-                    let issues = detect_response_issues(user_message, &final_response, tool_error_count);
-                    if !issues.is_empty() {
-                        let critique = format_critique(&issues);
-                        debug!(agent = %manifest.name, critique = %critique, "Reflexion: storing self-correction");
-                        let mut meta = HashMap::new();
-                        meta.insert("type".to_string(), serde_json::Value::String("self_correction".to_string()));
-                        let _ = memory
-                            .remember(
-                                session.agent_id,
-                                &critique,
-                                MemorySource::System,
-                                "procedural",
-                                meta,
-                            )
-                            .await;
+                let issues = detect_response_issues(user_message, &final_response, tool_error_count);
+                if !issues.is_empty() {
+                    let critique = format_critique(&issues);
+                    debug!(agent = %manifest.name, critique = %critique, "Reflexion: storing self-correction");
+
+                    // Ruthless mode: retry instead of passing bad output through
+                    if loop_guard_config.ruthless_mode && quality_retry_count < MAX_QUALITY_RETRIES {
+                        quality_retry_count += 1;
+                        warn!(
+                            agent = %manifest.name,
+                            retry = quality_retry_count,
+                            "Quality gate: rejecting response, retrying from scratch"
+                        );
+                        // Reset messages to system prompt + original user message + quality nudge
+                        messages.clear();
+                        messages.push(Message::user(user_message));
+                        messages.push(Message::user(format!(
+                            "[System quality note: your previous response was rejected — {}. \
+                             Please provide a complete, direct answer.]",
+                            critique
+                        )));
+                        continue;
                     }
+
+                    let mut meta = HashMap::new();
+                    meta.insert("type".to_string(), serde_json::Value::String("self_correction".to_string()));
+                    let _ = memory
+                        .remember(
+                            session.agent_id,
+                            &critique,
+                            MemorySource::System,
+                            "procedural",
+                            meta,
+                        )
+                        .await;
                 }
+
+                // Redact secrets from the final response before returning
+                let final_response = crate::session_repair::redact_secrets(&final_response);
 
                 info!(
                     agent = %manifest.name,
@@ -1368,13 +1410,27 @@ pub async fn run_agent_loop_streaming(
         }
         cfg
     };
-    let mut loop_guard = LoopGuard::new(loop_guard_config);
+    let mut loop_guard = LoopGuard::new(loop_guard_config.clone());
     let mut consecutive_max_tokens: u32 = 0;
 
     // Build context budget from model's actual context window (or fallback to default)
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+
+    // Classify task category for model scoring ledger (streaming path)
+    let task_category_str = {
+        let probe = crate::llm_driver::CompletionRequest {
+            model: manifest.model.model.clone(),
+            messages: vec![Message::user(user_message)],
+            tools: available_tools.to_vec(),
+            max_tokens: manifest.model.max_tokens,
+            temperature: manifest.model.temperature,
+            system: Some(system_prompt.clone()),
+            thinking: None,
+        };
+        Some(crate::task_classifier::classify(&probe).to_string())
+    };
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Streaming agent loop iteration");
@@ -1449,7 +1505,7 @@ pub async fn run_agent_loop_streaming(
                     success,
                     latency_ms: Some(latency),
                     total_tokens,
-                    task_category: None,
+                    task_category: task_category_str.clone(),
                     error_category: error_cat,
                 },
             );

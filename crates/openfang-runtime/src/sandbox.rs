@@ -65,6 +65,8 @@ pub struct GuestState {
     pub agent_id: String,
     /// Tokio runtime handle for async operations in sync host functions.
     pub tokio_handle: tokio::runtime::Handle,
+    /// Resource limiter for WASM linear memory and table growth.
+    pub limiter: StoreLimits,
 }
 
 /// Result of executing a WASM module.
@@ -156,6 +158,12 @@ impl WasmSandbox {
         let module = Module::new(engine, wasm_bytes)
             .map_err(|e| SandboxError::Compilation(e.to_string()))?;
 
+        // Build resource limiter from config
+        let limiter = StoreLimitsBuilder::new()
+            .memory_size(config.max_memory_bytes)
+            .trap_on_grow_failure(true)
+            .build();
+
         // Create store with guest state
         let mut store = Store::new(
             engine,
@@ -164,8 +172,12 @@ impl WasmSandbox {
                 kernel,
                 agent_id: agent_id.to_string(),
                 tokio_handle,
+                limiter,
             },
         );
+
+        // Enforce memory limits via the resource limiter
+        store.limiter(|state| &mut state.limiter);
 
         // Set fuel budget (deterministic metering)
         if config.fuel_limit > 0 {
