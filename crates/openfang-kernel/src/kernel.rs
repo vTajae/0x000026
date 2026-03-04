@@ -20,7 +20,9 @@ use openfang_runtime::agent_loop::{
 use openfang_runtime::audit::AuditLog;
 use openfang_runtime::drivers;
 use openfang_runtime::kernel_handle::{self, KernelHandle};
-use openfang_runtime::llm_driver::{CompletionRequest, DriverConfig, LlmDriver, StreamEvent};
+use openfang_runtime::llm_driver::{
+    CompletionRequest, CompletionResponse, DriverConfig, LlmDriver, LlmError, StreamEvent,
+};
 use openfang_runtime::python_runtime::{self, PythonConfig};
 use openfang_runtime::routing::ModelRouter;
 use openfang_runtime::sandbox::{SandboxConfig, WasmSandbox};
@@ -39,6 +41,22 @@ use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, info, warn};
 
 /// The main OpenFang kernel — coordinates all subsystems.
+/// Stub LLM driver used when no providers are configured.
+/// Returns a helpful error so the dashboard still boots and users can configure providers.
+struct StubDriver;
+
+#[async_trait]
+impl LlmDriver for StubDriver {
+    async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+        Err(LlmError::MissingApiKey(
+            "No LLM provider configured. Set an API key (e.g. GROQ_API_KEY) and restart, \
+             configure a provider via the dashboard, \
+             or use Ollama for local models (no API key needed)."
+                .to_string(),
+        ))
+    }
+}
+
 pub struct OpenFangKernel {
     /// Kernel configuration.
     pub config: KernelConfig,
@@ -131,6 +149,8 @@ pub struct OpenFangKernel {
     pub whatsapp_gateway_pid: Arc<std::sync::Mutex<Option<u32>>>,
     /// Channel adapters registered at bridge startup (for proactive `channel_send` tool).
     pub channel_adapters: dashmap::DashMap<String, Arc<dyn openfang_channels::types::ChannelAdapter>>,
+    /// Hot-reloadable default model override (set via config hot-reload, read at agent spawn).
+    pub default_model_override: std::sync::RwLock<Option<openfang_types::config::DefaultModelConfig>>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
 }
@@ -530,51 +550,73 @@ impl OpenFangKernel {
         let driver_config = DriverConfig {
             provider: config.default_model.provider.clone(),
             api_key: std::env::var(&config.default_model.api_key_env).ok(),
-            base_url: config.default_model.base_url.clone(),
+            base_url: config
+                .default_model
+                .base_url
+                .clone()
+                .or_else(|| config.provider_urls.get(&config.default_model.provider).cloned()),
         };
-        let primary_driver = drivers::create_driver(&driver_config)
-            .map_err(|e| KernelError::BootFailed(format!("LLM driver init failed: {e}")))?;
+        // Primary driver failure is non-fatal: the dashboard should remain accessible
+        // even if the LLM provider is misconfigured. Users can fix config via dashboard.
+        let primary_result = drivers::create_driver(&driver_config);
+        let mut driver_chain: Vec<Arc<dyn LlmDriver>> = Vec::new();
 
-        // If fallback providers are configured, wrap the primary driver in a FallbackDriver
-        let driver: Arc<dyn LlmDriver> = if !config.fallback_providers.is_empty() {
-            let mut chain: Vec<Arc<dyn LlmDriver>> = vec![primary_driver.clone()];
-            for fb in &config.fallback_providers {
-                let fb_config = DriverConfig {
-                    provider: fb.provider.clone(),
-                    api_key: if fb.api_key_env.is_empty() {
-                        None
-                    } else {
-                        std::env::var(&fb.api_key_env).ok()
-                    },
-                    base_url: fb.base_url.clone(),
-                };
-                match drivers::create_driver(&fb_config) {
-                    Ok(d) => {
-                        info!(
-                            provider = %fb.provider,
-                            model = %fb.model,
-                            "Fallback provider configured"
-                        );
-                        chain.push(d);
-                    }
-                    Err(e) => {
-                        warn!(
-                            provider = %fb.provider,
-                            error = %e,
-                            "Fallback provider init failed — skipped"
-                        );
-                    }
+        match &primary_result {
+            Ok(d) => driver_chain.push(d.clone()),
+            Err(e) => {
+                warn!(
+                    provider = %config.default_model.provider,
+                    error = %e,
+                    "Primary LLM driver init failed — dashboard will still be accessible"
+                );
+            }
+        }
+
+        // Add fallback providers to the chain
+        for fb in &config.fallback_providers {
+            let fb_config = DriverConfig {
+                provider: fb.provider.clone(),
+                api_key: if fb.api_key_env.is_empty() {
+                    None
+                } else {
+                    std::env::var(&fb.api_key_env).ok()
+                },
+                base_url: fb
+                    .base_url
+                    .clone()
+                    .or_else(|| config.provider_urls.get(&fb.provider).cloned()),
+            };
+            match drivers::create_driver(&fb_config) {
+                Ok(d) => {
+                    info!(
+                        provider = %fb.provider,
+                        model = %fb.model,
+                        "Fallback provider configured"
+                    );
+                    driver_chain.push(d);
+                }
+                Err(e) => {
+                    warn!(
+                        provider = %fb.provider,
+                        error = %e,
+                        "Fallback provider init failed — skipped"
+                    );
                 }
             }
-            if chain.len() > 1 {
-                Arc::new(openfang_runtime::drivers::fallback::FallbackDriver::new(
-                    chain,
-                ))
-            } else {
-                primary_driver
-            }
+        }
+
+        // Use the chain, or create a stub driver if everything failed
+        let driver: Arc<dyn LlmDriver> = if driver_chain.len() > 1 {
+            Arc::new(openfang_runtime::drivers::fallback::FallbackDriver::new(
+                driver_chain,
+            ))
+        } else if let Some(single) = driver_chain.into_iter().next() {
+            single
         } else {
-            primary_driver
+            // All drivers failed — use a stub that returns a helpful error.
+            // The kernel boots, dashboard is accessible, users can fix their config.
+            warn!("No LLM drivers available — agents will return errors until a provider is configured");
+            Arc::new(StubDriver) as Arc<dyn LlmDriver>
         };
 
         // Initialize metering engine (shares the same SQLite connection as the memory substrate)
@@ -646,7 +688,7 @@ impl OpenFangKernel {
         }
 
         // Initialize hand registry (curated autonomous packages)
-        let mut hand_registry = openfang_hands::registry::HandRegistry::new();
+        let hand_registry = openfang_hands::registry::HandRegistry::new();
         let hand_count = hand_registry.load_bundled();
         if hand_count > 0 {
             info!("Loaded {hand_count} bundled hand(s)");
@@ -716,7 +758,7 @@ impl OpenFangKernel {
             if let Some(ref provider) = config.memory.embedding_provider {
                 // Explicit config takes priority
                 let api_key_env = config.memory.embedding_api_key_env.as_deref().unwrap_or("");
-                match create_embedding_driver(provider, "text-embedding-3-small", api_key_env, config.memory.embedding_base_url.as_deref()) {
+                match create_embedding_driver(provider, "text-embedding-3-small", api_key_env) {
                     Ok(d) => {
                         info!(provider = %provider, "Embedding driver configured from memory config");
                         Some(Arc::from(d))
@@ -727,7 +769,7 @@ impl OpenFangKernel {
                     }
                 }
             } else if std::env::var("OPENAI_API_KEY").is_ok() {
-                match create_embedding_driver("openai", "text-embedding-3-small", "OPENAI_API_KEY", None)
+                match create_embedding_driver("openai", "text-embedding-3-small", "OPENAI_API_KEY")
                 {
                     Ok(d) => {
                         info!("Embedding driver auto-detected: OpenAI");
@@ -740,7 +782,7 @@ impl OpenFangKernel {
                 }
             } else {
                 // Try Ollama (local, no key needed)
-                match create_embedding_driver("ollama", "nomic-embed-text", "", config.memory.embedding_base_url.as_deref()) {
+                match create_embedding_driver("ollama", "nomic-embed-text", "") {
                     Ok(d) => {
                         info!("Embedding driver auto-detected: Ollama (local)");
                         Some(Arc::from(d))
@@ -883,6 +925,7 @@ impl OpenFangKernel {
             booted_at: std::time::Instant::now(),
             whatsapp_gateway_pid: Arc::new(std::sync::Mutex::new(None)),
             channel_adapters: dashmap::DashMap::new(),
+            default_model_override: std::sync::RwLock::new(None),
             self_handle: OnceLock::new(),
         };
 
@@ -893,6 +936,61 @@ impl OpenFangKernel {
                 for entry in agents {
                     let agent_id = entry.id;
                     let name = entry.name.clone();
+
+                    // Check if TOML on disk is newer/different — if so, update from file
+                    let mut entry = entry;
+                    let toml_path = kernel
+                        .config
+                        .home_dir
+                        .join("agents")
+                        .join(&name)
+                        .join("agent.toml");
+                    if toml_path.exists() {
+                        match std::fs::read_to_string(&toml_path) {
+                            Ok(toml_str) => {
+                                match toml::from_str::<openfang_types::agent::AgentManifest>(
+                                    &toml_str,
+                                ) {
+                                    Ok(disk_manifest) => {
+                                        // Compare key fields to detect changes
+                                        let changed = disk_manifest.name != entry.manifest.name
+                                            || disk_manifest.description != entry.manifest.description
+                                            || disk_manifest.model.system_prompt != entry.manifest.model.system_prompt
+                                            || disk_manifest.model.provider != entry.manifest.model.provider
+                                            || disk_manifest.model.model != entry.manifest.model.model
+                                            || disk_manifest.capabilities.tools != entry.manifest.capabilities.tools;
+                                        if changed {
+                                            info!(
+                                                agent = %name,
+                                                "Agent TOML on disk differs from DB, updating"
+                                            );
+                                            entry.manifest = disk_manifest;
+                                            // Persist the update back to DB
+                                            if let Err(e) = kernel.memory.save_agent(&entry) {
+                                                warn!(
+                                                    agent = %name,
+                                                    "Failed to persist TOML update: {e}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            agent = %name,
+                                            path = %toml_path.display(),
+                                            "Invalid agent TOML on disk, using DB version: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    agent = %name,
+                                    "Failed to read agent TOML: {e}"
+                                );
+                            }
+                        }
+                    }
 
                     // Re-grant capabilities
                     let caps = manifest_to_capabilities(&entry.manifest);
@@ -907,58 +1005,10 @@ impl OpenFangKernel {
                     let mut restored_entry = entry;
                     restored_entry.state = AgentState::Running;
 
-                    // Refresh exec_policy from on-disk agent.toml if it exists.
-                    // The TOML is the source of truth for security policy — the DB
-                    // may have stale allowed_commands / mode from a previous boot.
-                    {
-                        let toml_path = kernel
-                            .config
-                            .home_dir
-                            .join("agents")
-                            .join(&name)
-                            .join("agent.toml");
-                        if toml_path.is_file() {
-                            if let Ok(toml_str) = std::fs::read_to_string(&toml_path) {
-                                if let Ok(disk_manifest) =
-                                    toml::from_str::<AgentManifest>(&toml_str)
-                                {
-                                    if let Some(disk_policy) = disk_manifest.exec_policy {
-                                        info!(
-                                            agent = %name,
-                                            mode = ?disk_policy.mode,
-                                            commands = disk_policy.allowed_commands.len(),
-                                            "Refreshed exec_policy from on-disk TOML"
-                                        );
-                                        restored_entry.manifest.exec_policy =
-                                            Some(disk_policy);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
                     // Inherit kernel exec_policy for agents that lack one
                     if restored_entry.manifest.exec_policy.is_none() {
                         restored_entry.manifest.exec_policy =
                             Some(kernel.config.exec_policy.clone());
-                    }
-
-                    // Primary agent elevation on restore (same as spawn path)
-                    if let Some(ref primary_name) = kernel.config.primary_agent_name {
-                        if name == *primary_name {
-                            if let Some(ref mut policy) = restored_entry.manifest.exec_policy {
-                                let mut paths = kernel.config.system_allowed_paths.clone();
-                                if paths.is_empty() {
-                                    paths.push(kernel.config.home_dir.clone());
-                                }
-                                for p in paths {
-                                    if !policy.allowed_paths.contains(&p) {
-                                        policy.allowed_paths.push(p);
-                                    }
-                                }
-                                info!(agent = %name, allowed_paths = ?policy.allowed_paths, "Primary agent: elevated filesystem access (restore)");
-                            }
-                        }
                     }
 
                     // Apply global budget defaults to restored agents
@@ -968,18 +1018,25 @@ impl OpenFangKernel {
                     );
 
                     // Apply default_model to restored agents (same logic as spawn)
-                    if restored_entry.manifest.model.api_key_env.is_none()
-                        && restored_entry.manifest.model.base_url.is_none()
                     {
-                        let dm = &kernel.config.default_model;
-                        if !dm.provider.is_empty() {
-                            restored_entry.manifest.model.provider = dm.provider.clone();
-                        }
-                        if !dm.model.is_empty() {
-                            restored_entry.manifest.model.model = dm.model.clone();
-                        }
-                        if dm.base_url.is_some() {
-                            restored_entry.manifest.model.base_url = dm.base_url.clone();
+                        let is_default_provider = restored_entry.manifest.model.provider.is_empty()
+                            || restored_entry.manifest.model.provider == "default";
+                        let is_default_model = restored_entry.manifest.model.model.is_empty()
+                            || restored_entry.manifest.model.model == "default";
+                        if is_default_provider && is_default_model {
+                            let dm = &kernel.config.default_model;
+                            if !dm.provider.is_empty() {
+                                restored_entry.manifest.model.provider = dm.provider.clone();
+                            }
+                            if !dm.model.is_empty() {
+                                restored_entry.manifest.model.model = dm.model.clone();
+                            }
+                            if !dm.api_key_env.is_empty() && restored_entry.manifest.model.api_key_env.is_none() {
+                                restored_entry.manifest.model.api_key_env = Some(dm.api_key_env.clone());
+                            }
+                            if dm.base_url.is_some() && restored_entry.manifest.model.base_url.is_none() {
+                                restored_entry.manifest.model.base_url.clone_from(&dm.base_url);
+                            }
                         }
                     }
 
@@ -998,51 +1055,30 @@ impl OpenFangKernel {
             }
         }
 
-        // Auto-provision agents from TOML templates that aren't already in the registry.
-        // Scans ~/.openfang/agents/*/agent.toml for agent definitions.
-        {
-            let agents_dir = kernel.config.home_dir.join("agents");
-            if agents_dir.is_dir() {
-                let mut provisioned = 0u32;
-                if let Ok(entries) = std::fs::read_dir(&agents_dir) {
-                    for dir_entry in entries.flatten() {
-                        let toml_path = dir_entry.path().join("agent.toml");
-                        if !toml_path.is_file() {
-                            continue;
-                        }
-                        let toml_str = match std::fs::read_to_string(&toml_path) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                debug!("Skipping {}: {e}", toml_path.display());
-                                continue;
-                            }
-                        };
-                        let manifest: AgentManifest = match toml::from_str(&toml_str) {
-                            Ok(m) => m,
-                            Err(e) => {
-                                warn!("Invalid agent TOML {}: {e}", toml_path.display());
-                                continue;
-                            }
-                        };
-                        // Only provision if no agent with this name exists yet
-                        if kernel.registry.find_by_name(&manifest.name).is_some() {
-                            continue;
-                        }
-                        let name = manifest.name.clone();
-                        match kernel.spawn_agent(manifest) {
-                            Ok(id) => {
-                                info!(agent = %name, id = %id, "Auto-provisioned from TOML");
-                                provisioned += 1;
-                            }
-                            Err(e) => {
-                                warn!(agent = %name, "Auto-provision failed: {e}");
-                            }
-                        }
-                    }
-                }
-                if provisioned > 0 {
-                    info!("Auto-provisioned {provisioned} agent(s) from TOML templates");
-                }
+        // If no agents exist (fresh install), spawn a default assistant
+        if kernel.registry.list().is_empty() {
+            info!("No agents found — spawning default assistant");
+            let dm = &kernel.config.default_model;
+            let manifest = AgentManifest {
+                name: "assistant".to_string(),
+                description: "General-purpose assistant".to_string(),
+                model: openfang_types::agent::ModelConfig {
+                    provider: dm.provider.clone(),
+                    model: dm.model.clone(),
+                    system_prompt: "You are a helpful AI assistant.".to_string(),
+                    api_key_env: if dm.api_key_env.is_empty() {
+                        None
+                    } else {
+                        Some(dm.api_key_env.clone())
+                    },
+                    base_url: dm.base_url.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            match kernel.spawn_agent(manifest) {
+                Ok(id) => info!(id = %id, "Default assistant spawned"),
+                Err(e) => warn!("Failed to spawn default assistant: {e}"),
             }
         }
 
@@ -1092,38 +1128,39 @@ impl OpenFangKernel {
         if manifest.exec_policy.is_none() {
             manifest.exec_policy = Some(self.config.exec_policy.clone());
         }
+        info!(agent = %name, id = %agent_id, exec_mode = ?manifest.exec_policy.as_ref().map(|p| &p.mode), "Agent exec_policy resolved");
 
-        // Primary agent elevation: merge system_allowed_paths into exec_policy
-        if let Some(ref primary_name) = self.config.primary_agent_name {
-            if name == *primary_name {
-                if let Some(ref mut policy) = manifest.exec_policy {
-                    let mut paths = self.config.system_allowed_paths.clone();
-                    // If no explicit system_allowed_paths configured, default to ~/.openfang/
-                    if paths.is_empty() {
-                        paths.push(self.config.home_dir.clone());
-                    }
-                    for p in paths {
-                        if !policy.allowed_paths.contains(&p) {
-                            policy.allowed_paths.push(p);
-                        }
-                    }
-                    info!(agent = %name, allowed_paths = ?policy.allowed_paths, "Primary agent: elevated filesystem access");
+        // Overlay kernel default_model onto agent if agent didn't explicitly choose.
+        // Treat empty or "default" as "use the kernel's configured default_model".
+        // This allows bundled agents to defer to the user's configured provider/model,
+        // even if the agent manifest specifies an api_key_env (which is just a hint
+        // about which env var to check, not a hard lock on provider/model).
+        {
+            let is_default_provider =
+                manifest.model.provider.is_empty() || manifest.model.provider == "default";
+            let is_default_model =
+                manifest.model.model.is_empty() || manifest.model.model == "default";
+            if is_default_provider && is_default_model {
+                // Check hot-reloaded override first, fall back to boot-time config
+                let override_guard = self
+                    .default_model_override
+                    .read()
+                    .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
+                let dm = override_guard
+                    .as_ref()
+                    .unwrap_or(&self.config.default_model);
+                if !dm.provider.is_empty() {
+                    manifest.model.provider = dm.provider.clone();
                 }
-            }
-        }
-
-        // Overlay kernel default_model onto agent if no custom key/url is set.
-        // This ensures agents respect the user's configured provider from `openfang init`.
-        if manifest.model.api_key_env.is_none() && manifest.model.base_url.is_none() {
-            let dm = &self.config.default_model;
-            if !dm.provider.is_empty() {
-                manifest.model.provider = dm.provider.clone();
-            }
-            if !dm.model.is_empty() {
-                manifest.model.model = dm.model.clone();
-            }
-            if dm.base_url.is_some() {
-                manifest.model.base_url = dm.base_url.clone();
+                if !dm.model.is_empty() {
+                    manifest.model.model = dm.model.clone();
+                }
+                if !dm.api_key_env.is_empty() && manifest.model.api_key_env.is_none() {
+                    manifest.model.api_key_env = Some(dm.api_key_env.clone());
+                }
+                if dm.base_url.is_some() && manifest.model.base_url.is_none() {
+                    manifest.model.base_url.clone_from(&dm.base_url);
+                }
             }
         }
 
@@ -1136,13 +1173,9 @@ impl OpenFangKernel {
         // Apply global budget defaults to agent resource quotas
         apply_budget_defaults(&self.config.budget, &mut manifest.resources);
 
-        // Create workspace directory for the agent
+        // Create workspace directory for the agent (name-based, so SOUL.md survives recreation)
         let workspace_dir = manifest.workspace.clone().unwrap_or_else(|| {
-            self.config.effective_workspaces_dir().join(format!(
-                "{}-{}",
-                &name,
-                &agent_id.0.to_string()[..8]
-            ))
+            self.config.effective_workspaces_dir().join(&name)
         });
         ensure_workspace(&workspace_dir)?;
         if manifest.generate_identity_files {
@@ -1466,11 +1499,7 @@ impl OpenFangKernel {
 
         // Lazy backfill: create workspace for existing agents spawned before workspaces
         if manifest.workspace.is_none() {
-            let workspace_dir = self.config.effective_workspaces_dir().join(format!(
-                "{}-{}",
-                &manifest.name,
-                &agent_id.0.to_string()[..8]
-            ));
+            let workspace_dir = self.config.effective_workspaces_dir().join(&manifest.name);
             if let Err(e) = ensure_workspace(&workspace_dir) {
                 warn!(agent_id = %agent_id, "Failed to backfill workspace (streaming): {e}");
             } else {
@@ -1570,6 +1599,7 @@ impl OpenFangKernel {
                     None
                 },
                 peer_agents,
+                current_date: Some(chrono::Local::now().format("%A, %B %d, %Y (%Y-%m-%d %H:%M %Z)").to_string()),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -1682,7 +1712,6 @@ impl OpenFangKernel {
                 Some(&kernel_clone.hooks),
                 ctx_window,
                 Some(&kernel_clone.process_manager),
-                None, // cooldown
             )
             .await;
 
@@ -1938,11 +1967,7 @@ impl OpenFangKernel {
 
         // Lazy backfill: create workspace for existing agents spawned before workspaces
         if manifest.workspace.is_none() {
-            let workspace_dir = self.config.effective_workspaces_dir().join(format!(
-                "{}-{}",
-                &manifest.name,
-                &agent_id.0.to_string()[..8]
-            ));
+            let workspace_dir = self.config.effective_workspaces_dir().join(&manifest.name);
             if let Err(e) = ensure_workspace(&workspace_dir) {
                 warn!(agent_id = %agent_id, "Failed to backfill workspace: {e}");
             } else {
@@ -2043,6 +2068,7 @@ impl OpenFangKernel {
                     None
                 },
                 peer_agents,
+                current_date: Some(chrono::Local::now().format("%A, %B %d, %Y (%Y-%m-%d %H:%M %Z)").to_string()),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -2091,7 +2117,16 @@ impl OpenFangKernel {
                 routed_model = %routed_model,
                 "Model routing applied"
             );
-            manifest.model.model = routed_model;
+            manifest.model.model = routed_model.clone();
+            // Also update provider if the routed model belongs to a different provider
+            if let Ok(cat) = self.model_catalog.read() {
+                if let Some(entry) = cat.find_model(&routed_model) {
+                    if entry.provider != manifest.model.provider {
+                        info!(old = %manifest.model.provider, new = %entry.provider, "Model routing changed provider");
+                        manifest.model.provider = entry.provider.clone();
+                    }
+                }
+            }
         }
 
         let driver = self.resolve_driver(&manifest)?;
@@ -2157,7 +2192,6 @@ impl OpenFangKernel {
             Some(&self.hooks),
             ctx_window,
             Some(&self.process_manager),
-            None, // cooldown
         )
         .await
         .map_err(KernelError::OpenFang)?;
@@ -2428,7 +2462,7 @@ impl OpenFangKernel {
                 .take(5)
                 .enumerate()
                 .map(|(i, t)| {
-                    let truncated = openfang_types::truncate_str(t, 200);
+                    let truncated = if t.len() > 200 { &t[..200] } else { t };
                     format!("{}. {}", i + 1, truncated)
                 })
                 .collect::<Vec<_>>()
@@ -2494,6 +2528,10 @@ impl OpenFangKernel {
         if let Some(entry) = self.registry.get(agent_id) {
             let _ = self.memory.save_agent(&entry);
         }
+
+        // Clear canonical session to prevent memory poisoning from old model's responses
+        let _ = self.memory.delete_canonical_session(agent_id);
+        debug!(agent_id = %agent_id, "Cleared canonical session after model switch");
 
         Ok(())
     }
@@ -2564,6 +2602,30 @@ impl OpenFangKernel {
         }
 
         info!(agent_id = %agent_id, servers = ?servers, "Agent MCP servers updated");
+        Ok(())
+    }
+
+    /// Update an agent's tool allowlist and/or blocklist.
+    pub fn set_agent_tool_filters(
+        &self,
+        agent_id: AgentId,
+        allowlist: Option<Vec<String>>,
+        blocklist: Option<Vec<String>>,
+    ) -> KernelResult<()> {
+        self.registry
+            .update_tool_filters(agent_id, allowlist.clone(), blocklist.clone())
+            .map_err(KernelError::OpenFang)?;
+
+        if let Some(entry) = self.registry.get(agent_id) {
+            let _ = self.memory.save_agent(&entry);
+        }
+
+        info!(
+            agent_id = %agent_id,
+            allowlist = ?allowlist,
+            blocklist = ?blocklist,
+            "Agent tool filters updated"
+        );
         Ok(())
     }
 
@@ -2641,11 +2703,7 @@ impl OpenFangKernel {
                 label: None,
             });
 
-        let mut config = CompactionConfig::default();
-        // Enable relevance-weighted compaction when an embedding driver is available
-        if self.embedding_driver.is_some() {
-            config.relevance_weighting = true;
-        }
+        let config = CompactionConfig::default();
 
         if !needs_compaction(&session, &config) {
             return Ok(format!(
@@ -2658,15 +2716,9 @@ impl OpenFangKernel {
         let driver = self.resolve_driver(&entry.manifest)?;
         let model = entry.manifest.model.model.clone();
 
-        let result = compact_session(
-            driver,
-            &model,
-            &session,
-            &config,
-            self.embedding_driver.as_deref(),
-        )
-        .await
-        .map_err(|e| KernelError::OpenFang(OpenFangError::Internal(e)))?;
+        let result = compact_session(driver, &model, &session, &config)
+            .await
+            .map_err(|e| KernelError::OpenFang(OpenFangError::Internal(e)))?;
 
         // Store the LLM summary in the canonical session
         self.memory
@@ -2708,317 +2760,6 @@ impl OpenFangKernel {
         }
 
         Ok(msg)
-    }
-
-    /// Synthesize related memories using LLM.
-    ///
-    /// Finds pairs of memories with cosine similarity between 0.60 and 0.84
-    /// (related but not duplicates), clusters them, and asks the LLM to
-    /// produce a refined synthesis. Stores the result as a new "semantic"
-    /// memory and reduces confidence on the source memories.
-    pub async fn synthesize_related_memories(&self) -> u64 {
-        use openfang_runtime::embedding::{cosine_similarity, embedding_from_bytes};
-
-        let memories = match self.memory.get_memories_for_synthesis() {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("Failed to fetch memories for synthesis: {e}");
-                return 0;
-            }
-        };
-
-        if memories.len() < 2 {
-            return 0;
-        }
-
-        // Group by agent_id
-        // (memory_id, content, embedding, confidence)
-        type SynthesisMemory = (String, String, Vec<f32>, f32);
-        let mut by_agent: std::collections::HashMap<String, Vec<SynthesisMemory>> =
-            std::collections::HashMap::new();
-        for (id, agent_id, content, emb_bytes, confidence) in &memories {
-            let emb = embedding_from_bytes(emb_bytes);
-            if emb.is_empty() {
-                continue;
-            }
-            by_agent
-                .entry(agent_id.clone())
-                .or_default()
-                .push((id.clone(), content.clone(), emb, *confidence));
-        }
-
-        let mut synthesized = 0u64;
-
-        for (agent_id, agent_memories) in &by_agent {
-            // Find related pairs (cosine 0.60-0.84)
-            let mut clusters: Vec<Vec<usize>> = Vec::new();
-            let mut used: std::collections::HashSet<usize> = std::collections::HashSet::new();
-
-            for i in 0..agent_memories.len() {
-                if used.contains(&i) {
-                    continue;
-                }
-                let mut cluster = vec![i];
-                for j in (i + 1)..agent_memories.len() {
-                    if used.contains(&j) {
-                        continue;
-                    }
-                    let sim = cosine_similarity(&agent_memories[i].2, &agent_memories[j].2);
-                    if (0.60..0.85).contains(&sim) {
-                        cluster.push(j);
-                        used.insert(j);
-                    }
-                }
-                if cluster.len() >= 2 {
-                    used.insert(i);
-                    clusters.push(cluster);
-                }
-                if clusters.len() >= 10 {
-                    break; // Cap at 10 clusters per agent
-                }
-            }
-
-            for cluster in &clusters {
-                let cluster_texts: Vec<&str> = cluster
-                    .iter()
-                    .map(|&idx| agent_memories[idx].1.as_str())
-                    .collect();
-                let prompt = format!(
-                    "Synthesize the following related memories into a single, refined piece of knowledge. \
-                     Preserve key facts and relationships. Be concise (1-3 sentences).\n\n{}",
-                    cluster_texts
-                        .iter()
-                        .enumerate()
-                        .map(|(i, t)| format!("Memory {}: {}", i + 1, t))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                );
-
-                let request = CompletionRequest {
-                    model: "default".to_string(),
-                    messages: vec![openfang_types::message::Message::user(&prompt)],
-                    tools: vec![],
-                    max_tokens: 256,
-                    temperature: 0.3,
-                    system: Some("You are a knowledge synthesizer. Combine related facts into refined knowledge.".to_string()),
-                    thinking: None,
-                };
-
-                match self.default_driver.complete(request).await {
-                    Ok(response) => {
-                        let text = response.text();
-                        if !text.is_empty() {
-                            let aid: AgentId = match agent_id.parse() {
-                                Ok(id) => id,
-                                Err(_) => continue,
-                            };
-                            // Store synthesized memory
-                            let metadata = std::collections::HashMap::from([(
-                                "source".to_string(),
-                                serde_json::json!("synthesis"),
-                            )]);
-                            let _ = self.memory.remember_with_embedding(
-                                aid,
-                                &text,
-                                openfang_types::memory::MemorySource::Inference,
-                                "semantic",
-                                metadata,
-                                None,
-                            );
-                            // Reduce confidence on source memories
-                            for &idx in cluster {
-                                let _ = self
-                                    .memory
-                                    .reduce_confidence(&agent_memories[idx].0, 0.3);
-                            }
-                            synthesized += 1;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Memory synthesis LLM call failed: {e}");
-                    }
-                }
-            }
-        }
-
-        synthesized
-    }
-
-    /// Extract entities and relations from unprocessed memories using LLM.
-    ///
-    /// Fetches memories that haven't been through entity extraction,
-    /// batches them, and asks the LLM to identify structured entities
-    /// and their relationships for the knowledge graph.
-    pub async fn extract_entities_from_memories(&self) -> u64 {
-        let unextracted = match self.memory.get_unextracted_memories(50) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("Failed to fetch unextracted memories: {e}");
-                return 0;
-            }
-        };
-
-        if unextracted.is_empty() {
-            return 0;
-        }
-
-        let mut extracted = 0u64;
-
-        // Batch into ~2000 char chunks
-        let mut batch_text = String::new();
-        let mut batch_ids: Vec<String> = Vec::new();
-
-        for (id, _agent_id, content) in &unextracted {
-            if batch_text.len() + content.len() > 2000 && !batch_text.is_empty() {
-                extracted += self
-                    .extract_entities_batch(&batch_text, &batch_ids)
-                    .await;
-                batch_text.clear();
-                batch_ids.clear();
-            }
-            batch_text.push_str(content);
-            batch_text.push('\n');
-            batch_ids.push(id.clone());
-        }
-
-        // Process remaining batch
-        if !batch_text.is_empty() {
-            extracted += self
-                .extract_entities_batch(&batch_text, &batch_ids)
-                .await;
-        }
-
-        extracted
-    }
-
-    /// Extract entities from a text batch using LLM, store in knowledge graph.
-    async fn extract_entities_batch(&self, text: &str, memory_ids: &[String]) -> u64 {
-        let prompt = format!(
-            "Extract entities and their relationships from the following text. \
-             Return a JSON array of objects with these fields: \
-             subject, subject_type, relation, object, object_type, confidence (0.0-1.0).\n\
-             Valid entity types: person, organization, project, concept, event, location, document, tool\n\
-             Valid relation types: works_at, knows_about, related_to, depends_on, owned_by, created_by, located_in, part_of, uses, produces\n\
-             Return only the JSON array, no other text. If no entities found, return [].\n\n\
-             Text:\n{text}"
-        );
-
-        let request = CompletionRequest {
-            model: "default".to_string(),
-            messages: vec![openfang_types::message::Message::user(&prompt)],
-            tools: vec![],
-            max_tokens: 512,
-            temperature: 0.1,
-            system: Some(
-                "You are a structured data extractor. Output only valid JSON arrays.".to_string(),
-            ),
-            thinking: None,
-        };
-
-        let response = match self.default_driver.complete(request).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Entity extraction LLM call failed: {e}");
-                return 0;
-            }
-        };
-
-        let response_text = response.text();
-        if response_text.is_empty() {
-            return 0;
-        }
-
-        // Parse JSON array of entity extractions
-        let entities: Vec<serde_json::Value> = match serde_json::from_str(&response_text) {
-            Ok(v) => v,
-            Err(_) => {
-                // Try to extract JSON array from response (LLM may include surrounding text)
-                let start = response_text.find('[');
-                let end = response_text.rfind(']');
-                match (start, end) {
-                    (Some(s), Some(e)) if s < e => {
-                        match serde_json::from_str(&response_text[s..=e]) {
-                            Ok(v) => v,
-                            Err(_) => return 0,
-                        }
-                    }
-                    _ => return 0,
-                }
-            }
-        };
-
-        let mut count = 0u64;
-
-        for entity_json in &entities {
-            let subject = match entity_json["subject"].as_str() {
-                Some(s) if !s.is_empty() => s,
-                _ => continue,
-            };
-            let object = match entity_json["object"].as_str() {
-                Some(s) if !s.is_empty() => s,
-                _ => continue,
-            };
-            let subject_type = parse_entity_type(
-                entity_json["subject_type"].as_str().unwrap_or("concept"),
-            );
-            let object_type = parse_entity_type(
-                entity_json["object_type"].as_str().unwrap_or("concept"),
-            );
-            let relation_type = parse_relation_type(
-                entity_json["relation"].as_str().unwrap_or("related_to"),
-            );
-            let confidence = entity_json["confidence"]
-                .as_f64()
-                .unwrap_or(0.7) as f32;
-
-            // Create entities
-            let subject_entity = openfang_types::memory::Entity {
-                id: String::new(),
-                entity_type: subject_type,
-                name: subject.to_string(),
-                properties: std::collections::HashMap::new(),
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
-            };
-            let subject_id = match self.memory.knowledge_find_or_create(subject_entity) {
-                Ok(id) => id,
-                Err(_) => continue,
-            };
-
-            let object_entity = openfang_types::memory::Entity {
-                id: String::new(),
-                entity_type: object_type,
-                name: object.to_string(),
-                properties: std::collections::HashMap::new(),
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
-            };
-            let object_id = match self.memory.knowledge_find_or_create(object_entity) {
-                Ok(id) => id,
-                Err(_) => continue,
-            };
-
-            // Create relation
-            let relation = openfang_types::memory::Relation {
-                source: subject_id,
-                relation: relation_type,
-                target: object_id,
-                properties: std::collections::HashMap::new(),
-                confidence,
-                created_at: chrono::Utc::now(),
-            };
-            let _ = self.memory.add_relation_sync(relation);
-            count += 1;
-        }
-
-        // Mark all memories in this batch as extracted
-        for id in memory_ids {
-            let _ = self
-                .memory
-                .set_memory_metadata(id, "entity_extracted", serde_json::json!(true));
-        }
-
-        count
     }
 
     /// Generate a context window usage report for an agent.
@@ -3158,6 +2899,15 @@ impl OpenFangKernel {
                 max_iterations: max_iter,
                 ..Default::default()
             }),
+            // Autonomous hands must run in Continuous mode so the background loop picks them up.
+            // Reactive (default) only fires on incoming messages, so autonomous hands would be inert.
+            schedule: if def.agent.max_iterations.is_some() {
+                ScheduleMode::Continuous {
+                    check_interval_secs: 60,
+                }
+            } else {
+                ScheduleMode::default()
+            },
             skills: def.skills.clone(),
             mcp_servers: def.mcp_servers.clone(),
             // Hands are curated packages — if they declare shell_exec, grant full exec access
@@ -3182,10 +2932,23 @@ impl OpenFangKernel {
                 manifest.model.system_prompt, resolved.prompt_block
             );
         }
-        if !resolved.env_vars.is_empty() {
+        // Collect env vars from settings + from requires (api_key/env_var requirements)
+        let mut allowed_env = resolved.env_vars;
+        for req in &def.requires {
+            match req.requirement_type {
+                openfang_hands::RequirementType::ApiKey
+                | openfang_hands::RequirementType::EnvVar => {
+                    if !req.check_value.is_empty() && !allowed_env.contains(&req.check_value) {
+                        allowed_env.push(req.check_value.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !allowed_env.is_empty() {
             manifest.metadata.insert(
                 "hand_allowed_env".to_string(),
-                serde_json::to_value(&resolved.env_vars).unwrap_or_default(),
+                serde_json::to_value(&allowed_env).unwrap_or_default(),
             );
         }
 
@@ -3195,6 +2958,13 @@ impl OpenFangKernel {
                 "{}\n\n---\n\n## Reference Knowledge\n\n{}",
                 manifest.model.system_prompt, skill_content
             );
+        }
+
+        // If an agent with this hand's name already exists, remove it first
+        let existing = self.registry.list().into_iter().find(|e| e.name == def.agent.name);
+        if let Some(old) = existing {
+            info!(agent = %old.name, id = %old.id, "Removing existing hand agent for reactivation");
+            let _ = self.kill_agent(old.id);
         }
 
         // Spawn the agent
@@ -3229,6 +2999,18 @@ impl OpenFangKernel {
         if let Some(agent_id) = instance.agent_id {
             if let Err(e) = self.kill_agent(agent_id) {
                 warn!(agent = %agent_id, error = %e, "Failed to kill hand agent (may already be dead)");
+            }
+        } else {
+            // Fallback: if agent_id was never set (incomplete activation), search by hand tag
+            let hand_tag = format!("hand:{}", instance.hand_id);
+            for entry in self.registry.list() {
+                if entry.tags.contains(&hand_tag) {
+                    if let Err(e) = self.kill_agent(entry.id) {
+                        warn!(agent = %entry.id, error = %e, "Failed to kill orphaned hand agent");
+                    } else {
+                        info!(agent_id = %entry.id, hand_id = %instance.hand_id, "Cleaned up orphaned hand agent");
+                    }
+                }
             }
         }
         Ok(())
@@ -3345,6 +3127,17 @@ impl OpenFangKernel {
                         .write()
                         .unwrap_or_else(|e| e.into_inner());
                     catalog.apply_url_overrides(&new_config.provider_urls);
+                }
+                HotAction::UpdateDefaultModel => {
+                    info!(
+                        "Hot-reload: updating default model to {}/{}",
+                        new_config.default_model.provider, new_config.default_model.model
+                    );
+                    let mut guard = self
+                        .default_model_override
+                        .write()
+                        .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
+                    *guard = Some(new_config.default_model.clone());
                 }
                 _ => {
                     // Other hot actions (channels, web, browser, extensions, etc.)
@@ -3500,18 +3293,30 @@ impl OpenFangKernel {
     /// `Continuous`, `Periodic`, or `Proactive` schedules.
     pub fn start_background_agents(self: &Arc<Self>) {
         let agents = self.registry.list();
-        let mut started = 0u32;
+        let mut bg_agents: Vec<(openfang_types::agent::AgentId, String, ScheduleMode)> =
+            Vec::new();
 
         for entry in &agents {
             if matches!(entry.manifest.schedule, ScheduleMode::Reactive) {
                 continue;
             }
-            self.start_background_for_agent(entry.id, &entry.name, &entry.manifest.schedule);
-            started += 1;
+            bg_agents.push((entry.id, entry.name.clone(), entry.manifest.schedule.clone()));
         }
 
-        if started > 0 {
-            info!("Started {started} background agent loop(s)");
+        if !bg_agents.is_empty() {
+            let count = bg_agents.len();
+            let kernel = Arc::clone(self);
+            // Stagger agent startup to prevent rate-limit storm on shared providers.
+            // Each agent gets a 500ms delay before the next one starts.
+            tokio::spawn(async move {
+                for (i, (id, name, schedule)) in bg_agents.into_iter().enumerate() {
+                    kernel.start_background_for_agent(id, &name, &schedule);
+                    if i > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+                info!("Started {count} background agent loop(s) (staggered)");
+            });
         }
 
         // Start heartbeat monitor for agent health checking
@@ -3626,24 +3431,6 @@ impl OpenFangKernel {
                                 warn!("Memory consolidation failed: {e}");
                             }
                         }
-
-                        // LLM-based memory synthesis: merge related (but non-duplicate) memories
-                        let synthesized = kernel.synthesize_related_memories().await;
-                        if synthesized > 0 {
-                            info!(
-                                memories_synthesized = synthesized,
-                                "Memory synthesis completed"
-                            );
-                        }
-
-                        // LLM-based entity extraction: populate knowledge graph from memories
-                        let entities_extracted = kernel.extract_entities_from_memories().await;
-                        if entities_extracted > 0 {
-                            info!(
-                                entities_extracted,
-                                "Entity extraction completed"
-                            );
-                        }
                     }
                 });
                 info!("Memory consolidation scheduled every {interval_hours} hour(s)");
@@ -3720,9 +3507,10 @@ impl OpenFangKernel {
                                 let timeout_s = timeout_secs.unwrap_or(120);
                                 let timeout = std::time::Duration::from_secs(timeout_s);
                                 let delivery = job.delivery.clone();
+                                let kh: std::sync::Arc<dyn openfang_runtime::kernel_handle::KernelHandle> = kernel.clone();
                                 match tokio::time::timeout(
                                     timeout,
-                                    kernel.send_message(agent_id, message),
+                                    kernel.send_message_with_handle(agent_id, message, Some(kh)),
                                 )
                                 .await
                                 {
@@ -3956,7 +3744,7 @@ impl OpenFangKernel {
     }
 
     /// Start the background loop / register triggers for a single agent.
-    fn start_background_for_agent(
+    pub fn start_background_for_agent(
         self: &Arc<Self>,
         agent_id: AgentId,
         name: &str,
@@ -4090,10 +3878,14 @@ impl OpenFangKernel {
             let base_url = if has_custom_url {
                 manifest.model.base_url.clone()
             } else if agent_provider == default_provider {
-                self.config.default_model.base_url.clone()
+                self.config
+                    .default_model
+                    .base_url
+                    .clone()
+                    .or_else(|| self.config.provider_urls.get(agent_provider.as_str()).cloned())
             } else {
-                // Let create_driver() use the target provider's default base URL
-                None
+                // Check provider_urls before falling back to hardcoded defaults
+                self.config.provider_urls.get(agent_provider.as_str()).cloned()
             };
 
             let driver_config = DriverConfig {
@@ -4109,7 +3901,9 @@ impl OpenFangKernel {
 
         // If fallback models are configured, wrap in FallbackDriver
         if !manifest.fallback_models.is_empty() {
-            let mut chain = vec![primary.clone()];
+            // Primary driver uses the agent's own model name (already set in request)
+            let mut chain: Vec<(std::sync::Arc<dyn openfang_runtime::llm_driver::LlmDriver>, String)> =
+                vec![(primary.clone(), String::new())];
             for fb in &manifest.fallback_models {
                 let config = DriverConfig {
                     provider: fb.provider.clone(),
@@ -4117,10 +3911,13 @@ impl OpenFangKernel {
                         .api_key_env
                         .as_ref()
                         .and_then(|env| std::env::var(env).ok()),
-                    base_url: fb.base_url.clone(),
+                    base_url: fb
+                        .base_url
+                        .clone()
+                        .or_else(|| self.config.provider_urls.get(&fb.provider).cloned()),
                 };
                 match drivers::create_driver(&config) {
-                    Ok(d) => chain.push(d),
+                    Ok(d) => chain.push((d, fb.model.clone())),
                     Err(e) => {
                         warn!("Fallback driver '{}' failed to init: {e}", fb.provider);
                     }
@@ -4128,7 +3925,7 @@ impl OpenFangKernel {
             }
             if chain.len() > 1 {
                 return Ok(Arc::new(
-                    openfang_runtime::drivers::fallback::FallbackDriver::new(chain),
+                    openfang_runtime::drivers::fallback::FallbackDriver::with_models(chain),
                 ));
             }
         }
@@ -4528,6 +4325,31 @@ impl OpenFangKernel {
             }
         }
 
+        // Apply per-agent tool allowlist/blocklist (manifest-level filtering)
+        let (tool_allowlist, tool_blocklist) = entry
+            .as_ref()
+            .map(|e| (e.manifest.tool_allowlist.clone(), e.manifest.tool_blocklist.clone()))
+            .unwrap_or_default();
+
+        if !tool_allowlist.is_empty() {
+            all_tools.retain(|t| tool_allowlist.iter().any(|a| a == &t.name));
+        }
+        if !tool_blocklist.is_empty() {
+            all_tools.retain(|t| !tool_blocklist.iter().any(|b| b == &t.name));
+        }
+
+        // Remove shell_exec from tool list if exec_policy won't allow it,
+        // so the LLM doesn't try to call a tool that will be blocked.
+        let exec_blocks_shell = entry.as_ref().is_some_and(|e| {
+            e.manifest
+                .exec_policy
+                .as_ref()
+                .is_some_and(|p| p.mode == openfang_types::config::ExecSecurityMode::Deny)
+        });
+        if exec_blocks_shell {
+            all_tools.retain(|t| t.name != "shell_exec");
+        }
+
         let caps = self.capabilities.list(agent_id);
 
         // If agent has ToolAll, return all tools
@@ -4882,7 +4704,7 @@ fn infer_provider_from_model(model: &str) -> Option<String> {
 
 /// A well-known agent ID used for shared memory operations across agents.
 /// This is a fixed UUID so all agents read/write to the same namespace.
-fn shared_memory_agent_id() -> AgentId {
+pub fn shared_memory_agent_id() -> AgentId {
     AgentId(uuid::Uuid::from_bytes([
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x01,
@@ -4957,40 +4779,6 @@ async fn cron_deliver_response(
     }
 }
 
-/// Parse a string into an EntityType enum variant.
-fn parse_entity_type(s: &str) -> openfang_types::memory::EntityType {
-    use openfang_types::memory::EntityType;
-    match s.to_lowercase().as_str() {
-        "person" => EntityType::Person,
-        "organization" | "org" | "company" => EntityType::Organization,
-        "project" => EntityType::Project,
-        "concept" | "idea" => EntityType::Concept,
-        "event" => EntityType::Event,
-        "location" | "place" => EntityType::Location,
-        "document" | "doc" | "file" => EntityType::Document,
-        "tool" => EntityType::Tool,
-        other => EntityType::Custom(other.to_string()),
-    }
-}
-
-/// Parse a string into a RelationType enum variant.
-fn parse_relation_type(s: &str) -> openfang_types::memory::RelationType {
-    use openfang_types::memory::RelationType;
-    match s.to_lowercase().as_str() {
-        "works_at" | "employed_by" => RelationType::WorksAt,
-        "knows_about" | "understands" => RelationType::KnowsAbout,
-        "related_to" | "associated_with" => RelationType::RelatedTo,
-        "depends_on" | "requires" => RelationType::DependsOn,
-        "owned_by" | "belongs_to" => RelationType::OwnedBy,
-        "created_by" | "authored_by" | "made_by" => RelationType::CreatedBy,
-        "located_in" | "based_in" => RelationType::LocatedIn,
-        "part_of" | "member_of" | "component_of" => RelationType::PartOf,
-        "uses" | "utilizes" => RelationType::Uses,
-        "produces" | "generates" | "creates" => RelationType::Produces,
-        other => RelationType::Custom(other.to_string()),
-    }
-}
-
 #[async_trait]
 impl KernelHandle for OpenFangKernel {
     async fn spawn_agent(
@@ -5026,62 +4814,6 @@ impl KernelHandle for OpenFangKernel {
             .send_message(id, message)
             .await
             .map_err(|e| format!("Send failed: {e}"))?;
-        Ok(result.response)
-    }
-
-    async fn delegate_to_agent(
-        &self,
-        agent_id: &str,
-        task: &str,
-        context: Option<&str>,
-    ) -> Result<String, String> {
-        // Resolve agent by UUID or name
-        let id: AgentId = match agent_id.parse() {
-            Ok(id) => id,
-            Err(_) => self
-                .registry
-                .find_by_name(agent_id)
-                .map(|e| e.id)
-                .ok_or_else(|| format!("Agent not found: {agent_id}"))?,
-        };
-
-        // Build the full message
-        let message = match context {
-            Some(ctx) => format!("Context:\n{ctx}\n\nTask:\n{task}"),
-            None => task.to_string(),
-        };
-
-        // Create a temporary session for fresh-context execution
-        let temp_session = self
-            .memory
-            .create_session_with_label(id, Some("delegate_temp"))
-            .map_err(|e| format!("Failed to create temp session: {e}"))?;
-        let temp_session_id = temp_session.id;
-
-        // Clone the agent entry and swap in the temp session
-        let entry = self
-            .registry
-            .get(id)
-            .ok_or_else(|| format!("Agent not found: {id}"))?;
-        let mut delegate_entry = entry.clone();
-        delegate_entry.session_id = temp_session_id;
-
-        // Get kernel handle for inter-agent tools
-        let handle: Option<Arc<dyn KernelHandle>> = self
-            .self_handle
-            .get()
-            .and_then(|w| w.upgrade())
-            .map(|arc| arc as Arc<dyn KernelHandle>);
-
-        // Execute with the fresh session
-        let result = self
-            .execute_llm_agent(&delegate_entry, id, &message, handle)
-            .await
-            .map_err(|e| format!("Delegate failed: {e}"))?;
-
-        // Clean up the temporary session
-        let _ = self.memory.delete_session(temp_session_id);
-
         Ok(result.response)
     }
 
@@ -5362,6 +5094,24 @@ impl KernelHandle for OpenFangKernel {
         Ok(result)
     }
 
+    async fn hand_install(
+        &self,
+        toml_content: &str,
+        skill_content: &str,
+    ) -> Result<serde_json::Value, String> {
+        let def = self
+            .hand_registry
+            .install_from_content(toml_content, skill_content)
+            .map_err(|e| format!("{e}"))?;
+
+        Ok(serde_json::json!({
+            "id": def.id,
+            "name": def.name,
+            "description": def.description,
+            "category": format!("{:?}", def.category),
+        }))
+    }
+
     async fn hand_activate(
         &self,
         hand_id: &str,
@@ -5388,8 +5138,8 @@ impl KernelHandle for OpenFangKernel {
             .ok_or_else(|| format!("No active instance found for hand '{hand_id}'"))?;
 
         let def = self.hand_registry.get_definition(hand_id);
-        let def_name = def.map(|d| d.name.clone()).unwrap_or_default();
-        let def_icon = def.map(|d| d.icon.clone()).unwrap_or_default();
+        let def_name = def.as_ref().map(|d| d.name.clone()).unwrap_or_default();
+        let def_icon = def.as_ref().map(|d| d.icon.clone()).unwrap_or_default();
 
         Ok(serde_json::json!({
             "hand_id": hand_id,
@@ -5532,87 +5282,6 @@ impl KernelHandle for OpenFangKernel {
         // Delegate to the normal spawn path (use trait method via KernelHandle::)
         KernelHandle::spawn_agent(self, manifest_toml, parent_id).await
     }
-
-    fn sync_user_profile(&self, key: &str, value: &serde_json::Value) {
-        // Collect profile keys from shared memory
-        let shared_id = shared_memory_agent_id();
-
-        let user_name = if key == "user_name" {
-            value.as_str().map(String::from)
-        } else {
-            self.memory
-                .structured_get(shared_id, "user_name")
-                .ok()
-                .flatten()
-                .and_then(|v| v.as_str().map(String::from))
-        };
-
-        let user_profile = if key == "user_profile" {
-            Some(value.clone())
-        } else {
-            self.memory
-                .structured_get(shared_id, "user_profile")
-                .ok()
-                .flatten()
-        };
-
-        // Build the USER.md content from available profile data
-        let mut lines = Vec::new();
-        lines.push("# User".to_string());
-        lines.push("<!-- Auto-synced from shared memory -->".to_string());
-        if let Some(ref name) = user_name {
-            lines.push(format!("- Name: {name}"));
-        } else {
-            lines.push("- Name:".to_string());
-        }
-        lines.push("- Timezone:".to_string());
-
-        if let Some(ref profile) = user_profile {
-            if let Some(obj) = profile.as_object() {
-                lines.push("- Profile:".to_string());
-                for (k, v) in obj {
-                    let display = if let Some(s) = v.as_str() {
-                        s.to_string()
-                    } else {
-                        v.to_string()
-                    };
-                    lines.push(format!("  - {k}: {display}"));
-                }
-            } else if let Some(s) = profile.as_str() {
-                lines.push(format!("- Profile: {s}"));
-            }
-        } else {
-            lines.push("- Preferences:".to_string());
-        }
-
-        let user_md_content = lines.join("\n") + "\n";
-
-        // Write to every active agent's workspace
-        let agents = self.registry.list();
-        let mut synced = 0u32;
-        for entry in &agents {
-            if let Some(ref ws) = entry.manifest.workspace {
-                let user_md_path = ws.join("USER.md");
-                if let Err(e) = std::fs::write(&user_md_path, &user_md_content) {
-                    tracing::warn!(
-                        agent = %entry.name,
-                        path = %user_md_path.display(),
-                        error = %e,
-                        "Failed to sync USER.md"
-                    );
-                } else {
-                    synced += 1;
-                }
-            }
-        }
-        if synced > 0 {
-            tracing::info!(
-                key,
-                synced_agents = synced,
-                "User profile synced to agent workspaces"
-            );
-        }
-    }
 }
 
 // --- OFP Wire Protocol integration ---
@@ -5720,6 +5389,8 @@ mod tests {
             workspace: None,
             generate_identity_files: true,
             exec_policy: None,
+            tool_allowlist: vec![],
+            tool_blocklist: vec![],
         };
         manifest.capabilities.tools = vec!["file_read".to_string(), "web_fetch".to_string()];
         manifest.capabilities.agent_spawn = true;
@@ -5755,6 +5426,8 @@ mod tests {
             workspace: None,
             generate_identity_files: true,
             exec_policy: None,
+            tool_allowlist: vec![],
+            tool_blocklist: vec![],
         }
     }
 

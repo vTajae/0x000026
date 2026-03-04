@@ -281,8 +281,8 @@ pub struct BrowserConfig {
     pub idle_timeout_secs: u64,
     /// Maximum concurrent browser sessions.
     pub max_sessions: usize,
-    /// Python executable path (e.g., "python3" on Unix, "python" on Windows).
-    pub python_path: String,
+    /// Path to Chromium/Chrome binary. Auto-detected if None.
+    pub chromium_path: Option<String>,
 }
 
 impl Default for BrowserConfig {
@@ -294,11 +294,7 @@ impl Default for BrowserConfig {
             timeout_secs: 30,
             idle_timeout_secs: 300,
             max_sessions: 5,
-            python_path: if cfg!(windows) {
-                "python".to_string()
-            } else {
-                "python3".to_string()
-            },
+            chromium_path: None,
         }
     }
 }
@@ -750,11 +746,14 @@ impl Default for CanvasConfig {
 #[serde(rename_all = "lowercase")]
 pub enum ExecSecurityMode {
     /// Block all shell execution.
+    #[serde(alias = "none", alias = "disabled")]
     Deny,
     /// Only allow commands in safe_bins or allowed_commands.
     #[default]
+    #[serde(alias = "restricted")]
     Allowlist,
     /// Allow all commands (unsafe, dev only).
+    #[serde(alias = "allow", alias = "all", alias = "unrestricted")]
     Full,
 }
 
@@ -777,10 +776,6 @@ pub struct ExecPolicy {
     /// produce no stdout/stderr output for this duration. Default: 30.
     #[serde(default = "default_no_output_timeout")]
     pub no_output_timeout_secs: u64,
-    /// Additional filesystem paths the agent is allowed to access outside its workspace.
-    /// Used by the primary agent to access system directories like `~/.openfang/`.
-    #[serde(default)]
-    pub allowed_paths: Vec<PathBuf>,
 }
 
 fn default_no_output_timeout() -> u64 {
@@ -802,7 +797,6 @@ impl Default for ExecPolicy {
             timeout_secs: 30,
             max_output_bytes: 100 * 1024,
             no_output_timeout_secs: default_no_output_timeout(),
-            allowed_paths: Vec::new(),
         }
     }
 }
@@ -1051,15 +1045,6 @@ pub struct KernelConfig {
     /// OAuth client ID overrides for PKCE flows.
     #[serde(default)]
     pub oauth: OAuthConfig,
-    /// Name of the primary agent that gets elevated filesystem access.
-    /// When an agent's name matches this, `system_allowed_paths` are merged
-    /// into its exec_policy.allowed_paths at spawn time.
-    #[serde(default)]
-    pub primary_agent_name: Option<String>,
-    /// Filesystem paths the primary agent is allowed to access outside its workspace.
-    /// Defaults to `[~/.openfang/]` if empty and `primary_agent_name` is set.
-    #[serde(default)]
-    pub system_allowed_paths: Vec<PathBuf>,
 }
 
 /// OAuth client ID overrides for PKCE flows.
@@ -1183,7 +1168,7 @@ fn default_language() -> String {
 
 impl Default for KernelConfig {
     fn default() -> Self {
-        let home_dir = dirs_next_home().join(".openfang");
+        let home_dir = openfang_home_dir();
         Self {
             data_dir: home_dir.join("data"),
             home_dir,
@@ -1227,8 +1212,6 @@ impl Default for KernelConfig {
             budget: BudgetConfig::default(),
             provider_urls: HashMap::new(),
             oauth: OAuthConfig::default(),
-            primary_agent_name: None,
-            system_allowed_paths: Vec::new(),
         }
     }
 }
@@ -1325,9 +1308,16 @@ impl std::fmt::Debug for KernelConfig {
     }
 }
 
-/// Fallback home directory resolution.
-fn dirs_next_home() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(std::env::temp_dir)
+/// Resolve the OpenFang home directory.
+///
+/// Priority: `OPENFANG_HOME` env var > `~/.openfang`.
+fn openfang_home_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("OPENFANG_HOME") {
+        return PathBuf::from(home);
+    }
+    dirs::home_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".openfang")
 }
 
 /// Default LLM model configuration.
@@ -1373,17 +1363,13 @@ pub struct MemoryConfig {
     /// Environment variable name for the embedding API key.
     #[serde(default)]
     pub embedding_api_key_env: Option<String>,
-    /// Base URL override for the embedding provider (e.g., "http://10.0.0.68:11434/v1").
-    /// When set, overrides the default URL for the chosen provider.
-    #[serde(default)]
-    pub embedding_base_url: Option<String>,
     /// How often to run memory consolidation (hours). 0 = disabled.
     #[serde(default = "default_consolidation_interval")]
     pub consolidation_interval_hours: u64,
 }
 
 fn default_consolidation_interval() -> u64 {
-    1
+    24
 }
 
 impl Default for MemoryConfig {
@@ -1395,7 +1381,6 @@ impl Default for MemoryConfig {
             decay_rate: 0.1,
             embedding_provider: None,
             embedding_api_key_env: None,
-            embedding_base_url: None,
             consolidation_interval_hours: default_consolidation_interval(),
         }
     }
@@ -1574,19 +1559,11 @@ pub struct DiscordConfig {
     /// Env var name holding the bot token (NOT the token itself).
     pub bot_token_env: String,
     /// Guild (server) IDs allowed to interact (empty = allow all).
-    pub allowed_guilds: Vec<u64>,
-    /// Channel IDs allowed to interact (empty = allow all).
-    #[serde(default)]
-    pub allowed_channels: Vec<String>,
-    /// User IDs or usernames allowed to interact (empty = allow all).
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
-    /// Channel IDs where the bot reads but never responds.
-    #[serde(default)]
-    pub read_only_channels: Vec<String>,
+    /// Accepts strings for consistency with other channel configs.
+    pub allowed_guilds: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
-    /// Gateway intents bitmask (default: 33280 = GUILD_MESSAGES | MESSAGE_CONTENT).
+    /// Gateway intents bitmask (default: 37376 = GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT).
     pub intents: u64,
     /// Per-channel behavior overrides.
     #[serde(default)]
@@ -1598,11 +1575,8 @@ impl Default for DiscordConfig {
         Self {
             bot_token_env: "DISCORD_BOT_TOKEN".to_string(),
             allowed_guilds: vec![],
-            allowed_channels: vec![],
-            allowed_users: vec![],
-            read_only_channels: vec![],
             default_agent: None,
-            intents: 33280,
+            intents: 37376,
             overrides: ChannelOverrides::default(),
         }
     }
@@ -3259,7 +3233,7 @@ mod tests {
         let dc = DiscordConfig::default();
         assert_eq!(dc.bot_token_env, "DISCORD_BOT_TOKEN");
         assert!(dc.allowed_guilds.is_empty());
-        assert_eq!(dc.intents, 33280);
+        assert_eq!(dc.intents, 37376);
     }
 
     #[test]
