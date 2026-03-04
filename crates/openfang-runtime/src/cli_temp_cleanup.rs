@@ -82,7 +82,8 @@ fn remove_entry(path: &std::path::Path, report: &mut CleanupReport) {
 
     let size = dir_size(path);
 
-    let result = if path.is_dir() {
+    let was_dir = path.is_dir();
+    let result = if was_dir {
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
@@ -90,8 +91,7 @@ fn remove_entry(path: &std::path::Path, report: &mut CleanupReport) {
 
     match result {
         Ok(()) => {
-            if path.is_dir() || !path.exists() {
-                // Was a directory or successfully removed
+            if was_dir {
                 report.dirs_removed += 1;
             } else {
                 report.files_removed += 1;

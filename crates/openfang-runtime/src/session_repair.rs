@@ -597,26 +597,25 @@ fn strip_injection_markers(content: &str) -> String {
     ];
 
     let mut result = content.to_string();
-    let lower = result.to_lowercase();
 
     for marker in INJECTION_MARKERS {
         let marker_lower = marker.to_lowercase();
-        // Case-insensitive replacement
-        if lower.contains(&marker_lower) {
-            // Find and replace case-insensitively
-            let mut new_result = String::with_capacity(result.len());
-            let mut search_pos = 0;
-            let result_lower = result.to_lowercase();
-
-            while let Some(found) = result_lower[search_pos..].find(&marker_lower) {
-                let abs_pos = search_pos + found;
-                new_result.push_str(&result[search_pos..abs_pos]);
-                new_result.push_str("[injection marker removed]");
-                search_pos = abs_pos + marker.len();
-            }
-            new_result.push_str(&result[search_pos..]);
-            result = new_result;
+        let result_lower = result.to_lowercase();
+        if !result_lower.contains(&marker_lower) {
+            continue;
         }
+        // Case-insensitive replacement
+        let mut new_result = String::with_capacity(result.len());
+        let mut search_pos = 0;
+
+        while let Some(found) = result_lower[search_pos..].find(&marker_lower) {
+            let abs_pos = search_pos + found;
+            new_result.push_str(&result[search_pos..abs_pos]);
+            new_result.push_str("[injection marker removed]");
+            search_pos = abs_pos + marker.len();
+        }
+        new_result.push_str(&result[search_pos..]);
+        result = new_result;
     }
 
     result
