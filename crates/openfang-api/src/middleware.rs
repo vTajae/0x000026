@@ -79,9 +79,25 @@ pub async fn auth(
         return next.run(request).await;
     }
 
-    // Public endpoints that don't require auth (dashboard needs these)
+    // Shutdown is loopback-only (CLI on same machine) — skip token auth
     let path = request.uri().path();
+    if path == "/api/shutdown" {
+        let is_loopback = request
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0.ip().is_loopback())
+            .unwrap_or(true); // default true for unix sockets / tests
+        if is_loopback {
+            return next.run(request).await;
+        }
+    }
+
+    // Public endpoints that don't require auth (dashboard needs these)
     if path == "/"
+        || path == "/logo.png"
+        || path == "/favicon.ico"
+        || path == "/.well-known/agent.json"
+        || path.starts_with("/a2a/")
         || path == "/api/health"
         || path == "/api/health/detail"
         || path == "/api/status"
@@ -119,15 +135,22 @@ pub async fn auth(
         return next.run(request).await;
     }
 
-    // Check Authorization: Bearer <token> header
+    // Check Authorization: Bearer <token> header, then fallback to X-API-Key
     let bearer_token = request
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
 
+    let api_token = bearer_token.or_else(|| {
+        request
+            .headers()
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+    });
+
     // SECURITY: Use constant-time comparison to prevent timing attacks.
-    let header_auth = bearer_token.map(|token| {
+    let header_auth = api_token.map(|token| {
         use subtle::ConstantTimeEq;
         if token.len() != api_key.len() {
             return false;

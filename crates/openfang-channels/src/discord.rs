@@ -38,10 +38,7 @@ pub struct DiscordAdapter {
     /// SECURITY: Bot token is zeroized on drop to prevent memory disclosure.
     token: Zeroizing<String>,
     client: reqwest::Client,
-    allowed_guilds: Vec<u64>,
-    allowed_channels: Vec<String>,
-    allowed_users: Vec<String>,
-    read_only_channels: Vec<String>,
+    allowed_guilds: Vec<String>,
     intents: u64,
     shutdown_tx: Arc<watch::Sender<bool>>,
     shutdown_rx: watch::Receiver<bool>,
@@ -54,22 +51,12 @@ pub struct DiscordAdapter {
 }
 
 impl DiscordAdapter {
-    pub fn new(
-        token: String,
-        allowed_guilds: Vec<u64>,
-        allowed_channels: Vec<String>,
-        allowed_users: Vec<String>,
-        read_only_channels: Vec<String>,
-        intents: u64,
-    ) -> Self {
+    pub fn new(token: String, allowed_guilds: Vec<String>, intents: u64) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             token: Zeroizing::new(token),
             client: reqwest::Client::new(),
             allowed_guilds,
-            allowed_channels,
-            allowed_users,
-            read_only_channels,
             intents,
             shutdown_tx: Arc::new(shutdown_tx),
             shutdown_rx,
@@ -226,9 +213,6 @@ impl ChannelAdapter for DiscordAdapter {
         let token = self.token.clone();
         let intents = self.intents;
         let allowed_guilds = self.allowed_guilds.clone();
-        let allowed_channels = self.allowed_channels.clone();
-        let allowed_users = self.allowed_users.clone();
-        let read_only_channels = self.read_only_channels.clone();
         let bot_user_id = self.bot_user_id.clone();
         let session_id_store = self.session_id.clone();
         let resume_url_store = self.resume_gateway_url.clone();
@@ -262,29 +246,12 @@ impl ChannelAdapter for DiscordAdapter {
                 info!("Discord gateway connected");
 
                 let (mut ws_tx, mut ws_rx) = ws_stream.split();
-                let mut heartbeat_timer = tokio::time::interval(tokio::time::Duration::from_secs(45));
-                heartbeat_timer.tick().await; // consume first immediate tick
+                let mut _heartbeat_interval: Option<u64> = None;
 
                 // Inner message loop — returns true if we should reconnect
                 let should_reconnect = 'inner: loop {
                     let msg = tokio::select! {
                         msg = ws_rx.next() => msg,
-                        _ = heartbeat_timer.tick() => {
-                            // Send periodic heartbeat
-                            let seq = *sequence.read().await;
-                            let hb = serde_json::json!({ "op": opcode::HEARTBEAT, "d": seq });
-                            if let Err(e) = ws_tx
-                                .send(tokio_tungstenite::tungstenite::Message::Text(
-                                    serde_json::to_string(&hb).unwrap(),
-                                ))
-                                .await
-                            {
-                                warn!("Discord: failed to send heartbeat: {e}");
-                                break 'inner true;
-                            }
-                            debug!("Discord heartbeat sent (seq={seq:?})");
-                            continue;
-                        }
                         _ = shutdown.changed() => {
                             if *shutdown.borrow() {
                                 info!("Discord shutdown requested");
@@ -335,8 +302,7 @@ impl ChannelAdapter for DiscordAdapter {
                         opcode::HELLO => {
                             let interval =
                                 payload["d"]["heartbeat_interval"].as_u64().unwrap_or(45000);
-                            heartbeat_timer = tokio::time::interval(tokio::time::Duration::from_millis(interval));
-                            heartbeat_timer.tick().await; // consume first immediate tick
+                            _heartbeat_interval = Some(interval);
                             debug!("Discord HELLO: heartbeat_interval={interval}ms");
 
                             // Try RESUME if we have a session, otherwise IDENTIFY
@@ -407,14 +373,7 @@ impl ChannelAdapter for DiscordAdapter {
 
                                 "MESSAGE_CREATE" | "MESSAGE_UPDATE" => {
                                     if let Some(msg) =
-                                        parse_discord_message(
-                                            d,
-                                            &bot_user_id,
-                                            &allowed_guilds,
-                                            &allowed_channels,
-                                            &allowed_users,
-                                            &read_only_channels,
-                                        )
+                                        parse_discord_message(d, &bot_user_id, &allowed_guilds)
                                             .await
                                     {
                                         debug!(
@@ -474,20 +433,13 @@ impl ChannelAdapter for DiscordAdapter {
                                             }
                                         }
 
-                                        // Check permissions (guild, channel, user)
-                                        let guild_id = d["guild_id"].as_str().and_then(|g| g.parse::<u64>().ok());
+                                        // Check guild permissions
                                         if !allowed_guilds.is_empty() {
-                                            if let Some(gid) = guild_id {
-                                                if !allowed_guilds.contains(&gid) {
+                                            if let Some(guild_id) = d["guild_id"].as_str() {
+                                                if !allowed_guilds.iter().any(|g| g == guild_id) {
                                                     continue;
                                                 }
                                             }
-                                        }
-                                        if !allowed_channels.is_empty() && !allowed_channels.contains(&channel_id) {
-                                            continue;
-                                        }
-                                        if !allowed_users.is_empty() && !allowed_users.contains(&username) {
-                                            continue;
                                         }
 
                                         // Build the args list
@@ -728,153 +680,44 @@ impl ChannelAdapter for DiscordAdapter {
     }
 }
 
-/// Fetch the text content of a Discord CDN attachment URL.
-///
-/// Used to inline .txt, .md, .json, and other text-based file attachments
-/// so the agent sees the content directly in the message.
-async fn fetch_attachment_text(url: &str) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
-
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("Fetch failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
-    }
-
-    resp.text()
-        .await
-        .map_err(|e| format!("Read body failed: {e}"))
-}
-
 /// Parse a Discord MESSAGE_CREATE or MESSAGE_UPDATE payload into a `ChannelMessage`.
 async fn parse_discord_message(
     d: &serde_json::Value,
     bot_user_id: &Arc<RwLock<Option<String>>>,
-    allowed_guilds: &[u64],
-    allowed_channels: &[String],
-    allowed_users: &[String],
-    read_only_channels: &[String],
+    allowed_guilds: &[String],
 ) -> Option<ChannelMessage> {
     let author = d.get("author")?;
     let author_id = author["id"].as_str()?;
-    let username = author["username"].as_str().unwrap_or("Unknown");
-    let channel_id = d["channel_id"].as_str()?;
 
-    let is_read_only = !read_only_channels.is_empty() && read_only_channels.contains(&channel_id.to_string());
-
-    // Filter out bot's own messages (always — even in read-only channels)
+    // Filter out bot's own messages
     if let Some(ref bid) = *bot_user_id.read().await {
         if author_id == bid {
             return None;
         }
     }
 
-    // Filter out other bots — UNLESS this is a read-only channel (transcriber is a bot)
-    if !is_read_only && author["bot"].as_bool() == Some(true) {
+    // Filter out other bots
+    if author["bot"].as_bool() == Some(true) {
         return None;
     }
 
     // Filter by allowed guilds
     if !allowed_guilds.is_empty() {
         if let Some(guild_id) = d["guild_id"].as_str() {
-            let gid: u64 = guild_id.parse().unwrap_or(0);
-            if !allowed_guilds.contains(&gid) {
+            if !allowed_guilds.iter().any(|g| g == guild_id) {
                 return None;
             }
         }
     }
 
-    // Filter by allowed channels (read-only channels are implicitly allowed)
-    if !allowed_channels.is_empty() && !is_read_only && !allowed_channels.contains(&channel_id.to_string()) {
+    let content_text = d["content"].as_str().unwrap_or("");
+    if content_text.is_empty() {
         return None;
     }
 
-    // Filter by allowed users (skip for read-only channels — transcriber bot won't be listed)
-    if !allowed_users.is_empty() && !is_read_only {
-        let id_match = allowed_users.contains(&author_id.to_string());
-        let name_match = allowed_users.contains(&username.to_string());
-        if !id_match && !name_match {
-            return None;
-        }
-    }
-
-    let content_text = d["content"].as_str().unwrap_or("");
-
-    // Extract attachment info (files, images sent alongside or instead of text)
-    let attachments = d["attachments"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-
-    // For .txt file attachments, download the content inline so the agent sees it
-    let mut attachment_texts: Vec<String> = Vec::new();
-    let mut attachment_metadata: Vec<serde_json::Value> = Vec::new();
-    for att in &attachments {
-        let filename = att["filename"].as_str().unwrap_or("");
-        let url = att["url"].as_str().unwrap_or("");
-        let size = att["size"].as_u64().unwrap_or(0);
-        let content_type = att["content_type"].as_str().unwrap_or("");
-
-        // Store metadata for all attachments
-        attachment_metadata.push(serde_json::json!({
-            "filename": filename,
-            "url": url,
-            "size": size,
-            "content_type": content_type,
-        }));
-
-        // Auto-fetch text-based attachments (txt, md, json, csv, log, yaml, toml, etc.)
-        let is_text_file = filename.ends_with(".txt")
-            || filename.ends_with(".md")
-            || filename.ends_with(".json")
-            || filename.ends_with(".csv")
-            || filename.ends_with(".log")
-            || filename.ends_with(".yaml")
-            || filename.ends_with(".yml")
-            || filename.ends_with(".toml")
-            || filename.ends_with(".xml")
-            || filename.ends_with(".py")
-            || filename.ends_with(".rs")
-            || filename.ends_with(".js")
-            || filename.ends_with(".ts")
-            || content_type.starts_with("text/");
-
-        // Only fetch reasonably sized text files (< 100KB)
-        if is_text_file && !url.is_empty() && size < 100_000 {
-            match fetch_attachment_text(url).await {
-                Ok(text) => {
-                    attachment_texts.push(format!("--- Attached file: {filename} ---\n{text}\n--- End of {filename} ---"));
-                }
-                Err(e) => {
-                    tracing::warn!(filename, url, error = %e, "Failed to fetch Discord attachment");
-                    attachment_texts.push(format!("[Attachment: {filename} ({size} bytes) — fetch failed: {e}]"));
-                }
-            }
-        } else if !url.is_empty() {
-            // Non-text or too large — just note the attachment
-            attachment_texts.push(format!("[Attachment: {filename} ({size} bytes, {content_type})]"));
-        }
-    }
-
-    // Build final text: message content + attachment contents
-    let combined_text = if content_text.is_empty() && attachment_texts.is_empty() {
-        return None; // No text and no attachments — nothing to process
-    } else if content_text.is_empty() {
-        attachment_texts.join("\n\n")
-    } else if attachment_texts.is_empty() {
-        content_text.to_string()
-    } else {
-        format!("{content_text}\n\n{}", attachment_texts.join("\n\n"))
-    };
-
+    let channel_id = d["channel_id"].as_str()?;
     let message_id = d["id"].as_str().unwrap_or("0");
+    let username = author["username"].as_str().unwrap_or("Unknown");
     let discriminator = author["discriminator"].as_str().unwrap_or("0000");
     let display_name = if discriminator == "0" {
         username.to_string()
@@ -889,8 +732,8 @@ async fn parse_discord_message(
         .unwrap_or_else(chrono::Utc::now);
 
     // Parse commands (messages starting with /)
-    let content = if combined_text.starts_with('/') {
-        let parts: Vec<&str> = combined_text.splitn(2, ' ').collect();
+    let content = if content_text.starts_with('/') {
+        let parts: Vec<&str> = content_text.splitn(2, ' ').collect();
         let cmd_name = &parts[0][1..];
         let args = if parts.len() > 1 {
             parts[1].split_whitespace().map(String::from).collect()
@@ -902,19 +745,8 @@ async fn parse_discord_message(
             args,
         }
     } else {
-        ChannelContent::Text(combined_text)
+        ChannelContent::Text(content_text.to_string())
     };
-
-    // Build metadata with author info and read-only flag
-    let mut metadata = HashMap::new();
-    metadata.insert("author_id".to_string(), serde_json::Value::String(author_id.to_string()));
-    metadata.insert("author_username".to_string(), serde_json::Value::String(username.to_string()));
-    if !attachment_metadata.is_empty() {
-        metadata.insert("attachments".to_string(), serde_json::Value::Array(attachment_metadata));
-    }
-    if is_read_only {
-        metadata.insert("read_only".to_string(), serde_json::Value::Bool(true));
-    }
 
     Some(ChannelMessage {
         channel: ChannelType::Discord,
@@ -929,7 +761,7 @@ async fn parse_discord_message(
         timestamp,
         is_group: true,
         thread_id: None,
-        metadata,
+        metadata: HashMap::new(),
     })
 }
 
@@ -953,7 +785,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &[]).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[]).await.unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
         assert_eq!(msg.sender.display_name, "alice");
         assert_eq!(msg.sender.platform_id, "ch1");
@@ -975,7 +807,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &[]).await;
+        let msg = parse_discord_message(&d, &bot_id, &[]).await;
         assert!(msg.is_none());
     }
 
@@ -995,7 +827,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &[]).await;
+        let msg = parse_discord_message(&d, &bot_id, &[]).await;
         assert!(msg.is_none());
     }
 
@@ -1016,11 +848,11 @@ mod tests {
         });
 
         // Not in allowed guilds
-        let msg = parse_discord_message(&d, &bot_id, &[111, 222], &[], &[], &[]).await;
+        let msg = parse_discord_message(&d, &bot_id, &["111".into(), "222".into()]).await;
         assert!(msg.is_none());
 
         // In allowed guilds
-        let msg = parse_discord_message(&d, &bot_id, &[999], &[], &[], &[]).await;
+        let msg = parse_discord_message(&d, &bot_id, &["999".into()]).await;
         assert!(msg.is_some());
     }
 
@@ -1039,7 +871,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &[]).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[]).await.unwrap();
         match &msg.content {
             ChannelContent::Command { name, args } => {
                 assert_eq!(name, "agent");
@@ -1064,7 +896,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &[]).await;
+        let msg = parse_discord_message(&d, &bot_id, &[]).await;
         assert!(msg.is_none());
     }
 
@@ -1083,7 +915,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &[]).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[]).await.unwrap();
         assert_eq!(msg.sender.display_name, "alice#1234");
     }
 
@@ -1104,7 +936,8 @@ mod tests {
             "edited_timestamp": "2024-01-01T00:01:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &[]).await.unwrap();
+        // MESSAGE_UPDATE uses the same parse function as MESSAGE_CREATE
+        let msg = parse_discord_message(&d, &bot_id, &[]).await.unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
         assert!(
             matches!(msg.content, ChannelContent::Text(ref t) if t == "Edited message content")
@@ -1113,133 +946,8 @@ mod tests {
 
     #[test]
     fn test_discord_adapter_creation() {
-        let adapter = DiscordAdapter::new(
-            "test-token".to_string(),
-            vec![123, 456],
-            vec![],
-            vec![],
-            vec![],
-            33280,
-        );
+        let adapter = DiscordAdapter::new("test-token".to_string(), vec!["123".to_string(), "456".to_string()], 37376);
         assert_eq!(adapter.name(), "discord");
         assert_eq!(adapter.channel_type(), ChannelType::Discord);
-    }
-
-    // --- New tests for channel/user/read-only filtering ---
-
-    #[tokio::test]
-    async fn test_channel_filter_blocks_unlisted_channel() {
-        let bot_id = Arc::new(RwLock::new(None));
-        let d = serde_json::json!({
-            "id": "msg1",
-            "channel_id": "ch999",
-            "content": "Hello",
-            "author": { "id": "u1", "username": "alice", "discriminator": "0" },
-            "timestamp": "2024-01-01T00:00:00+00:00"
-        });
-        let allowed_ch = vec!["ch1".to_string(), "ch2".to_string()];
-        let msg = parse_discord_message(&d, &bot_id, &[], &allowed_ch, &[], &[]).await;
-        assert!(msg.is_none());
-
-        // Allowed channel passes
-        let d2 = serde_json::json!({
-            "id": "msg2",
-            "channel_id": "ch1",
-            "content": "Hello",
-            "author": { "id": "u1", "username": "alice", "discriminator": "0" },
-            "timestamp": "2024-01-01T00:00:00+00:00"
-        });
-        let msg = parse_discord_message(&d2, &bot_id, &[], &allowed_ch, &[], &[]).await;
-        assert!(msg.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_user_filter_by_id() {
-        let bot_id = Arc::new(RwLock::new(None));
-        let d = serde_json::json!({
-            "id": "msg1",
-            "channel_id": "ch1",
-            "content": "Hello",
-            "author": { "id": "u999", "username": "stranger", "discriminator": "0" },
-            "timestamp": "2024-01-01T00:00:00+00:00"
-        });
-        let allowed_users = vec!["u1".to_string(), "u2".to_string()];
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &allowed_users, &[]).await;
-        assert!(msg.is_none());
-
-        // Matching ID passes
-        let d2 = serde_json::json!({
-            "id": "msg2",
-            "channel_id": "ch1",
-            "content": "Hello",
-            "author": { "id": "u1", "username": "stranger", "discriminator": "0" },
-            "timestamp": "2024-01-01T00:00:00+00:00"
-        });
-        let msg = parse_discord_message(&d2, &bot_id, &[], &[], &allowed_users, &[]).await;
-        assert!(msg.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_user_filter_by_username() {
-        let bot_id = Arc::new(RwLock::new(None));
-        let d = serde_json::json!({
-            "id": "msg1",
-            "channel_id": "ch1",
-            "content": "Hello",
-            "author": { "id": "u999", "username": "xomclovin", "discriminator": "0" },
-            "timestamp": "2024-01-01T00:00:00+00:00"
-        });
-        let allowed_users = vec!["xomclovin".to_string(), "iso.cry".to_string()];
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &allowed_users, &[]).await;
-        assert!(msg.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_read_only_channel_metadata() {
-        let bot_id = Arc::new(RwLock::new(None));
-        let d = serde_json::json!({
-            "id": "msg1",
-            "channel_id": "ro_ch",
-            "content": "Transcribed audio",
-            "author": { "id": "bot_transcriber", "username": "transcriber", "discriminator": "0", "bot": true },
-            "timestamp": "2024-01-01T00:00:00+00:00"
-        });
-        let read_only = vec!["ro_ch".to_string()];
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &read_only).await.unwrap();
-        assert_eq!(msg.metadata.get("read_only").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(msg.metadata.get("author_id").and_then(|v| v.as_str()), Some("bot_transcriber"));
-    }
-
-    #[tokio::test]
-    async fn test_read_only_bypasses_allowed_channels() {
-        let bot_id = Arc::new(RwLock::new(None));
-        let d = serde_json::json!({
-            "id": "msg1",
-            "channel_id": "ro_ch",
-            "content": "Transcribed text",
-            "author": { "id": "bot_t", "username": "transcriber", "discriminator": "0", "bot": true },
-            "timestamp": "2024-01-01T00:00:00+00:00"
-        });
-        // ro_ch is NOT in allowed_channels, but IS in read_only_channels — should pass
-        let allowed_ch = vec!["ch1".to_string()];
-        let read_only = vec!["ro_ch".to_string()];
-        let msg = parse_discord_message(&d, &bot_id, &[], &allowed_ch, &[], &read_only).await;
-        assert!(msg.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_metadata_contains_author_info() {
-        let bot_id = Arc::new(RwLock::new(None));
-        let d = serde_json::json!({
-            "id": "msg1",
-            "channel_id": "ch1",
-            "content": "Hi",
-            "author": { "id": "u42", "username": "alice", "discriminator": "0" },
-            "timestamp": "2024-01-01T00:00:00+00:00"
-        });
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], &[]).await.unwrap();
-        assert_eq!(msg.metadata.get("author_id").and_then(|v| v.as_str()), Some("u42"));
-        assert_eq!(msg.metadata.get("author_username").and_then(|v| v.as_str()), Some("alice"));
-        assert!(!msg.metadata.contains_key("read_only"));
     }
 }
