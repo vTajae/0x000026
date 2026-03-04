@@ -128,6 +128,24 @@ imap = "2"
 native-tls = "0.2"
 mailparse = "0.15"
 
+# Scheduling
+cron = "0.15"
+
+# Desktop (Tauri 2.0)
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-build = { version = "2", features = [] }
+tauri-plugin-notification = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-updater = "2"
+open = "5"
+
+# Platform
+libc = "0.2"
+
 # Testing
 tokio-test = "0.4"
 tempfile = "3"
