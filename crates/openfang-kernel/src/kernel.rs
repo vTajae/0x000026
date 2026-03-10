@@ -157,6 +157,8 @@ pub struct OpenFangKernel {
     agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
+    /// Credential resolver — vault + dotenv + env var chain for secret access.
+    pub credential_resolver: Arc<openfang_extensions::credentials::CredentialResolver>,
 }
 
 /// Bounded in-memory delivery receipt tracker.
@@ -538,6 +540,47 @@ impl OpenFangKernel {
         // Ensure data directory exists
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| KernelError::BootFailed(format!("Failed to create data dir: {e}")))?;
+
+        // Initialize credential resolver (vault + dotenv + env var chain)
+        let credential_resolver = {
+            use openfang_extensions::credentials::CredentialResolver;
+            use openfang_extensions::vault::CredentialVault;
+
+            let vault_path = config
+                .vault
+                .path
+                .clone()
+                .unwrap_or_else(|| config.home_dir.join("vault.enc"));
+
+            let vault = if config.vault.enabled && vault_path.exists() {
+                let mut v = CredentialVault::new(vault_path);
+                match v.unlock() {
+                    Ok(()) => {
+                        info!("Credential vault unlocked — secrets will be resolved from vault first");
+                        Some(v)
+                    }
+                    Err(e) => {
+                        warn!("Credential vault exists but failed to unlock: {e} — falling back to env vars");
+                        None
+                    }
+                }
+            } else {
+                debug!("No vault configured — credentials resolved from dotenv/env vars only");
+                None
+            };
+
+            let dotenv_path = config.home_dir.join(".env");
+            let dotenv_ref = if dotenv_path.exists() {
+                Some(dotenv_path)
+            } else {
+                None
+            };
+
+            Arc::new(CredentialResolver::new(
+                vault,
+                dotenv_ref.as_deref(),
+            ))
+        };
 
         // Initialize memory substrate
         let db_path = config
@@ -990,6 +1033,7 @@ impl OpenFangKernel {
             default_model_override: std::sync::RwLock::new(None),
             agent_msg_locks: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
+            credential_resolver,
         };
 
         // Restore persisted agents from SQLite
