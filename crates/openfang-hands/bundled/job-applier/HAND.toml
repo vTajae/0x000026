@@ -212,14 +212,14 @@ Execute these stages in order. Report progress after each stage.
 - Track: `memory_store` → `job_applier_hand_jobs_scored`
 
 ### Stage 5: Tailor (Typst Powered)
-- Customize resume using the **OpenClaw Typst Resume System** at `/home/kronic/Desktop/Job/Resume/typst-resume`.
-- `shell_exec` → `python3 /home/kronic/Desktop/Job/Resume/typst-resume/exporter/cli.py --variant {job_id} --format aihawk --output ~/services/job-applier/shared/config/plain_text_resume.yaml`
-- `shell_exec` → `python3 /home/kronic/Desktop/Job/Resume/typst-resume/exporter/cli.py --variant {job_id} --format pdf --output ~/services/job-applier/shared/output/tailored_resume_{job_id}.pdf`
+- Customize resume using the **OpenClaw Typst Resume System** at `~/Desktop/Job/Resume/typst-resume`.
+- `shell_exec` → `python3 ~/Desktop/Job/Resume/typst-resume/exporter/cli.py --variant {job_id} --format aihawk --output ~/services/job-applier/shared/config/plain_text_resume.yaml`
+- `shell_exec` → `python3 ~/Desktop/Job/Resume/typst-resume/exporter/cli.py --variant {job_id} --format pdf --output ~/services/job-applier/shared/output/tailored_resume_{job_id}.pdf`
 - This ensures the LLM-optimized YAML is used by ApplyPilot while a professional Typst PDF is generated for the application.
 
 ### Stage 6: Cover Letters (Typst Powered)
 - Generate personalized cover letters using the Typst template.
-- `shell_exec` → `python3 /home/kronic/Desktop/Job/Resume/typst-resume/exporter/cli.py --variant {job_id} --format cover_letter --output ~/services/job-applier/shared/output/cover_letter_{job_id}.pdf`
+- `shell_exec` → `python3 ~/Desktop/Job/Resume/typst-resume/exporter/cli.py --variant {job_id} --format cover_letter --output ~/services/job-applier/shared/output/cover_letter_{job_id}.pdf`
 
 ### Stage 7: Apply
 - Route by platform:
@@ -233,7 +233,6 @@ Execute these stages in order. Report progress after each stage.
 ### Stage 7.5: Discord Notification
 - For each successful application, post a summary to the Discord `#jobs` channel.
 - `agent_send` → `recruiter` (or self if bound) with message: "Applied to {position} at {company}. Tailored Typst resume and cover letter generated."
-
 
 ### Stage 8: Learn
 - Store what worked in memory for next cycle:
