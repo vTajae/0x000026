@@ -303,14 +303,28 @@ fn migrate_v7(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
-/// Version 8: Add entity name+type index for fast find-or-create lookups.
+/// Version 8: Add entity name+type index and audit_entries table.
 fn migrate_v8(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         "
         CREATE INDEX IF NOT EXISTS idx_entities_name_type ON entities(name, entity_type);
 
+        CREATE TABLE IF NOT EXISTS audit_entries (
+            seq INTEGER PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            prev_hash TEXT NOT NULL,
+            hash TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_agent ON audit_entries(agent_id);
+        CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_entries(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_entries(action);
+
         INSERT OR IGNORE INTO migrations (version, applied_at, description)
-        VALUES (8, datetime('now'), 'Add entity name+type index for knowledge graph dedup');
+        VALUES (8, datetime('now'), 'Add entity name+type index and audit_entries table');
         ",
     )?;
     Ok(())

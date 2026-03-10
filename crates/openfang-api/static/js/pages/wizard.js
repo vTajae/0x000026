@@ -283,10 +283,12 @@ function wizardPage() {
     },
 
     get canGoNext() {
-      if (this.step === 2) return this.keySaved || this.hasConfiguredProvider;
+      if (this.step === 2) return this.keySaved || this.hasConfiguredProvider || this.claudeCodeDetected;
       if (this.step === 3) return this.agentName.trim().length > 0;
       return true;
     },
+
+    claudeCodeDetected: false,
 
     get hasConfiguredProvider() {
       var self = this;
@@ -320,7 +322,7 @@ function wizardPage() {
     },
 
     get popularProviders() {
-      var popular = ['anthropic', 'openai', 'gemini', 'groq', 'deepseek', 'openrouter'];
+      var popular = ['anthropic', 'openai', 'gemini', 'groq', 'deepseek', 'openrouter', 'claude-code'];
       return this.providers.filter(function(p) {
         return popular.indexOf(p.id) >= 0;
       }).sort(function(a, b) {
@@ -329,7 +331,7 @@ function wizardPage() {
     },
 
     get otherProviders() {
-      var popular = ['anthropic', 'openai', 'gemini', 'groq', 'deepseek', 'openrouter'];
+      var popular = ['anthropic', 'openai', 'gemini', 'groq', 'deepseek', 'openrouter', 'claude-code'];
       return this.providers.filter(function(p) {
         return popular.indexOf(p.id) < 0;
       });
@@ -355,7 +357,8 @@ function wizardPage() {
         fireworks: { url: 'https://fireworks.ai/account/api-keys', text: 'Get your key from Fireworks AI' },
         perplexity: { url: 'https://www.perplexity.ai/settings/api', text: 'Get your key from Perplexity Settings' },
         cohere: { url: 'https://dashboard.cohere.com/api-keys', text: 'Get your key from the Cohere Dashboard' },
-        xai: { url: 'https://console.x.ai/', text: 'Get your key from the xAI Console' }
+        xai: { url: 'https://console.x.ai/', text: 'Get your key from the xAI Console' },
+        'claude-code': { url: 'https://docs.anthropic.com/en/docs/claude-code', text: 'Install: npm install -g @anthropic-ai/claude-code && claude auth (no API key needed)' }
       };
       return help[id] || null;
     },
@@ -404,6 +407,28 @@ function wizardPage() {
       } catch(e) {
         this.testResult = { status: 'error', error: e.message };
         OpenFangToast.error('Test failed: ' + e.message);
+      }
+      this.testingProvider = false;
+    },
+
+    async detectClaudeCode() {
+      this.testingProvider = true;
+      this.testResult = null;
+      try {
+        var result = await OpenFangAPI.post('/api/providers/claude-code/test', {});
+        this.testResult = result;
+        if (result.status === 'ok') {
+          this.claudeCodeDetected = true;
+          this.keySaved = true;
+          this.setupSummary.provider = 'Claude Code';
+          OpenFangToast.success('Claude Code detected (' + (result.latency_ms || '?') + 'ms)');
+        } else {
+          this.testResult = { status: 'error', error: 'Claude Code CLI not detected' };
+          OpenFangToast.error('Claude Code CLI not detected. Make sure you\'ve run: npm install -g @anthropic-ai/claude-code && claude auth');
+        }
+      } catch(e) {
+        this.testResult = { status: 'error', error: e.message };
+        OpenFangToast.error('Claude Code CLI not detected. Make sure you\'ve run: npm install -g @anthropic-ai/claude-code && claude auth');
       }
       this.testingProvider = false;
     },
@@ -468,13 +493,14 @@ function wizardPage() {
         gemini: 'gemini-2.5-flash',
         groq: 'llama-3.3-70b-versatile',
         deepseek: 'deepseek-chat',
-        openrouter: 'openrouter/auto',
+        openrouter: 'openrouter/google/gemini-2.5-flash',
         mistral: 'mistral-large-latest',
         together: 'meta-llama/Llama-3-70b-chat-hf',
         fireworks: 'accounts/fireworks/models/llama-v3p1-70b-instruct',
         perplexity: 'llama-3.1-sonar-large-128k-online',
         cohere: 'command-r-plus',
-        xai: 'grok-2'
+        xai: 'grok-2',
+        'claude-code': 'claude-code/sonnet'
       };
       return defaults[providerId] || '';
     },

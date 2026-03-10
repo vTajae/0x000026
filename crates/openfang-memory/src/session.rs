@@ -383,8 +383,18 @@ impl SessionStore {
 
         match result {
             Ok((messages_blob, cursor, summary, updated_at)) => {
-                let messages: Vec<Message> = rmp_serde::from_slice(&messages_blob)
-                    .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+                // Try named format first (current), fall back to empty if blob is
+                // corrupt (e.g. saved with compact `to_vec` before the fix).
+                let messages: Vec<Message> = match rmp_serde::from_slice(&messages_blob) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(
+                            "canonical session for agent {agent_id:?} has corrupt message blob \
+                             ({e}), resetting to empty — old summary preserved"
+                        );
+                        Vec::new()
+                    }
+                };
                 Ok(CanonicalSession {
                     agent_id,
                     messages,
@@ -496,7 +506,7 @@ impl SessionStore {
             .conn
             .lock()
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-        let messages_blob = rmp_serde::to_vec(&canonical.messages)
+        let messages_blob = rmp_serde::to_vec_named(&canonical.messages)
             .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
         conn.execute(
             "INSERT INTO canonical_sessions (agent_id, messages, compaction_cursor, compacted_summary, updated_at)
@@ -560,7 +570,7 @@ impl SessionStore {
                             ContentBlock::Text { text } => {
                                 text_parts.push(text.clone());
                             }
-                            ContentBlock::ToolUse { id, name, input } => {
+                            ContentBlock::ToolUse { id, name, input, .. } => {
                                 tool_parts.push(serde_json::json!({
                                     "type": "tool_use",
                                     "id": id,
@@ -587,7 +597,7 @@ impl SessionStore {
                             ContentBlock::Thinking { thinking } => {
                                 text_parts.push(format!(
                                     "[thinking: {}]",
-                                    &thinking[..thinking.len().min(200)]
+                                    openfang_types::truncate_str(thinking, 200)
                                 ));
                             }
                             ContentBlock::Unknown => {}
@@ -771,6 +781,83 @@ mod tests {
         let all_text: String = recent.iter().map(|m| m.content.text_content()).collect();
         assert!(all_text.contains("Jaber"));
         assert!(summary.is_none()); // Only 2 messages, no compaction
+    }
+
+    #[test]
+    fn test_canonical_roundtrip_with_content_blocks() {
+        // Regression test: canonical sessions must round-trip ContentBlock variants
+        // (ToolUse, ToolResult, Thinking) which require named-field MessagePack
+        // serialization for the #[serde(tag = "type")] discriminator to work.
+        let store = setup();
+        let agent_id = AgentId::new();
+
+        let msgs = vec![
+            Message::user("Run the fetch tool"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "I'll fetch that for you.".to_string(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "tu_001".to_string(),
+                        name: "fetch".to_string(),
+                        input: serde_json::json!({"url": "https://example.com"}),
+                        provider_metadata: None,
+                    },
+                ]),
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "tu_001".to_string(),
+                    tool_name: "fetch".to_string(),
+                    content: "OK 200".to_string(),
+                    is_error: false,
+                }]),
+            },
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Thinking {
+                        thinking: "The fetch succeeded.".to_string(),
+                    },
+                    ContentBlock::Text {
+                        text: "Done! Got 200 OK.".to_string(),
+                    },
+                ]),
+            },
+        ];
+
+        store.append_canonical(agent_id, &msgs, None).unwrap();
+
+        // Load back and verify all blocks survived the round-trip
+        let canonical = store.load_canonical(agent_id).unwrap();
+        assert_eq!(canonical.messages.len(), 4);
+
+        // Verify the tool_use block
+        if let MessageContent::Blocks(ref blocks) = canonical.messages[1].content {
+            assert_eq!(blocks.len(), 2);
+            assert!(matches!(&blocks[1], ContentBlock::ToolUse { name, .. } if name == "fetch"));
+        } else {
+            panic!("Expected Blocks content for assistant message with tool_use");
+        }
+
+        // Verify the tool_result block
+        if let MessageContent::Blocks(ref blocks) = canonical.messages[2].content {
+            assert!(
+                matches!(&blocks[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "tu_001")
+            );
+        } else {
+            panic!("Expected Blocks content for user message with tool_result");
+        }
+
+        // Verify the thinking block
+        if let MessageContent::Blocks(ref blocks) = canonical.messages[3].content {
+            assert!(matches!(&blocks[0], ContentBlock::Thinking { .. }));
+        } else {
+            panic!("Expected Blocks content for assistant message with thinking");
+        }
     }
 
     #[test]

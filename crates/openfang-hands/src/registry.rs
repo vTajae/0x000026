@@ -52,6 +52,59 @@ impl HandRegistry {
         }
     }
 
+    /// Persist active hand state to disk so it survives restarts.
+    pub fn persist_state(&self, path: &std::path::Path) -> HandResult<()> {
+        let entries: Vec<serde_json::Value> = self
+            .instances
+            .iter()
+            .filter(|e| e.status == HandStatus::Active)
+            .map(|e| {
+                serde_json::json!({
+                    "hand_id": e.hand_id,
+                    "config": e.config,
+                    "agent_id": e.agent_id,
+                })
+            })
+            .collect();
+        let json = serde_json::to_string_pretty(&entries)
+            .map_err(|e| HandError::Config(format!("serialize hand state: {e}")))?;
+        std::fs::write(path, json)
+            .map_err(|e| HandError::Config(format!("write hand state: {e}")))?;
+        Ok(())
+    }
+
+    /// Load persisted hand state and re-activate hands.
+    /// Returns list of (hand_id, config, old_agent_id) that should be activated.
+    /// The `old_agent_id` is the agent UUID from before the restart, used to
+    /// reassign cron jobs to the newly spawned agent (issue #402).
+    pub fn load_state(
+        path: &std::path::Path,
+    ) -> Vec<(String, HashMap<String, serde_json::Value>, Option<AgentId>)> {
+        let data = match std::fs::read_to_string(path) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        let entries: Vec<serde_json::Value> = match serde_json::from_str(&data) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Failed to parse hand state file: {e}");
+                return Vec::new();
+            }
+        };
+        entries
+            .into_iter()
+            .filter_map(|e| {
+                let hand_id = e["hand_id"].as_str()?.to_string();
+                let config: HashMap<String, serde_json::Value> =
+                    serde_json::from_value(e["config"].clone()).unwrap_or_default();
+                let old_agent_id: Option<AgentId> = e
+                    .get("agent_id")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok());
+                Some((hand_id, config, old_agent_id))
+            })
+            .collect()
+    }
+
     /// Load all bundled hand definitions. Returns count of definitions loaded.
     pub fn load_bundled(&self) -> usize {
         let bundled = bundled::bundled_hands();
@@ -311,8 +364,25 @@ impl Default for HandRegistry {
 fn check_requirement(req: &HandRequirement) -> bool {
     match req.requirement_type {
         RequirementType::Binary => {
-            // Check if binary exists on PATH
-            which_binary(&req.check_value)
+            // Special handling for python3: must actually run the command and verify
+            // the output contains "Python 3", because Windows ships a python3.exe
+            // Store shim that exists on PATH but doesn't actually work.
+            if req.check_value == "python3" {
+                return check_python3_available();
+            }
+            // Check if binary exists on PATH.
+            if which_binary(&req.check_value) {
+                return true;
+            }
+            if req.check_value == "chromium" {
+                // Try common Chromium/Chrome binary names across platforms
+                return which_binary("chromium-browser")
+                    || which_binary("google-chrome")
+                    || which_binary("google-chrome-stable")
+                    || which_binary("chrome")
+                    || std::env::var("CHROME_PATH").map(|v| !v.is_empty()).unwrap_or(false);
+            }
+            false
         }
         RequirementType::EnvVar | RequirementType::ApiKey => {
             // Check if env var is set and non-empty
@@ -320,6 +390,44 @@ fn check_requirement(req: &HandRequirement) -> bool {
                 .map(|v| !v.is_empty())
                 .unwrap_or(false)
         }
+    }
+}
+
+/// Check if Python 3 is actually available by running the command and checking
+/// the version output. This avoids false negatives from Windows Store shims
+/// (python3.exe that just opens the Microsoft Store) and false positives from
+/// Python 2 installations where `python` exists but is Python 2.
+fn check_python3_available() -> bool {
+    // Try "python3 --version" first (Linux/macOS, some Windows installs)
+    if run_returns_python3("python3") {
+        return true;
+    }
+    // Try "python --version" (Windows commonly uses this, Docker containers too)
+    if run_returns_python3("python") {
+        return true;
+    }
+    false
+}
+
+/// Run `{cmd} --version` and return true if the output contains "Python 3".
+fn run_returns_python3(cmd: &str) -> bool {
+    match std::process::Command::new(cmd)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .output()
+    {
+        Ok(output) => {
+            if !output.status.success() {
+                return false;
+            }
+            // Python --version may print to stdout or stderr depending on version
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            stdout.contains("Python 3") || stderr.contains("Python 3")
+        }
+        Err(_) => false,
     }
 }
 
@@ -390,7 +498,7 @@ mod tests {
     fn load_bundled_hands() {
         let reg = HandRegistry::new();
         let count = reg.load_bundled();
-        assert_eq!(count, 9);
+        assert_eq!(count, 10);
         assert!(!reg.list_definitions().is_empty());
 
         // Clip hand should be loaded
