@@ -597,12 +597,14 @@ impl OpenFangKernel {
         // For the API key, try: 1) explicit api_key_env from config, 2) provider_api_keys
         // mapping, 3) auth profiles, 4) convention {PROVIDER}_API_KEY. This ensures
         // custom providers (e.g. nvidia, azure) work without hardcoded env var names.
+        // Resolution uses the credential resolver (vault → dotenv → env var).
         let default_api_key = if !config.default_model.api_key_env.is_empty() {
-            std::env::var(&config.default_model.api_key_env).ok()
+            credential_resolver
+                .resolve(&config.default_model.api_key_env)
+                .map(|z| z.to_string())
         } else {
-            // api_key_env not set — resolve using provider_api_keys / convention
             let env_var = config.resolve_api_key_env(&config.default_model.provider);
-            std::env::var(&env_var).ok()
+            credential_resolver.resolve(&env_var).map(|z| z.to_string())
         };
         let driver_config = DriverConfig {
             provider: config.default_model.provider.clone(),
@@ -630,7 +632,9 @@ impl OpenFangKernel {
                 if let Some((provider, model, env_var)) = drivers::detect_available_provider() {
                     let auto_config = DriverConfig {
                         provider: provider.to_string(),
-                        api_key: std::env::var(env_var).ok(),
+                        api_key: credential_resolver
+                            .resolve(env_var)
+                            .map(|z| z.to_string()),
                         base_url: config.provider_urls.get(provider).cloned(),
                     };
                     match drivers::create_driver(&auto_config) {
@@ -663,11 +667,12 @@ impl OpenFangKernel {
         }
         for fb in &config.fallback_providers {
             let fb_api_key = if !fb.api_key_env.is_empty() {
-                std::env::var(&fb.api_key_env).ok()
+                credential_resolver
+                    .resolve(&fb.api_key_env)
+                    .map(|z| z.to_string())
             } else {
-                // Resolve using provider_api_keys / convention for custom providers
                 let env_var = config.resolve_api_key_env(&fb.provider);
-                std::env::var(&env_var).ok()
+                credential_resolver.resolve(&env_var).map(|z| z.to_string())
             };
             let fb_config = DriverConfig {
                 provider: fb.provider.clone(),
