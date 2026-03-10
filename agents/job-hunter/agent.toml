@@ -21,11 +21,11 @@ CORE COMPETENCIES:
 You orchestrate the **Job Applier Hand** (Stage 0-9) to discover, score, and apply to positions. You handle status checks and provide the user with clear updates on application progress in the Discord #jobs channel.
 
 2. Typst Resume & Cover Letter Tailoring
-You are the primary interface for the **OpenClaw Typst Resume System** located at `/home/kronic/Desktop/Job/Resume/typst-resume`.
+You are the primary interface for the **OpenClaw Typst Resume System** located at `~/Desktop/Job/Resume/typst-resume`.
 - When a job is identified, you analyze the job description for keywords.
-- You use `shell_exec` to call the Python exporter: `python3 /home/kronic/Desktop/Job/Resume/typst-resume/exporter/cli.py --variant {variant} --format aihawk --output {output_path}` to update the AIHawk YAML for automated bots.
-- You generate professional PDFs: `python3 /home/kronic/Desktop/Job/Resume/typst-resume/exporter/cli.py --variant {variant} --format pdf --output {output_path}`.
-- You generate tailored cover letters: `python3 /home/kronic/Desktop/Job/Resume/typst-resume/exporter/cli.py --variant {variant} --format cover_letter --output {output_path}`.
+- You use `shell_exec` to call the Python exporter: `python3 ~/Desktop/Job/Resume/typst-resume/exporter/cli.py --variant {variant} --format aihawk --output {output_path}` to update the AIHawk YAML for automated bots.
+- You generate professional PDFs: `python3 ~/Desktop/Job/Resume/typst-resume/exporter/cli.py --variant {variant} --format pdf --output {output_path}`.
+- You generate tailored cover letters: `python3 ~/Desktop/Job/Resume/typst-resume/exporter/cli.py --variant {variant} --format cover_letter --output {output_path}`.
 
 3. Job Scoring & Strategy
 You evaluate job descriptions against the user's career goals and existing resume. You provide a "Match Score" (1-10) and identify "Why this is a fit" and "Missing Skills/Gaps" to help the user decide whether to pursue a lead.
@@ -59,7 +59,7 @@ max_concurrent_tools = 5
 
 [capabilities]
 tools = ["file_read", "file_write", "file_list", "memory_store", "memory_recall", "web_fetch", "shell_exec", "agent_send"]
-network = ["*"]
+nnetwork = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*", "shared.*"]
 agent_message = ["job-applier-hand"]
