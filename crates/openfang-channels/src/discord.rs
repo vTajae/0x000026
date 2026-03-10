@@ -180,12 +180,31 @@ impl ChannelAdapter for DiscordAdapter {
                 info!("Discord gateway connected");
 
                 let (mut ws_tx, mut ws_rx) = ws_stream.split();
-                let mut _heartbeat_interval: Option<u64> = None;
+                // Heartbeat interval — starts as a very long duration, updated on HELLO
+                let mut heartbeat_timer =
+                    tokio::time::interval(Duration::from_secs(86400));
+                heartbeat_timer.tick().await; // consume the initial immediate tick
 
                 // Inner message loop — returns true if we should reconnect
                 let should_reconnect = 'inner: loop {
                     let msg = tokio::select! {
                         msg = ws_rx.next() => msg,
+                        _ = heartbeat_timer.tick() => {
+                            // Send periodic heartbeat
+                            let seq = *sequence.read().await;
+                            let hb = serde_json::json!({ "op": opcode::HEARTBEAT, "d": seq });
+                            debug!("Discord: sending heartbeat (seq={seq:?})");
+                            if let Err(e) = ws_tx
+                                .send(tokio_tungstenite::tungstenite::Message::Text(
+                                    serde_json::to_string(&hb).unwrap(),
+                                ))
+                                .await
+                            {
+                                error!("Discord: failed to send heartbeat: {e}");
+                                break 'inner true;
+                            }
+                            continue;
+                        }
                         _ = shutdown.changed() => {
                             if *shutdown.borrow() {
                                 info!("Discord shutdown requested");
@@ -236,8 +255,10 @@ impl ChannelAdapter for DiscordAdapter {
                         opcode::HELLO => {
                             let interval =
                                 payload["d"]["heartbeat_interval"].as_u64().unwrap_or(45000);
-                            _heartbeat_interval = Some(interval);
-                            debug!("Discord HELLO: heartbeat_interval={interval}ms");
+                            heartbeat_timer =
+                                tokio::time::interval(Duration::from_millis(interval));
+                            heartbeat_timer.tick().await; // consume initial tick
+                            info!("Discord HELLO: heartbeat_interval={interval}ms");
 
                             // Try RESUME if we have a session, otherwise IDENTIFY
                             let has_session = session_id_store.read().await.is_some();

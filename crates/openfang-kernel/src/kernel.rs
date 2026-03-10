@@ -85,7 +85,7 @@ pub struct OpenFangKernel {
     /// Default LLM driver (from kernel config).
     default_driver: Arc<dyn LlmDriver>,
     /// WASM sandbox engine (shared across all WASM agent executions).
-    wasm_sandbox: WasmSandbox,
+    pub wasm_sandbox: WasmSandbox,
     /// RBAC authentication manager.
     pub auth: AuthManager,
     /// Model catalog registry (RwLock for auth status refresh from API).
@@ -758,7 +758,7 @@ impl OpenFangKernel {
             if let Some(ref provider) = config.memory.embedding_provider {
                 // Explicit config takes priority
                 let api_key_env = config.memory.embedding_api_key_env.as_deref().unwrap_or("");
-                match create_embedding_driver(provider, "text-embedding-3-small", api_key_env) {
+                match create_embedding_driver(provider, "text-embedding-3-small", api_key_env, None) {
                     Ok(d) => {
                         info!(provider = %provider, "Embedding driver configured from memory config");
                         Some(Arc::from(d))
@@ -769,7 +769,7 @@ impl OpenFangKernel {
                     }
                 }
             } else if std::env::var("OPENAI_API_KEY").is_ok() {
-                match create_embedding_driver("openai", "text-embedding-3-small", "OPENAI_API_KEY")
+                match create_embedding_driver("openai", "text-embedding-3-small", "OPENAI_API_KEY", None)
                 {
                     Ok(d) => {
                         info!("Embedding driver auto-detected: OpenAI");
@@ -782,7 +782,7 @@ impl OpenFangKernel {
                 }
             } else {
                 // Try Ollama (local, no key needed)
-                match create_embedding_driver("ollama", "nomic-embed-text", "") {
+                match create_embedding_driver("ollama", "nomic-embed-text", "", None) {
                     Ok(d) => {
                         info!("Embedding driver auto-detected: Ollama (local)");
                         Some(Arc::from(d))
@@ -1712,6 +1712,8 @@ impl OpenFangKernel {
                 Some(&kernel_clone.hooks),
                 ctx_window,
                 Some(&kernel_clone.process_manager),
+                None, // cooldown
+                Some(&kernel_clone.wasm_sandbox),
             )
             .await;
 
@@ -2192,6 +2194,8 @@ impl OpenFangKernel {
             Some(&self.hooks),
             ctx_window,
             Some(&self.process_manager),
+            None, // cooldown
+            Some(&self.wasm_sandbox),
         )
         .await
         .map_err(KernelError::OpenFang)?;
@@ -2716,7 +2720,7 @@ impl OpenFangKernel {
         let driver = self.resolve_driver(&entry.manifest)?;
         let model = entry.manifest.model.model.clone();
 
-        let result = compact_session(driver, &model, &session, &config)
+        let result = compact_session(driver, &model, &session, &config, self.embedding_driver.as_deref())
             .await
             .map_err(|e| KernelError::OpenFang(OpenFangError::Internal(e)))?;
 

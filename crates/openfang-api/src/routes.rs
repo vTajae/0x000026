@@ -5841,6 +5841,7 @@ pub async fn mcp_http(
                 None
             },
             Some(&*state.kernel.process_manager),
+            Some(&state.kernel.wasm_sandbox),
         )
         .await;
 

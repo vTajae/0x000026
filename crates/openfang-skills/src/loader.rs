@@ -29,7 +29,7 @@ pub async fn execute_skill_tool(
             execute_node(skill_dir, &manifest.runtime.entry, tool_name, input).await
         }
         SkillRuntime::Wasm => Err(SkillError::RuntimeNotAvailable(
-            "WASM skill runtime not yet implemented".to_string(),
+            "WASM skills execute through the sandbox engine in the agent runtime".to_string(),
         )),
         SkillRuntime::Builtin => Err(SkillError::RuntimeNotAvailable(
             "Builtin skills are handled by the kernel directly".to_string(),

@@ -5,8 +5,10 @@
 
 use crate::kernel_handle::KernelHandle;
 use crate::mcp;
+use crate::sandbox::WasmSandbox;
 use crate::web_search::{parse_ddg_results, WebToolsContext};
 use openfang_skills::registry::SkillRegistry;
+use openfang_skills::SkillRuntime;
 use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
 use openfang_types::tool::{ToolDefinition, ToolResult};
 use std::collections::HashSet;
@@ -116,6 +118,7 @@ pub async fn execute_tool(
     tts_engine: Option<&crate::tts::TtsEngine>,
     docker_config: Option<&openfang_types::config::DockerSandboxConfig>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
+    wasm_sandbox: Option<&WasmSandbox>,
 ) -> ToolResult {
     // Capability enforcement: reject tools not in the allowed list
     if let Some(allowed) = allowed_tools {
@@ -440,24 +443,39 @@ pub async fn execute_tool(
             else if let Some(registry) = skill_registry {
                 if let Some(skill) = registry.find_tool_provider(other) {
                     debug!(tool = other, skill = %skill.manifest.skill.name, "Dispatching to skill");
-                    match openfang_skills::loader::execute_skill_tool(
-                        &skill.manifest,
-                        &skill.path,
-                        other,
-                        input,
-                    )
-                    .await
-                    {
-                        Ok(skill_result) => {
-                            let content = serde_json::to_string(&skill_result.output)
-                                .unwrap_or_else(|_| skill_result.output.to_string());
-                            if skill_result.is_error {
-                                Err(content)
-                            } else {
-                                Ok(content)
+
+                    // WASM skills execute in the sandbox rather than via subprocess
+                    if skill.manifest.runtime.runtime_type == SkillRuntime::Wasm {
+                        execute_wasm_skill(
+                            &skill.manifest,
+                            &skill.path,
+                            other,
+                            input,
+                            wasm_sandbox,
+                            kernel.cloned(),
+                            caller_agent_id.unwrap_or("unknown"),
+                        )
+                        .await
+                    } else {
+                        match openfang_skills::loader::execute_skill_tool(
+                            &skill.manifest,
+                            &skill.path,
+                            other,
+                            input,
+                        )
+                        .await
+                        {
+                            Ok(skill_result) => {
+                                let content = serde_json::to_string(&skill_result.output)
+                                    .unwrap_or_else(|_| skill_result.output.to_string());
+                                if skill_result.is_error {
+                                    Err(content)
+                                } else {
+                                    Ok(content)
+                                }
                             }
+                            Err(e) => Err(format!("Skill execution failed: {e}")),
                         }
-                        Err(e) => Err(format!("Skill execution failed: {e}")),
                     }
                 } else {
                     Err(format!("Unknown tool: {other}"))
@@ -480,6 +498,105 @@ pub async fn execute_tool(
             is_error: true,
         },
     }
+}
+
+/// Execute a WASM skill in the sandbox.
+///
+/// Reads the `.wasm` or `.wat` file from the skill directory, maps the
+/// skill's declared capabilities into sandbox permissions, and runs the
+/// module with fuel metering and epoch interruption.
+async fn execute_wasm_skill(
+    manifest: &openfang_skills::SkillManifest,
+    skill_dir: &Path,
+    tool_name: &str,
+    input: &serde_json::Value,
+    wasm_sandbox: Option<&WasmSandbox>,
+    kernel: Option<Arc<dyn KernelHandle>>,
+    agent_id: &str,
+) -> Result<String, String> {
+    use crate::sandbox::SandboxConfig;
+    use openfang_types::capability::Capability;
+
+    let sandbox = wasm_sandbox.ok_or_else(|| {
+        "WASM sandbox not available — cannot execute WASM skill".to_string()
+    })?;
+
+    let wasm_path = skill_dir.join(&manifest.runtime.entry);
+    if !wasm_path.exists() {
+        return Err(format!(
+            "WASM module not found: {}",
+            wasm_path.display()
+        ));
+    }
+
+    let wasm_bytes = std::fs::read(&wasm_path).map_err(|e| {
+        format!(
+            "Failed to read WASM module '{}': {e}",
+            wasm_path.display()
+        )
+    })?;
+
+    // Map skill requirements to sandbox capabilities
+    let caps: Vec<Capability> = manifest
+        .requirements
+        .capabilities
+        .iter()
+        .filter_map(|c| {
+            if c.starts_with("FileRead") {
+                Some(Capability::FileRead("*".to_string()))
+            } else if c.starts_with("FileWrite") {
+                Some(Capability::FileWrite("*".to_string()))
+            } else if c.starts_with("NetConnect") {
+                Some(Capability::NetConnect("*".to_string()))
+            } else if c.starts_with("ShellExec") {
+                Some(Capability::ShellExec("*".to_string()))
+            } else if c.starts_with("EnvRead") {
+                Some(Capability::EnvRead("*".to_string()))
+            } else if c.starts_with("MemoryRead") {
+                Some(Capability::MemoryRead("*".to_string()))
+            } else if c.starts_with("MemoryWrite") {
+                Some(Capability::MemoryWrite("*".to_string()))
+            } else if c.starts_with("AgentMessage") {
+                Some(Capability::AgentMessage("*".to_string()))
+            } else if c == "AgentSpawn" {
+                Some(Capability::AgentSpawn)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let config = SandboxConfig {
+        fuel_limit: 10_000_000, // generous default for skills
+        capabilities: caps,
+        timeout_secs: Some(30),
+        ..Default::default()
+    };
+
+    let payload = serde_json::json!({
+        "tool": tool_name,
+        "input": input,
+    });
+
+    debug!(
+        skill = %manifest.skill.name,
+        tool = tool_name,
+        "Executing WASM skill in sandbox"
+    );
+
+    let result = sandbox
+        .execute(&wasm_bytes, payload, config, kernel, agent_id)
+        .await
+        .map_err(|e| format!("WASM skill execution failed: {e}"))?;
+
+    debug!(
+        skill = %manifest.skill.name,
+        fuel_consumed = result.fuel_consumed,
+        "WASM skill execution complete"
+    );
+
+    serde_json::to_string(&result.output)
+        .map_err(|e| format!("Failed to serialize WASM output: {e}"))
 }
 
 /// Get definitions for all built-in tools.
@@ -1233,14 +1350,7 @@ fn resolve_file_path(
         return Ok(PathBuf::from(raw_path));
     }
     if let Some(root) = workspace_root {
-        let allowed = exec_policy
-            .map(|p| p.allowed_paths.as_slice())
-            .unwrap_or(&[]);
-        if allowed.is_empty() {
-            crate::workspace_sandbox::resolve_sandbox_path(raw_path, root)
-        } else {
-            crate::workspace_sandbox::resolve_sandbox_path_with_allowed(raw_path, root, allowed)
-        }
+        crate::workspace_sandbox::resolve_sandbox_path(raw_path, root)
     } else {
         let _ = validate_path(raw_path)?;
         Ok(PathBuf::from(raw_path))
@@ -3251,6 +3361,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // wasm_sandbox
         )
         .await;
         assert!(result.is_error);
@@ -3276,6 +3387,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // wasm_sandbox
         )
         .await;
         assert!(result.is_error);
@@ -3302,6 +3414,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // wasm_sandbox
         )
         .await;
         assert!(result.is_error);
@@ -3328,6 +3441,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // wasm_sandbox
         )
         .await;
         assert!(result.is_error);
@@ -3354,6 +3468,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // wasm_sandbox
         )
         .await;
         // web_search now attempts a real fetch; may succeed or fail depending on network
@@ -3380,6 +3495,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // wasm_sandbox
         )
         .await;
         assert!(result.is_error);
@@ -3406,6 +3522,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // wasm_sandbox
         )
         .await;
         assert!(result.is_error);
@@ -3433,6 +3550,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // wasm_sandbox
         )
         .await;
         assert!(result.is_error);
@@ -3460,6 +3578,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // wasm_sandbox
         )
         .await;
         // Should fail for file-not-found, NOT for permission denied
@@ -3627,6 +3746,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // wasm_sandbox
         )
         .await;
         assert!(result.is_error);
@@ -3672,6 +3792,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // wasm_sandbox
         )
         .await;
         assert!(result.is_error);
