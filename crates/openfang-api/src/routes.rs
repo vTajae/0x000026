@@ -11040,6 +11040,55 @@ pub async fn parse_ears_requirements(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Self-Critique
+// ---------------------------------------------------------------------------
+
+/// POST /api/critique — Evaluate a response against quality criteria.
+#[derive(serde::Deserialize)]
+pub struct CritiqueRequest {
+    pub query: String,
+    pub response: String,
+    #[serde(default)]
+    pub criteria: Option<openfang_runtime::self_critique::CritiqueCriteria>,
+}
+
+pub async fn critique_response(
+    Json(req): Json<CritiqueRequest>,
+) -> impl IntoResponse {
+    let criteria = req.criteria.unwrap_or_default();
+    let critique_prompt = openfang_runtime::self_critique::build_critique_prompt(
+        &req.query,
+        &req.response,
+        &criteria,
+    );
+
+    // Return the critique prompt and criteria for the caller to execute
+    // (the actual LLM call is done by the caller to avoid coupling)
+    Json(serde_json::json!({
+        "critique_prompt": critique_prompt,
+        "criteria": criteria,
+        "should_critique": openfang_runtime::self_critique::should_critique(&req.response, 50),
+    }))
+}
+
+/// POST /api/critique/parse — Parse a critique response from an LLM.
+#[derive(serde::Deserialize)]
+pub struct ParseCritiqueRequest {
+    pub critique_response: String,
+}
+
+pub async fn parse_critique(
+    Json(req): Json<ParseCritiqueRequest>,
+) -> impl IntoResponse {
+    let result = openfang_runtime::self_critique::parse_critique_response(&req.critique_response);
+    Json(serde_json::json!({
+        "passed": result.passed,
+        "evaluations": result.evaluations,
+        "revision": result.revision_prompt,
+    }))
+}
+
 /// Remove a `[section]` and its contents from a TOML string.
 fn remove_toml_section(content: &str, section: &str) -> String {
     let header = format!("[{}]", section);

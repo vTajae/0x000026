@@ -326,6 +326,14 @@ pub async fn build_router(
             "/api/ears/parse",
             axum::routing::post(routes::parse_ears_requirements),
         )
+        .route(
+            "/api/critique",
+            axum::routing::post(routes::critique_response),
+        )
+        .route(
+            "/api/critique/parse",
+            axum::routing::post(routes::parse_critique),
+        )
         // Skills endpoints
         .route("/api/skills", axum::routing::get(routes::list_skills))
         .route(

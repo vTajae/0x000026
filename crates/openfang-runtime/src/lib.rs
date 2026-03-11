@@ -36,6 +36,7 @@ pub mod prompt_builder;
 pub mod provider_health;
 pub mod python_runtime;
 pub mod reply_directives;
+pub mod self_critique;
 pub mod retry;
 pub mod routing;
 pub mod sandbox;
