@@ -462,6 +462,16 @@ pub async fn build_router(
             "/api/approvals/{id}/reject",
             axum::routing::post(routes::reject_request),
         )
+        // Violation tracking endpoints
+        .route(
+            "/api/violations",
+            axum::routing::get(routes::violations_summary),
+        )
+        .route(
+            "/api/agents/{id}/violations",
+            axum::routing::get(routes::agent_violations)
+                .delete(routes::clear_agent_violations),
+        )
         // Vault endpoints
         .route(
             "/api/vault/keys",

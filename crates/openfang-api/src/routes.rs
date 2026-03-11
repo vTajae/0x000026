@@ -9128,6 +9128,55 @@ pub async fn reject_request(
 }
 
 // ---------------------------------------------------------------------------
+// Behavioral Violation Tracking
+// ---------------------------------------------------------------------------
+
+/// GET /api/violations — Violation summary for all agents.
+pub async fn violations_summary(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let summary = state.kernel.violation_tracker.summary_all();
+    let config = state.kernel.violation_tracker.config();
+    Json(serde_json::json!({
+        "agents": summary,
+        "config": {
+            "max_score": config.max_score,
+            "window_secs": config.window_secs,
+            "auto_downgrade": config.auto_downgrade,
+        }
+    }))
+}
+
+/// GET /api/agents/{id}/violations — Violation records for a specific agent.
+pub async fn agent_violations(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let score = state.kernel.violation_tracker.current_score(&id);
+    let records = state.kernel.violation_tracker.recent_records(&id);
+    let should_downgrade = state.kernel.violation_tracker.should_downgrade(&id);
+    Json(serde_json::json!({
+        "agent_id": id,
+        "weighted_score": score,
+        "threshold": state.kernel.violation_tracker.config().max_score,
+        "should_downgrade": should_downgrade,
+        "recent_count": records.len(),
+        "records": records,
+    }))
+}
+
+/// DELETE /api/agents/{id}/violations — Clear violations for an agent.
+pub async fn clear_agent_violations(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    state.kernel.violation_tracker.clear(&id);
+    Json(serde_json::json!({
+        "message": format!("Violations cleared for agent {id}"),
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Credential Vault Management
 // ---------------------------------------------------------------------------
 

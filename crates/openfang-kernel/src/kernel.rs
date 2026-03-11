@@ -159,6 +159,8 @@ pub struct OpenFangKernel {
     self_handle: OnceLock<Weak<OpenFangKernel>>,
     /// Credential resolver — vault + dotenv + env var chain for secret access.
     pub credential_resolver: Arc<openfang_extensions::credentials::CredentialResolver>,
+    /// Behavioral violation tracker — aggregates violations from all guard systems.
+    pub violation_tracker: openfang_runtime::violation_tracker::ViolationTracker,
 }
 
 /// Bounded in-memory delivery receipt tracker.
@@ -1039,6 +1041,7 @@ impl OpenFangKernel {
             agent_msg_locks: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
             credential_resolver,
+            violation_tracker: openfang_runtime::violation_tracker::ViolationTracker::new(),
         };
 
         // Restore persisted agents from SQLite
@@ -1530,6 +1533,17 @@ impl OpenFangKernel {
                 // Record the failure in supervisor for health reporting
                 self.supervisor.record_panic();
                 warn!(agent_id = %agent_id, error = %e, "Agent loop failed — recorded in supervisor");
+
+                // Record violation if it was a loop guard circuit break
+                let err_str = e.to_string();
+                if err_str.contains("circuit breaker") || err_str.contains("Circuit breaker") {
+                    self.violation_tracker.record(
+                        &agent_id.to_string(),
+                        openfang_types::violation::ViolationKind::LoopGuard,
+                        None,
+                        &err_str,
+                    );
+                }
                 Err(e)
             }
         }
@@ -1939,6 +1953,17 @@ impl OpenFangKernel {
                 Err(e) => {
                     kernel_clone.supervisor.record_panic();
                     warn!(agent_id = %agent_id, error = %e, "Streaming agent loop failed");
+
+                    // Record violation if loop guard triggered
+                    let err_str = e.to_string();
+                    if err_str.contains("circuit breaker") || err_str.contains("Circuit breaker") {
+                        kernel_clone.violation_tracker.record(
+                            &agent_id.to_string(),
+                            openfang_types::violation::ViolationKind::LoopGuard,
+                            None,
+                            &err_str,
+                        );
+                    }
                     Err(KernelError::OpenFang(e))
                 }
             }
@@ -5660,6 +5685,21 @@ impl KernelHandle for OpenFangKernel {
                 %request_id, %outcome,
                 "Approval decision for {} / {}",
                 agent_id, tool_name,
+            );
+        }
+
+        // Record violation for denied/timed-out approval requests
+        if decision != ApprovalDecision::Approved {
+            let detail = match decision {
+                ApprovalDecision::Denied => format!("Approval denied for tool '{tool_name}'"),
+                ApprovalDecision::TimedOut => format!("Approval timed out for tool '{tool_name}'"),
+                _ => unreachable!(),
+            };
+            self.violation_tracker.record(
+                agent_id,
+                openfang_types::violation::ViolationKind::ApprovalDenied,
+                Some(tool_name),
+                &detail,
             );
         }
 
