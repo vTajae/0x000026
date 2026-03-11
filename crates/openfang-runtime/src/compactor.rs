@@ -44,6 +44,11 @@ pub struct CompactionConfig {
     pub token_threshold_ratio: f64,
     /// Model context window size in tokens.
     pub context_window_tokens: usize,
+    /// Proactive compaction trigger: compact when estimated tokens exceed this fraction
+    /// of context_window_tokens. This is the "Smart Zone" threshold — compacting early
+    /// preserves response quality before context degradation begins.
+    /// Should be lower than `token_threshold_ratio` (the reactive threshold).
+    pub proactive_threshold_ratio: f64,
     /// Whether to use relevance-weighted splitting (requires embedding driver).
     /// When enabled, old-but-relevant messages are preserved based on semantic
     /// similarity to recent conversation anchors.
@@ -73,6 +78,7 @@ impl CompactionConfig {
                 max_chunk_chars: 20_000,
                 max_retries: 2,
                 token_threshold_ratio: 0.5,
+                proactive_threshold_ratio: 0.3,
                 context_window_tokens: window_tokens,
                 relevance_weighting: false,
                 relevance_keep_extra: 3,
@@ -91,6 +97,7 @@ impl CompactionConfig {
                 max_chunk_chars: 40_000,
                 max_retries: 3,
                 token_threshold_ratio: 0.6,
+                proactive_threshold_ratio: 0.35,
                 context_window_tokens: window_tokens,
                 relevance_weighting: false,
                 relevance_keep_extra: 4,
@@ -119,6 +126,7 @@ impl Default for CompactionConfig {
             max_chunk_chars: 80_000,
             max_retries: 3,
             token_threshold_ratio: 0.7,
+            proactive_threshold_ratio: 0.4,
             context_window_tokens: 200_000,
             relevance_weighting: false,
             relevance_keep_extra: 5,
@@ -191,21 +199,39 @@ pub fn needs_compaction_by_tokens(estimated_tokens: usize, config: &CompactionCo
     estimated_tokens > threshold
 }
 
+/// Check whether estimated tokens exceed the proactive "Smart Zone" threshold.
+///
+/// The Smart Zone (default 40%) triggers compaction early to preserve response quality
+/// before context degradation begins. This is less aggressive than the reactive threshold
+/// (70%) and is intended for mid-loop compaction during long tool-use chains.
+pub fn needs_proactive_compaction(estimated_tokens: usize, config: &CompactionConfig) -> bool {
+    let threshold =
+        (config.context_window_tokens as f64 * config.proactive_threshold_ratio) as usize;
+    estimated_tokens > threshold
+}
+
 // ---------------------------------------------------------------------------
 // Context Report
 // ---------------------------------------------------------------------------
 
 /// Context window pressure level.
+///
+/// The `Proactive` level (40–50%) represents the "Smart Zone" threshold where
+/// automatic compaction should trigger to preserve response quality before
+/// context degradation begins. This follows the ACE methodology from the
+/// AGI architecture blueprint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ContextPressure {
-    /// < 50% usage
+    /// < 40% usage — healthy, no action needed.
     Low,
-    /// 50–70% usage
+    /// 40–50% usage — "Smart Zone" trigger, proactive compaction recommended.
+    Proactive,
+    /// 50–70% usage — context growing, compaction advisable.
     Medium,
-    /// 70–85% usage
+    /// 70–85% usage — context is full, compaction urgent.
     High,
-    /// > 85% usage
+    /// > 85% usage — critical, compaction required immediately.
     Critical,
 }
 
@@ -217,6 +243,8 @@ impl ContextPressure {
             Self::High
         } else if pct > 50.0 {
             Self::Medium
+        } else if pct > 40.0 {
+            Self::Proactive
         } else {
             Self::Low
         }
@@ -226,6 +254,7 @@ impl ContextPressure {
     pub fn color(&self) -> &'static str {
         match self {
             Self::Low => "green",
+            Self::Proactive => "blue",
             Self::Medium => "yellow",
             Self::High => "orange",
             Self::Critical => "red",
@@ -288,6 +317,14 @@ pub fn generate_context_report(
     let pressure = ContextPressure::from_percent(pct);
 
     match pressure {
+        ContextPressure::Proactive => {
+            info!(
+                pct = format!("{pct:.1}"),
+                total_tokens = total,
+                context_window = cw,
+                "Context pressure PROACTIVE — Smart Zone reached, auto-compaction eligible"
+            );
+        }
         ContextPressure::High => {
             warn!(
                 pct = format!("{pct:.1}"),
@@ -309,6 +346,9 @@ pub fn generate_context_report(
 
     let recommendation = match pressure {
         ContextPressure::Low => "Context usage is healthy.".to_string(),
+        ContextPressure::Proactive => {
+            "Smart Zone reached — auto-compaction will trigger to preserve quality.".to_string()
+        }
         ContextPressure::Medium => {
             "Consider using /compact if the conversation grows longer.".to_string()
         }
@@ -1593,8 +1633,20 @@ mod tests {
     }
 
     #[test]
+    fn test_needs_proactive_compaction() {
+        let config = CompactionConfig::default();
+        // 40% of 200_000 = 80_000
+        assert!(!needs_proactive_compaction(70_000, &config));
+        assert!(needs_proactive_compaction(90_000, &config));
+    }
+
+    #[test]
     fn test_context_pressure_from_percent() {
         assert_eq!(ContextPressure::from_percent(30.0), ContextPressure::Low);
+        assert_eq!(
+            ContextPressure::from_percent(45.0),
+            ContextPressure::Proactive
+        );
         assert_eq!(ContextPressure::from_percent(55.0), ContextPressure::Medium);
         assert_eq!(ContextPressure::from_percent(75.0), ContextPressure::High);
         assert_eq!(

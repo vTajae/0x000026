@@ -968,6 +968,84 @@ pub async fn run_agent_loop(
                 if let Err(e) = memory.save_session(session) {
                     warn!("Failed to interim-save session: {e}");
                 }
+
+                // Smart Zone mid-loop compaction: if context has reached 40% saturation
+                // during a long tool-use chain, compact now to preserve response quality.
+                // This prevents the slow quality degradation that occurs when context fills
+                // silently across many iterations without compaction.
+                {
+                    use crate::compactor::{
+                        compact_session, estimate_token_count, needs_proactive_compaction,
+                        CompactionConfig,
+                    };
+                    let compact_config = CompactionConfig::for_context_window(ctx_window);
+                    let estimated = estimate_token_count(&messages, Some(&system_prompt), Some(available_tools));
+                    if needs_proactive_compaction(estimated, &compact_config)
+                        && messages.len() > compact_config.keep_recent + 2
+                    {
+                        info!(
+                            agent = %manifest.name,
+                            iteration,
+                            estimated_tokens = estimated,
+                            threshold_pct = compact_config.proactive_threshold_ratio * 100.0,
+                            messages = messages.len(),
+                            "Smart Zone: mid-loop compaction triggered"
+                        );
+
+                        // Build a temporary session for compaction
+                        let temp_session = Session {
+                            id: session.id,
+                            agent_id: session.agent_id,
+                            messages: messages.clone(),
+                            context_window_tokens: ctx_window as u64,
+                            label: session.label.clone(),
+                        };
+                        match compact_session(
+                            driver.clone(),
+                            &manifest.model.model,
+                            &temp_session,
+                            &compact_config,
+                            embedding_driver,
+                        )
+                        .await
+                        {
+                            Ok(result) => {
+                                let compacted = result.compacted_count;
+                                // Rebuild messages: summary as system context + kept messages
+                                let mut new_messages = Vec::with_capacity(result.kept_messages.len() + 1);
+                                if !result.summary.is_empty() {
+                                    new_messages.push(Message::user(format!(
+                                        "[Context summary of {compacted} earlier messages]\n{}",
+                                        result.summary
+                                    )));
+                                    new_messages.push(Message::assistant(
+                                        "Understood. I have the context from the summary above.",
+                                    ));
+                                }
+                                new_messages.extend(result.kept_messages);
+                                // Validate tool_call/tool_result pairing after rebuild
+                                new_messages = crate::session_repair::validate_and_repair(&new_messages);
+                                messages = new_messages.clone();
+                                session.messages = new_messages;
+
+                                info!(
+                                    agent = %manifest.name,
+                                    compacted_count = compacted,
+                                    remaining = messages.len(),
+                                    chunks = result.chunks_used,
+                                    fallback = result.used_fallback,
+                                    "Smart Zone: mid-loop compaction complete"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    agent = %manifest.name,
+                                    "Smart Zone: mid-loop compaction failed, continuing: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
             }
             StopReason::MaxTokens => {
                 consecutive_max_tokens += 1;

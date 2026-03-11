@@ -89,6 +89,7 @@ function chatPage() {
         case 'critical': return '#ef4444';
         case 'high': return '#f97316';
         case 'medium': return '#eab308';
+        case 'proactive': return '#3b82f6';
         default: return '#22c55e';
       }
     },
