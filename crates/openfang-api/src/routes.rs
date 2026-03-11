@@ -11089,6 +11089,36 @@ pub async fn parse_critique(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Runtime Assertions
+// ---------------------------------------------------------------------------
+
+/// POST /api/assertions/check — Check response against assertions.
+#[derive(serde::Deserialize)]
+pub struct CheckAssertionsRequest {
+    pub assertions: Vec<openfang_runtime::assertions::RuntimeAssertion>,
+    pub response: String,
+    #[serde(default)]
+    pub tool_call_count: usize,
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
+pub async fn check_assertions(
+    Json(req): Json<CheckAssertionsRequest>,
+) -> impl IntoResponse {
+    let result = openfang_runtime::assertions::check_assertions(
+        &req.assertions,
+        &req.response,
+        req.tool_call_count,
+        req.cost_usd,
+    );
+    Json(serde_json::json!({
+        "all_passed": result.all_passed,
+        "results": result.results,
+    }))
+}
+
 /// Remove a `[section]` and its contents from a TOML string.
 fn remove_toml_section(content: &str, section: &str) -> String {
     let header = format!("[{}]", section);

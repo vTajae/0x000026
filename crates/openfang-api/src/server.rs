@@ -334,6 +334,10 @@ pub async fn build_router(
             "/api/critique/parse",
             axum::routing::post(routes::parse_critique),
         )
+        .route(
+            "/api/assertions/check",
+            axum::routing::post(routes::check_assertions),
+        )
         // Skills endpoints
         .route("/api/skills", axum::routing::get(routes::list_skills))
         .route(

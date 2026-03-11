@@ -5,6 +5,7 @@
 
 pub mod a2a;
 pub mod agent_loop;
+pub mod assertions;
 pub mod apply_patch;
 pub mod audit;
 pub mod auth_cooldown;
