@@ -165,6 +165,10 @@
               <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3"/><path d="M1 14h6M9 8h6M17 16h6"/></svg></span>
               <span class="nav-label">Settings</span>
             </a>
+            <a class="nav-item" :class="{ active: page === 'vault' }" @click="navigate('vault')" :aria-current="page === 'vault' ? 'page' : false">
+              <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span>
+              <span class="nav-label">Vault</span>
+            </a>
           </div>
         </template>
       </div>
@@ -4798,6 +4802,81 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             <div class="flex gap-2">
               <button class="btn btn-ghost btn-sm" @click="loadData()">Refresh</button>
             </div>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- Page: Vault -->
+    <template x-if="page === 'vault'">
+      <div x-data="vaultPage" x-init="loadData()">
+        <div class="page-header"><h2>Credential Vault</h2></div>
+        <div class="page-body">
+          <div x-show="loadError" class="error-state">
+            <span class="error-icon">!</span>
+            <p x-text="loadError"></p>
+            <button class="btn btn-ghost btn-sm" @click="loadData()">Retry</button>
+          </div>
+
+          <!-- Vault Status -->
+          <template x-if="vaultStatus">
+            <div class="card mb-4" style="padding:16px">
+              <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                <span class="font-bold">Vault Status</span>
+              </div>
+              <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px">
+                <div><span class="text-dim text-xs">Enabled</span><div class="font-bold" x-text="vaultStatus.enabled ? 'Yes' : 'No'"></div></div>
+                <div><span class="text-dim text-xs">Vault File</span><div class="font-bold" x-text="vaultStatus.exists ? 'Exists' : 'Not created'"></div></div>
+                <div><span class="text-dim text-xs">Configured</span><div class="font-bold" x-text="configuredCount + ' keys'"></div></div>
+                <div><span class="text-dim text-xs">Missing</span><div class="font-bold" style="color:var(--warning)" x-text="missingCount + ' keys'"></div></div>
+              </div>
+              <div class="text-xs text-dim mt-2">Resolution chain: vault &rarr; dotenv &rarr; environment variables</div>
+            </div>
+          </template>
+
+          <!-- Add Credential -->
+          <div class="card mb-4" style="padding:16px">
+            <h4 style="margin-bottom:12px">Add Credential</h4>
+            <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+              <div style="flex:1;min-width:200px">
+                <label class="text-xs text-dim">Key (ENV_VAR_NAME)</label>
+                <input class="form-input" x-model="newKey" placeholder="e.g. OPENAI_API_KEY" style="width:100%;font-family:monospace">
+              </div>
+              <div style="flex:2;min-width:250px">
+                <label class="text-xs text-dim">Value</label>
+                <input class="form-input" type="password" x-model="newValue" placeholder="Secret value" style="width:100%">
+              </div>
+              <button class="btn btn-primary" @click="saveKey()" :disabled="saving || !newKey || !newValue" x-text="saving ? 'Saving...' : 'Save'"></button>
+            </div>
+            <div class="text-xs text-dim mt-2">Credentials are stored in ~/.openfang/.env and immediately available to all adapters.</div>
+          </div>
+
+          <!-- Credential List -->
+          <div class="card" style="padding:16px">
+            <h4 style="margin-bottom:12px">Known Credentials</h4>
+            <template x-if="keys.length === 0">
+              <div class="empty-state" style="padding:24px;text-align:center">
+                <p class="text-dim">No credentials tracked yet.</p>
+              </div>
+            </template>
+            <div style="display:flex;flex-direction:column;gap:4px">
+              <template x-for="k in keys" :key="k.key">
+                <div class="card" style="padding:10px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px" :style="k.available ? '' : 'border-left:3px solid var(--warning)'">
+                  <div style="display:flex;align-items:center;gap:10px;min-width:0;flex:1">
+                    <span class="font-mono font-bold text-sm" x-text="k.key" style="word-break:break-all"></span>
+                    <span class="badge text-xs" :class="k.available ? 'badge-ready' : 'badge-error'" x-text="k.available ? 'configured' : 'missing'"></span>
+                  </div>
+                  <template x-if="k.available">
+                    <button class="btn btn-ghost btn-sm" style="color:var(--error);font-size:11px" @click="deleteKey(k.key)" x-text="deleteConfirm === k.key ? 'Confirm Delete' : 'Delete'"></button>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <div class="flex gap-2 mt-4">
+            <button class="btn btn-ghost btn-sm" @click="loadData()">Refresh</button>
           </div>
         </div>
       </div>

@@ -462,6 +462,23 @@ pub async fn build_router(
             "/api/approvals/{id}/reject",
             axum::routing::post(routes::reject_request),
         )
+        // Vault endpoints
+        .route(
+            "/api/vault/keys",
+            axum::routing::get(routes::vault_list_keys),
+        )
+        .route(
+            "/api/vault/set",
+            axum::routing::post(routes::vault_set_key),
+        )
+        .route(
+            "/api/vault/delete",
+            axum::routing::post(routes::vault_delete_key),
+        )
+        .route(
+            "/api/vault/status",
+            axum::routing::get(routes::vault_status),
+        )
         // Usage endpoints
         .route("/api/usage", axum::routing::get(routes::usage_stats))
         .route(

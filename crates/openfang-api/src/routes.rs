@@ -9128,6 +9128,223 @@ pub async fn reject_request(
 }
 
 // ---------------------------------------------------------------------------
+// Credential Vault Management
+// ---------------------------------------------------------------------------
+
+/// GET /api/vault/status — Check vault status (locked/unlocked, key count).
+pub async fn vault_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let vault_info = {
+        let config = &state.kernel.config;
+        let vault_path = config
+            .vault
+            .path
+            .clone()
+            .unwrap_or_else(|| config.home_dir.join("vault.enc"));
+        let exists = vault_path.exists();
+        let enabled = config.vault.enabled;
+        serde_json::json!({
+            "enabled": enabled,
+            "exists": exists,
+            "path": vault_path.display().to_string(),
+            "source_chain": ["vault", "dotenv", "env"],
+        })
+    };
+    Json(vault_info)
+}
+
+/// GET /api/vault/keys — List credential keys (names only, never values).
+pub async fn vault_list_keys(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // List known credential keys from dotenv + env pattern scanning
+    // The vault itself stores keys we can enumerate, but for security
+    // we also merge with well-known env var patterns
+    let config = &state.kernel.config;
+    let mut keys: Vec<serde_json::Value> = Vec::new();
+
+    // Known credential env vars from channel configs + LLM providers
+    let well_known = [
+        "GROQ_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GOOGLE_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "OPENROUTER_API_KEY",
+        "DISCORD_BOT_TOKEN",
+        "SLACK_BOT_TOKEN",
+        "TELEGRAM_BOT_TOKEN",
+        "GITHUB_TOKEN",
+    ];
+
+    for key in &well_known {
+        let has = state.kernel.credential_resolver.has_credential(key);
+        keys.push(serde_json::json!({
+            "key": key,
+            "available": has,
+            "source": if has { "configured" } else { "missing" },
+        }));
+    }
+
+    // Also check the default_model api_key_env
+    if !config.default_model.api_key_env.is_empty() {
+        let key = &config.default_model.api_key_env;
+        if !well_known.contains(&key.as_str()) {
+            let has = state.kernel.credential_resolver.has_credential(key);
+            keys.push(serde_json::json!({
+                "key": key,
+                "available": has,
+                "source": if has { "configured" } else { "missing" },
+            }));
+        }
+    }
+
+    Json(serde_json::json!({"keys": keys, "total": keys.len()}))
+}
+
+/// POST /api/vault/set — Store a credential (in dotenv file as fallback).
+///
+/// Body: `{ "key": "ENV_VAR_NAME", "value": "secret_value" }`
+///
+/// Security: Values are stored in `~/.openfang/.env` (dotenv fallback).
+/// The encrypted vault requires CLI initialization; this endpoint provides
+/// a web-accessible way to persist credentials without vault setup.
+pub async fn vault_set_key(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let key = match body.get("key").and_then(|v| v.as_str()) {
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing or empty 'key' field"})),
+            );
+        }
+    };
+    let value = match body.get("value").and_then(|v| v.as_str()) {
+        Some(v) => v.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing 'value' field"})),
+            );
+        }
+    };
+
+    // Validate key: alphanumeric + underscore only
+    if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Key must be alphanumeric with underscores only"})),
+        );
+    }
+
+    // Write to dotenv file (~/.openfang/.env)
+    let dotenv_path = state.kernel.config.home_dir.join(".env");
+    match append_or_update_dotenv(&dotenv_path, &key, &value) {
+        Ok(()) => {
+            // Also set in current process env so it's immediately available
+            std::env::set_var(&key, &value);
+            tracing::info!(key = %key, "Credential stored via dashboard");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "ok", "key": key, "stored_in": "dotenv"})),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to write dotenv: {e}")})),
+        ),
+    }
+}
+
+/// POST /api/vault/delete — Remove a credential from dotenv.
+///
+/// Body: `{ "key": "ENV_VAR_NAME" }`
+pub async fn vault_delete_key(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let key = match body.get("key").and_then(|v| v.as_str()) {
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing or empty 'key' field"})),
+            );
+        }
+    };
+
+    let dotenv_path = state.kernel.config.home_dir.join(".env");
+    match remove_from_dotenv(&dotenv_path, &key) {
+        Ok(removed) => {
+            if removed {
+                std::env::remove_var(&key);
+                tracing::info!(key = %key, "Credential removed via dashboard");
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "ok", "key": key, "removed": removed})),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to update dotenv: {e}")})),
+        ),
+    }
+}
+
+/// Append or update a key=value in a dotenv file.
+fn append_or_update_dotenv(
+    path: &std::path::Path,
+    key: &str,
+    value: &str,
+) -> Result<(), std::io::Error> {
+    let content = if path.exists() {
+        std::fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    let prefix = format!("{}=", key);
+    let mut found = false;
+    for line in &mut lines {
+        if line.starts_with(&prefix) {
+            *line = format!("{}={}", key, value);
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        lines.push(format!("{}={}", key, value));
+    }
+
+    // Ensure parent directory exists
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, lines.join("\n") + "\n")
+}
+
+/// Remove a key from a dotenv file. Returns true if the key was found.
+fn remove_from_dotenv(path: &std::path::Path, key: &str) -> Result<bool, std::io::Error> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(path)?;
+    let prefix = format!("{}=", key);
+    let original_len = content.lines().count();
+    let lines: Vec<&str> = content
+        .lines()
+        .filter(|line| !line.starts_with(&prefix))
+        .collect();
+    let removed = lines.len() < original_len;
+    if removed {
+        std::fs::write(path, lines.join("\n") + "\n")?;
+    }
+    Ok(removed)
+}
+
+// ---------------------------------------------------------------------------
 // Config Reload endpoint
 // ---------------------------------------------------------------------------
 
