@@ -328,3 +328,160 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Property-Based Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Invariant: Any Message with text content survives JSON roundtrip.
+        #[test]
+        fn message_text_json_roundtrip(
+            role_idx in 0u8..3,
+            text in "[ -~]{0,200}",
+        ) {
+            let role = match role_idx {
+                0 => Role::User,
+                1 => Role::Assistant,
+                _ => Role::System,
+            };
+            let msg = Message {
+                role,
+                content: MessageContent::Text(text.clone()),
+            };
+            let json = serde_json::to_string(&msg).unwrap();
+            let back: Message = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(back.role, role);
+            match back.content {
+                MessageContent::Text(ref t) => prop_assert_eq!(t, &text),
+                _ => prop_assert!(false, "Expected Text content"),
+            }
+        }
+
+        /// Invariant: ContentBlock::Text serde roundtrip preserves text.
+        #[test]
+        fn text_block_roundtrip(text in "[ -~]{0,500}") {
+            let block = ContentBlock::Text { text: text.clone() };
+            let json = serde_json::to_string(&block).unwrap();
+            let back: ContentBlock = serde_json::from_str(&json).unwrap();
+            match back {
+                ContentBlock::Text { text: t } => prop_assert_eq!(t, text),
+                _ => prop_assert!(false, "Expected Text block"),
+            }
+        }
+
+        /// Invariant: ContentBlock::ToolUse serde roundtrip preserves all fields.
+        #[test]
+        fn tool_use_block_roundtrip(
+            id in "[a-z0-9_]{1,20}",
+            name in "[a-z_]{1,20}",
+            val in proptest::num::i64::ANY,
+        ) {
+            let input = serde_json::json!({"value": val});
+            let block = ContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+                provider_metadata: None,
+            };
+            let json = serde_json::to_string(&block).unwrap();
+            let back: ContentBlock = serde_json::from_str(&json).unwrap();
+            match back {
+                ContentBlock::ToolUse { id: i, name: n, input: inp, .. } => {
+                    prop_assert_eq!(i, id);
+                    prop_assert_eq!(n, name);
+                    prop_assert_eq!(inp, input);
+                }
+                _ => prop_assert!(false, "Expected ToolUse block"),
+            }
+        }
+
+        /// Invariant: ContentBlock::ToolResult serde roundtrip preserves all fields.
+        #[test]
+        fn tool_result_block_roundtrip(
+            tool_use_id in "[a-z0-9_]{1,20}",
+            tool_name in "[a-z_]{1,20}",
+            content in "[ -~]{0,200}",
+            is_error in proptest::bool::ANY,
+        ) {
+            let block = ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                tool_name: tool_name.clone(),
+                content: content.clone(),
+                is_error,
+            };
+            let json = serde_json::to_string(&block).unwrap();
+            let back: ContentBlock = serde_json::from_str(&json).unwrap();
+            match back {
+                ContentBlock::ToolResult { tool_use_id: tu, tool_name: tn, content: c, is_error: ie } => {
+                    prop_assert_eq!(tu, tool_use_id);
+                    prop_assert_eq!(tn, tool_name);
+                    prop_assert_eq!(c, content);
+                    prop_assert_eq!(ie, is_error);
+                }
+                _ => prop_assert!(false, "Expected ToolResult block"),
+            }
+        }
+
+        /// Invariant: text_length() always equals the sum of text in blocks.
+        #[test]
+        fn text_length_is_sum_of_parts(
+            n_text_blocks in 0..5usize,
+            text_len in 0..50usize,
+            n_tool_blocks in 0..3usize,
+        ) {
+            let mut blocks = Vec::new();
+            let text = "x".repeat(text_len);
+            for _ in 0..n_text_blocks {
+                blocks.push(ContentBlock::Text { text: text.clone() });
+            }
+            for i in 0..n_tool_blocks {
+                blocks.push(ContentBlock::ToolUse {
+                    id: format!("tu_{}", i),
+                    name: "test".into(),
+                    input: serde_json::json!({}),
+                    provider_metadata: None,
+                });
+            }
+            let content = MessageContent::Blocks(blocks);
+            let expected = n_text_blocks * text_len;
+            prop_assert_eq!(content.text_length(), expected);
+        }
+
+        /// Invariant: MessagePack named roundtrip preserves messages.
+        #[test]
+        fn message_msgpack_named_roundtrip(text in "[ -~]{0,100}") {
+            let msg = Message::user(text.clone());
+            let bytes = rmp_serde::to_vec_named(&msg).unwrap();
+            let back: Message = rmp_serde::from_slice(&bytes).unwrap();
+            prop_assert_eq!(back.role, Role::User);
+            match back.content {
+                MessageContent::Text(ref t) => prop_assert_eq!(t, &text),
+                _ => prop_assert!(false, "Expected Text content after msgpack roundtrip"),
+            }
+        }
+
+        /// Invariant: Unrecognized block types always deserialize as Unknown.
+        #[test]
+        fn unknown_blocks_are_forward_compatible(type_name in "[a-z]{5,15}_block") {
+            let json = serde_json::json!({"type": type_name});
+            let block: ContentBlock = serde_json::from_value(json).unwrap();
+            prop_assert!(matches!(block, ContentBlock::Unknown));
+        }
+
+        /// Invariant: TokenUsage.total() is always input + output.
+        #[test]
+        fn token_usage_total_is_sum(input in 0u64..1_000_000, output in 0u64..1_000_000) {
+            let usage = TokenUsage {
+                input_tokens: input,
+                output_tokens: output,
+            };
+            prop_assert_eq!(usage.total(), input + output);
+        }
+    }
+}

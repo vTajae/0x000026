@@ -737,3 +737,165 @@ mod tests {
         assert!(back.contains("hooks.example.com"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Property-Based Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Strategy: generate valid tool names (alphanumeric + underscore, 1..=64 chars).
+    fn valid_tool_name() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9_]{1,64}".prop_map(|s| s)
+    }
+
+    /// Strategy: generate valid timeout values.
+    fn valid_timeout() -> impl Strategy<Value = u64> {
+        MIN_TIMEOUT_SECS..=MAX_TIMEOUT_SECS
+    }
+
+    proptest! {
+        /// Invariant: Any ApprovalRequest with valid fields always passes validation.
+        #[test]
+        fn valid_request_always_validates(
+            tool_name in valid_tool_name(),
+            desc_len in 0..=MAX_DESCRIPTION_LEN,
+            summary_len in 0..=MAX_ACTION_SUMMARY_LEN,
+            timeout in valid_timeout(),
+        ) {
+            let req = ApprovalRequest {
+                id: Uuid::new_v4(),
+                agent_id: "agent-pbt".into(),
+                tool_name,
+                description: "x".repeat(desc_len),
+                action_summary: "x".repeat(summary_len),
+                risk_level: RiskLevel::Medium,
+                requested_at: Utc::now(),
+                timeout_secs: timeout,
+            };
+            prop_assert!(req.validate().is_ok());
+        }
+
+        /// Invariant: Any timeout outside [10, 300] always fails validation.
+        #[test]
+        fn invalid_timeout_always_fails(timeout in prop::num::u64::ANY) {
+            prop_assume!(!(MIN_TIMEOUT_SECS..=MAX_TIMEOUT_SECS).contains(&timeout));
+            let req = ApprovalRequest {
+                id: Uuid::new_v4(),
+                agent_id: "agent-pbt".into(),
+                tool_name: "test_tool".into(),
+                description: String::new(),
+                action_summary: String::new(),
+                risk_level: RiskLevel::Low,
+                requested_at: Utc::now(),
+                timeout_secs: timeout,
+            };
+            prop_assert!(req.validate().is_err());
+
+            // Same for policy
+            let policy = ApprovalPolicy {
+                timeout_secs: timeout,
+                ..ApprovalPolicy::default()
+            };
+            prop_assert!(policy.validate().is_err());
+        }
+
+        /// Invariant: tool names with ASCII punctuation chars always fail.
+        #[test]
+        fn invalid_tool_name_chars_always_fail(
+            prefix in "[a-zA-Z]{1,5}",
+            bad_char in "[!@#$%^&*()\\-+=\\[\\]{}<>|;:',./? ]{1}",
+            suffix in "[a-zA-Z]{0,5}",
+        ) {
+            let tool_name = format!("{}{}{}", prefix, bad_char, suffix);
+            let req = ApprovalRequest {
+                id: Uuid::new_v4(),
+                agent_id: "agent-pbt".into(),
+                tool_name,
+                description: String::new(),
+                action_summary: String::new(),
+                risk_level: RiskLevel::Low,
+                requested_at: Utc::now(),
+                timeout_secs: 60,
+            };
+            prop_assert!(req.validate().is_err());
+        }
+
+        /// Invariant: ApprovalPolicy JSON roundtrip preserves all fields.
+        #[test]
+        fn policy_json_roundtrip_preserves_all_fields(
+            n_tools in 0..5usize,
+            timeout in valid_timeout(),
+            auto_approve_auto in proptest::bool::ANY,
+            auto_approve in proptest::bool::ANY,
+        ) {
+            let tools: Vec<String> = (0..n_tools)
+                .map(|i| format!("tool_{}", i))
+                .collect();
+            let policy = ApprovalPolicy {
+                require_approval: tools.clone(),
+                timeout_secs: timeout,
+                auto_approve_autonomous: auto_approve_auto,
+                auto_approve,
+                notify_channel: None,
+                notify_recipient: None,
+                notify_webhook: None,
+            };
+            let json = serde_json::to_string(&policy).unwrap();
+            let back: ApprovalPolicy = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(back.require_approval, tools);
+            prop_assert_eq!(back.timeout_secs, timeout);
+            prop_assert_eq!(back.auto_approve_autonomous, auto_approve_auto);
+            prop_assert_eq!(back.auto_approve, auto_approve);
+        }
+
+        /// Invariant: RiskLevel serde roundtrip is identity for all variants.
+        #[test]
+        fn risk_level_roundtrip(variant in 0u8..4) {
+            let level = match variant {
+                0 => RiskLevel::Low,
+                1 => RiskLevel::Medium,
+                2 => RiskLevel::High,
+                _ => RiskLevel::Critical,
+            };
+            let json = serde_json::to_string(&level).unwrap();
+            let back: RiskLevel = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(level, back);
+        }
+
+        /// Invariant: ApprovalDecision serde roundtrip is identity.
+        #[test]
+        fn decision_roundtrip(variant in 0u8..3) {
+            let decision = match variant {
+                0 => ApprovalDecision::Approved,
+                1 => ApprovalDecision::Denied,
+                _ => ApprovalDecision::TimedOut,
+            };
+            let json = serde_json::to_string(&decision).unwrap();
+            let back: ApprovalDecision = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(decision, back);
+        }
+
+        /// Invariant: auto_approve shorthand always clears the require list.
+        #[test]
+        fn auto_approve_always_clears_list(n_tools in 1..10usize) {
+            let tools: Vec<String> = (0..n_tools)
+                .map(|i| format!("tool_{}", i))
+                .collect();
+            let mut policy = ApprovalPolicy {
+                require_approval: tools,
+                timeout_secs: 60,
+                auto_approve_autonomous: false,
+                auto_approve: true,
+                notify_channel: None,
+                notify_recipient: None,
+                notify_webhook: None,
+            };
+            policy.apply_shorthands();
+            prop_assert!(policy.require_approval.is_empty());
+        }
+    }
+}

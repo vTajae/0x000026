@@ -314,3 +314,158 @@ mod tests {
         assert!(validate_capability_inheritance(&parent, &child).is_err());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Property-Based Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Strategy: generate arbitrary non-empty strings for patterns.
+    fn pattern_str() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9._/-]{1,50}"
+    }
+
+    proptest! {
+        /// Invariant: Wildcard "*" always matches any value.
+        #[test]
+        fn wildcard_always_matches(value in pattern_str()) {
+            prop_assert!(glob_matches("*", &value));
+        }
+
+        /// Invariant: Exact match is reflexive — any string matches itself.
+        #[test]
+        fn exact_match_is_reflexive(value in pattern_str()) {
+            prop_assert!(glob_matches(&value, &value));
+        }
+
+        /// Invariant: ToolAll always grants any ToolInvoke.
+        #[test]
+        fn tool_all_grants_any_tool_invoke(tool_id in pattern_str()) {
+            prop_assert!(capability_matches(
+                &Capability::ToolAll,
+                &Capability::ToolInvoke(tool_id),
+            ));
+        }
+
+        /// Invariant: Different capability variants never match (type safety).
+        #[test]
+        fn cross_variant_never_matches(
+            read_pat in pattern_str(),
+            write_pat in pattern_str(),
+        ) {
+            // FileRead should never grant FileWrite
+            prop_assert!(!capability_matches(
+                &Capability::FileRead(read_pat.clone()),
+                &Capability::FileWrite(write_pat.clone()),
+            ));
+            // NetConnect should never grant ShellExec
+            prop_assert!(!capability_matches(
+                &Capability::NetConnect(read_pat.clone()),
+                &Capability::ShellExec(write_pat.clone()),
+            ));
+            // MemoryRead should never grant MemoryWrite
+            prop_assert!(!capability_matches(
+                &Capability::MemoryRead(read_pat),
+                &Capability::MemoryWrite(write_pat),
+            ));
+        }
+
+        /// Invariant: LlmMaxTokens(N) always grants LlmMaxTokens(M) when N >= M.
+        #[test]
+        fn token_budget_monotonic(granted in 0u64..1_000_000, delta in 0u64..1_000_000) {
+            let required = granted.saturating_sub(delta);
+            prop_assert!(capability_matches(
+                &Capability::LlmMaxTokens(granted),
+                &Capability::LlmMaxTokens(required),
+            ));
+        }
+
+        /// Invariant: LlmMaxTokens(N) never grants LlmMaxTokens(M) when N < M.
+        #[test]
+        fn token_budget_never_exceeds(granted in 0u64..999_999) {
+            let required = granted + 1;
+            prop_assert!(!capability_matches(
+                &Capability::LlmMaxTokens(granted),
+                &Capability::LlmMaxTokens(required),
+            ));
+        }
+
+        /// Invariant: EconSpend(N) grants EconSpend(M) iff N >= M.
+        #[test]
+        fn econ_spend_monotonic(granted in 0.0f64..1_000_000.0, delta in 0.0f64..1_000_000.0) {
+            let required = (granted - delta).max(0.0);
+            prop_assert!(capability_matches(
+                &Capability::EconSpend(granted),
+                &Capability::EconSpend(required),
+            ));
+        }
+
+        /// Invariant: Prefix glob "foo*" matches anything starting with "foo".
+        #[test]
+        fn prefix_glob_matches_prefixed_values(
+            prefix in "[a-z]{1,10}",
+            suffix in "[a-z]{0,20}",
+        ) {
+            let pattern = format!("{}*", prefix);
+            let value = format!("{}{}", prefix, suffix);
+            prop_assert!(glob_matches(&pattern, &value));
+        }
+
+        /// Invariant: Suffix glob "*bar" matches anything ending with "bar".
+        #[test]
+        fn suffix_glob_matches_suffixed_values(
+            prefix in "[a-z]{0,20}",
+            suffix in "[a-z]{1,10}",
+        ) {
+            let pattern = format!("*{}", suffix);
+            let value = format!("{}{}", prefix, suffix);
+            prop_assert!(glob_matches(&pattern, &value));
+        }
+
+        /// Invariant: Child capabilities that are a subset of parent always pass
+        /// inheritance validation.
+        #[test]
+        fn subset_always_passes_inheritance(
+            n_parent in 1..5usize,
+            n_child in 0..3usize,
+        ) {
+            // Parent has N tools, child picks a subset
+            let parent_tools: Vec<String> = (0..n_parent)
+                .map(|i| format!("tool_{}", i))
+                .collect();
+            let parent_caps: Vec<Capability> = parent_tools.iter()
+                .map(|t| Capability::ToolInvoke(t.clone()))
+                .collect();
+            let child_count = n_child.min(n_parent);
+            let child_caps: Vec<Capability> = parent_tools[..child_count].iter()
+                .map(|t| Capability::ToolInvoke(t.clone()))
+                .collect();
+            prop_assert!(validate_capability_inheritance(&parent_caps, &child_caps).is_ok());
+        }
+
+        /// Invariant: Capability serde roundtrip is identity.
+        #[test]
+        fn capability_serde_roundtrip(value in pattern_str()) {
+            let caps = vec![
+                Capability::FileRead(value.clone()),
+                Capability::FileWrite(value.clone()),
+                Capability::NetConnect(value.clone()),
+                Capability::ToolInvoke(value.clone()),
+                Capability::ShellExec(value.clone()),
+                Capability::ToolAll,
+                Capability::AgentSpawn,
+                Capability::LlmMaxTokens(42),
+                Capability::EconSpend(3.50),
+            ];
+            for cap in caps {
+                let json = serde_json::to_string(&cap).unwrap();
+                let back: Capability = serde_json::from_str(&json).unwrap();
+                prop_assert_eq!(cap, back);
+            }
+        }
+    }
+}

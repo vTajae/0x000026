@@ -948,3 +948,187 @@ mod tests {
         assert_eq!(stats.unique_calls, 50);
     }
 }
+
+// ===========================================================================
+// Property-Based Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Invariant: The first call with any unique params is ALWAYS Allow.
+        #[test]
+        fn first_unique_call_always_allowed(
+            tool_name in "[a-z_]{1,20}",
+            param_val in proptest::num::i64::ANY,
+        ) {
+            let mut guard = LoopGuard::new(LoopGuardConfig::default());
+            let params = serde_json::json!({"v": param_val});
+            let verdict = guard.check(&tool_name, &params);
+            prop_assert_eq!(verdict, LoopGuardVerdict::Allow);
+        }
+
+        /// Invariant: total_calls in stats always equals the number of check() calls.
+        #[test]
+        fn total_calls_equals_check_count(n_calls in 1u32..25) {
+            let config = LoopGuardConfig {
+                global_circuit_breaker: 100,
+                ..Default::default()
+            };
+            let mut guard = LoopGuard::new(config);
+            for i in 0..n_calls {
+                let params = serde_json::json!({"i": i});
+                guard.check("tool", &params);
+            }
+            let stats = guard.stats();
+            prop_assert_eq!(stats.total_calls, n_calls);
+        }
+
+        /// Invariant: unique_calls <= total_calls (pigeonhole).
+        #[test]
+        fn unique_calls_le_total(
+            n_unique in 1u32..10,
+            repeats in 1u32..5,
+        ) {
+            let config = LoopGuardConfig {
+                global_circuit_breaker: 200,
+                warn_threshold: 100,
+                block_threshold: 200,
+                ..Default::default()
+            };
+            let mut guard = LoopGuard::new(config);
+            for u in 0..n_unique {
+                for _ in 0..repeats {
+                    let params = serde_json::json!({"u": u});
+                    guard.check("tool", &params);
+                }
+            }
+            let stats = guard.stats();
+            prop_assert!(stats.unique_calls <= stats.total_calls);
+            prop_assert_eq!(stats.unique_calls, n_unique);
+        }
+
+        /// Invariant: Exceeding global_circuit_breaker always triggers CircuitBreak.
+        #[test]
+        fn circuit_breaker_always_triggers(threshold in 5u32..30) {
+            let config = LoopGuardConfig {
+                global_circuit_breaker: threshold,
+                warn_threshold: 200,
+                block_threshold: 200,
+                ..Default::default()
+            };
+            let mut guard = LoopGuard::new(config);
+
+            // Make exactly threshold unique calls (all allowed)
+            for i in 0..threshold {
+                let params = serde_json::json!({"i": i});
+                guard.check("tool", &params);
+            }
+
+            // The (threshold + 1)th call must circuit-break
+            let params = serde_json::json!({"overflow": true});
+            let verdict = guard.check("tool", &params);
+            prop_assert!(
+                matches!(verdict, LoopGuardVerdict::CircuitBreak(_)),
+                "Expected CircuitBreak after {} calls, got {:?}",
+                threshold + 1,
+                verdict,
+            );
+        }
+
+        /// Invariant: Repeating the same call N times where N >= block_threshold
+        /// always results in Block (for non-poll tools).
+        #[test]
+        fn repeated_calls_eventually_block(
+            block_threshold in 3u32..10,
+            warn_threshold in 1u32..3,
+        ) {
+            prop_assume!(warn_threshold < block_threshold);
+            let config = LoopGuardConfig {
+                warn_threshold,
+                block_threshold,
+                global_circuit_breaker: 200,
+                poll_multiplier: 1,
+                max_warnings_per_call: 100,
+                ..Default::default()
+            };
+            let mut guard = LoopGuard::new(config);
+            let params = serde_json::json!({"same": true});
+
+            let mut saw_block = false;
+            for _ in 0..block_threshold {
+                let verdict = guard.check("non_poll_tool", &params);
+                if matches!(verdict, LoopGuardVerdict::Block(_)) {
+                    saw_block = true;
+                    break;
+                }
+            }
+            prop_assert!(saw_block, "Expected Block after {} identical calls", block_threshold);
+        }
+
+        /// Invariant: blocked_calls in stats is always <= total_calls.
+        #[test]
+        fn blocked_le_total(n_calls in 1u32..20) {
+            let config = LoopGuardConfig {
+                warn_threshold: 2,
+                block_threshold: 3,
+                global_circuit_breaker: 100,
+                ..Default::default()
+            };
+            let mut guard = LoopGuard::new(config);
+            let params = serde_json::json!({"x": 1});
+            for _ in 0..n_calls {
+                guard.check("tool", &params);
+            }
+            let stats = guard.stats();
+            prop_assert!(stats.blocked_calls <= stats.total_calls);
+        }
+
+        /// Invariant: SHA-256 hash is deterministic — same inputs always produce
+        /// the same hash.
+        #[test]
+        fn hash_is_deterministic(
+            tool_name in "[a-z]{1,20}",
+            val in proptest::num::i64::ANY,
+        ) {
+            let params = serde_json::json!({"val": val});
+            let h1 = LoopGuard::compute_hash(&tool_name, &params);
+            let h2 = LoopGuard::compute_hash(&tool_name, &params);
+            prop_assert_eq!(h1, h2);
+        }
+
+        /// Invariant: Different tool names produce different hashes
+        /// (collision resistance — probabilistic but extremely unlikely for short inputs).
+        #[test]
+        fn different_tools_different_hashes(
+            tool_a in "[a-z]{1,10}",
+            tool_b in "[a-z]{1,10}",
+        ) {
+            prop_assume!(tool_a != tool_b);
+            let params = serde_json::json!({});
+            let h1 = LoopGuard::compute_hash(&tool_a, &params);
+            let h2 = LoopGuard::compute_hash(&tool_b, &params);
+            prop_assert_ne!(h1, h2);
+        }
+
+        /// Invariant: history ring buffer never exceeds HISTORY_SIZE.
+        #[test]
+        fn history_bounded(n_calls in 1u32..100) {
+            let config = LoopGuardConfig {
+                global_circuit_breaker: 200,
+                warn_threshold: 200,
+                block_threshold: 200,
+                ..Default::default()
+            };
+            let mut guard = LoopGuard::new(config);
+            for i in 0..n_calls {
+                let params = serde_json::json!({"i": i});
+                guard.check("tool", &params);
+            }
+            prop_assert!(guard.recent_calls.len() <= HISTORY_SIZE);
+        }
+    }
+}
