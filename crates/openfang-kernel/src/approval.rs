@@ -182,6 +182,9 @@ mod tests {
             timeout_secs: 30,
             auto_approve_autonomous: false,
             auto_approve: false,
+            notify_channel: None,
+            notify_recipient: None,
+            notify_webhook: None,
         };
         let mgr = ApprovalManager::new(policy);
         assert!(mgr.requires_approval("file_write"));
@@ -260,6 +263,9 @@ mod tests {
             timeout_secs: 120,
             auto_approve_autonomous: true,
             auto_approve: false,
+            notify_channel: None,
+            notify_recipient: None,
+            notify_webhook: None,
         };
         mgr.update_policy(new_policy);
 

@@ -21,3 +21,4 @@ rand = { workspace = true }
 
 [dev-dependencies]
 rmp-serde = { workspace = true }
+proptest.workspace = true

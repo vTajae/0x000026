@@ -4868,6 +4868,116 @@ impl OpenFangKernel {
         }
         context_parts.join("\n\n")
     }
+
+    /// Send CIBA-style push notification for an approval request via channel or webhook.
+    async fn send_approval_notification(
+        &self,
+        policy: &openfang_types::approval::ApprovalPolicy,
+        req: &openfang_types::approval::ApprovalRequest,
+    ) {
+        let api_base = format!("http://{}", self.config.api_listen);
+
+        let msg = format!(
+            "{} **Approval Required**\n\
+             Agent: `{}`\n\
+             Tool: `{}`\n\
+             Risk: {:?}\n\
+             Action: {}\n\
+             Timeout: {}s\n\
+             Approve: {}/api/approvals/{}/approve\n\
+             Reject: {}/api/approvals/{}/reject\n\
+             Dashboard: {}/#approvals",
+            req.risk_level.emoji(),
+            req.agent_id,
+            req.tool_name,
+            req.risk_level,
+            req.action_summary,
+            req.timeout_secs,
+            api_base, req.id,
+            api_base, req.id,
+            api_base,
+        );
+
+        // Push to configured channel (Discord, Slack, etc.)
+        if let (Some(channel), Some(recipient)) =
+            (&policy.notify_channel, &policy.notify_recipient)
+        {
+            if let Some(adapter_ref) = self.channel_adapters.get(channel.as_str()) {
+                let adapter: Arc<dyn openfang_channels::types::ChannelAdapter> =
+                    adapter_ref.value().clone();
+                drop(adapter_ref);
+                let user = openfang_channels::types::ChannelUser {
+                    platform_id: recipient.clone(),
+                    display_name: "operator".to_string(),
+                    openfang_user: None,
+                };
+                if let Err(e) = adapter
+                    .send(
+                        &user,
+                        openfang_channels::types::ChannelContent::Text(msg.clone()),
+                    )
+                    .await
+                {
+                    warn!(
+                        channel, recipient,
+                        "Failed to send approval notification: {e}"
+                    );
+                } else {
+                    info!(
+                        channel, recipient, request_id = %req.id,
+                        "Approval push notification sent"
+                    );
+                }
+            } else {
+                warn!(
+                    channel,
+                    "Approval notify_channel not found in channel adapters"
+                );
+            }
+        }
+
+        // CIBA webhook: POST JSON payload to external endpoint
+        if let Some(webhook_url) = &policy.notify_webhook {
+            let payload = serde_json::json!({
+                "type": "approval_request",
+                "request_id": req.id.to_string(),
+                "agent_id": req.agent_id,
+                "tool_name": req.tool_name,
+                "risk_level": req.risk_level,
+                "action_summary": req.action_summary,
+                "timeout_secs": req.timeout_secs,
+                "requested_at": req.requested_at.to_rfc3339(),
+                "approve_url": format!("{}/api/approvals/{}/approve", api_base, req.id),
+                "reject_url": format!("{}/api/approvals/{}/reject", api_base, req.id),
+            });
+
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default();
+
+            match client.post(webhook_url).json(&payload).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    info!(
+                        %webhook_url, request_id = %req.id,
+                        "CIBA webhook notification sent"
+                    );
+                }
+                Ok(resp) => {
+                    warn!(
+                        %webhook_url, status = %resp.status(),
+                        "CIBA webhook returned non-success"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        %webhook_url,
+                        "CIBA webhook notification failed: {e}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Convert a manifest's capability declarations into Capability enums.
@@ -5533,7 +5643,26 @@ impl KernelHandle for OpenFangKernel {
             timeout_secs: policy.timeout_secs,
         };
 
+        // CIBA-style push notification: alert operator via channel or webhook
+        let request_id = req.id;
+        self.send_approval_notification(&policy, &req).await;
+
         let decision = self.approval_manager.request_approval(req).await;
+
+        // Notify the outcome if we notified the request
+        if policy.notify_channel.is_some() || policy.notify_webhook.is_some() {
+            let outcome = match decision {
+                ApprovalDecision::Approved => "APPROVED",
+                ApprovalDecision::Denied => "DENIED",
+                ApprovalDecision::TimedOut => "TIMED OUT",
+            };
+            info!(
+                %request_id, %outcome,
+                "Approval decision for {} / {}",
+                agent_id, tool_name,
+            );
+        }
+
         Ok(decision == ApprovalDecision::Approved)
     }
 

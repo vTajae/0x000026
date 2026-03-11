@@ -180,6 +180,17 @@ pub struct ApprovalPolicy {
     /// Alias: if `auto_approve = true`, clears the require list at boot.
     #[serde(default, alias = "auto_approve")]
     pub auto_approve: bool,
+    /// Channel to send push notifications when approval is required.
+    /// e.g. "discord", "slack", "telegram". If empty, no push notification.
+    #[serde(default)]
+    pub notify_channel: Option<String>,
+    /// Recipient (channel/user ID) for push notifications.
+    #[serde(default)]
+    pub notify_recipient: Option<String>,
+    /// Webhook URL for CIBA-style backchannel notifications.
+    /// If set, POSTs a JSON payload with approval details to this URL.
+    #[serde(default)]
+    pub notify_webhook: Option<String>,
 }
 
 impl Default for ApprovalPolicy {
@@ -189,6 +200,9 @@ impl Default for ApprovalPolicy {
             timeout_secs: 60,
             auto_approve_autonomous: false,
             auto_approve: false,
+            notify_channel: None,
+            notify_recipient: None,
+            notify_webhook: None,
         }
     }
 }
@@ -689,11 +703,37 @@ mod tests {
             timeout_secs: 120,
             auto_approve_autonomous: true,
             auto_approve: false,
+            notify_channel: Some("discord".into()),
+            notify_recipient: Some("1234567890".into()),
+            notify_webhook: None,
         };
         let json = serde_json::to_string(&policy).unwrap();
         let back: ApprovalPolicy = serde_json::from_str(&json).unwrap();
         assert_eq!(back.require_approval, policy.require_approval);
         assert_eq!(back.timeout_secs, 120);
         assert!(back.auto_approve_autonomous);
+        assert_eq!(back.notify_channel, Some("discord".into()));
+        assert_eq!(back.notify_recipient, Some("1234567890".into()));
+        assert_eq!(back.notify_webhook, None);
+    }
+
+    #[test]
+    fn policy_notify_fields_default_to_none() {
+        let policy: ApprovalPolicy = serde_json::from_str("{}").unwrap();
+        assert!(policy.notify_channel.is_none());
+        assert!(policy.notify_recipient.is_none());
+        assert!(policy.notify_webhook.is_none());
+    }
+
+    #[test]
+    fn policy_notify_webhook_roundtrip() {
+        let json = r#"{"notify_webhook": "https://hooks.example.com/approval"}"#;
+        let policy: ApprovalPolicy = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            policy.notify_webhook,
+            Some("https://hooks.example.com/approval".into())
+        );
+        let back = serde_json::to_string(&policy).unwrap();
+        assert!(back.contains("hooks.example.com"));
     }
 }
