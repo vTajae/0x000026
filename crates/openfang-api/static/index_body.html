@@ -3723,6 +3723,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             <div class="tab" :class="{ active: tab === 'by-model' }" @click="tab = 'by-model'">By Model</div>
             <div class="tab" :class="{ active: tab === 'by-agent' }" @click="tab = 'by-agent'">By Agent</div>
             <div class="tab" :class="{ active: tab === 'costs' }" @click="tab = 'costs'">Costs</div>
+            <div class="tab" :class="{ active: tab === 'safety' }" @click="tab = 'safety'">Safety <span x-show="totalViolations() > 0" class="badge badge-warn" style="font-size:9px;padding:1px 6px;margin-left:4px" x-text="totalViolations()"></span></div>
           </div>
           <div x-show="tab === 'summary'">
             <div class="card mt-4">
@@ -3932,6 +3933,50 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             </div>
 
           </div>
+
+          <!-- Safety Tab -->
+          <div x-show="tab === 'safety'">
+            <div class="stats-row mt-4">
+              <div class="stat-card">
+                <div class="stat-label">Total Violations</div>
+                <div class="stat-value" x-text="totalViolations()"></div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">Agents at Risk</div>
+                <div class="stat-value" :style="'color:' + (agentsAtRisk() > 0 ? '#ef4444' : '#22c55e')" x-text="agentsAtRisk()"></div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">Score Threshold</div>
+                <div class="stat-value" x-text="violationConfig.max_score || 50"></div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">Window</div>
+                <div class="stat-value" x-text="violationConfig.window_secs ? Math.round(violationConfig.window_secs / 60) + 'm' : '60m'"></div>
+              </div>
+            </div>
+
+            <div class="card mt-4">
+              <div class="card-header">Agent Violation Scores</div>
+              <div x-show="violations.length === 0" class="text-sm text-dim" style="padding:20px;text-align:center">No violations recorded. All agents operating within safety bounds.</div>
+              <template x-for="v in violations" :key="v.agent_id">
+                <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px">
+                  <div style="flex:1;min-width:0">
+                    <div class="font-bold text-sm" x-text="v.agent_id" style="font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
+                    <div class="text-xs text-dim" x-text="v.recent_violations + ' recent / ' + v.total_violations + ' total'"></div>
+                  </div>
+                  <div style="width:120px;flex-shrink:0">
+                    <div style="height:8px;background:var(--surface2);border-radius:4px;overflow:hidden">
+                      <div :style="'height:100%;border-radius:4px;background:' + violationScoreColor(v.weighted_score, v.threshold) + ';width:' + violationScoreWidth(v.weighted_score, v.threshold)"></div>
+                    </div>
+                    <div class="text-xs text-dim" style="margin-top:2px" x-text="v.weighted_score + ' / ' + v.threshold"></div>
+                  </div>
+                  <span x-show="v.should_downgrade" class="badge badge-error" style="font-size:9px">DOWNGRADE</span>
+                  <button class="btn btn-ghost btn-sm" style="font-size:10px;padding:2px 8px" @click="clearViolations(v.agent_id)">Clear</button>
+                </div>
+              </template>
+            </div>
+          </div>
+
           </div>
         </div>
       </div>

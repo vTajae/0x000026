@@ -16,6 +16,10 @@ function analyticsPage() {
     todayCost: 0,
     firstEventDate: null,
 
+    // Safety tab state
+    violations: [],
+    violationConfig: {},
+
     // Chart colors for providers (stable palette)
     _chartColors: [
       '#FF5C00', '#3B82F6', '#10B981', '#F59E0B', '#8B5CF6',
@@ -31,7 +35,8 @@ function analyticsPage() {
           this.loadSummary(),
           this.loadByModel(),
           this.loadByAgent(),
-          this.loadDailyCosts()
+          this.loadDailyCosts(),
+          this.loadViolations()
         ]);
       } catch(e) {
         this.loadError = e.message || 'Could not load usage data.';
@@ -74,6 +79,51 @@ function analyticsPage() {
         this.dailyCosts = [];
         this.todayCost = 0;
         this.firstEventDate = null;
+      }
+    },
+
+    async loadViolations() {
+      try {
+        var data = await OpenFangAPI.get('/api/violations');
+        this.violations = data.agents || [];
+        this.violationConfig = data.config || {};
+      } catch(e) {
+        this.violations = [];
+        this.violationConfig = {};
+      }
+    },
+
+    totalViolations() {
+      var total = 0;
+      this.violations.forEach(function(v) { total += (v.recent_violations || 0); });
+      return total;
+    },
+
+    agentsAtRisk() {
+      return this.violations.filter(function(v) { return v.should_downgrade; }).length;
+    },
+
+    violationScoreColor(score, threshold) {
+      if (!threshold) threshold = 50;
+      var pct = score / threshold;
+      if (pct >= 1.0) return '#ef4444';
+      if (pct >= 0.7) return '#f97316';
+      if (pct >= 0.4) return '#eab308';
+      return '#22c55e';
+    },
+
+    violationScoreWidth(score, threshold) {
+      if (!threshold) threshold = 50;
+      return Math.min(100, Math.round((score / threshold) * 100)) + '%';
+    },
+
+    async clearViolations(agentId) {
+      try {
+        await OpenFangAPI.del('/api/agents/' + agentId + '/violations');
+        OpenFangToast.success('Violations cleared');
+        await this.loadViolations();
+      } catch(e) {
+        OpenFangToast.error('Failed to clear: ' + e.message);
       }
     },
 
