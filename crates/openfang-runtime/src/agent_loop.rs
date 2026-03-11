@@ -905,6 +905,13 @@ pub async fn run_agent_loop(
                     // Dynamic truncation based on context budget (replaces flat MAX_TOOL_RESULT_CHARS)
                     let content = truncate_tool_result_dynamic(&result.content, &context_budget);
 
+                    // Error compaction — preserve diagnostic value, reduce token bloat
+                    let content = if result.is_error {
+                        crate::error_compaction::compact_tool_error(&content, 600)
+                    } else {
+                        content
+                    };
+
                     // Append warning if verdict was Warn
                     let final_content = if let LoopGuardVerdict::Warn(ref warn_msg) = verdict {
                         format!("{content}\n\n[LOOP GUARD] {warn_msg}")

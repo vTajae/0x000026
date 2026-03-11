@@ -17,6 +17,7 @@ pub mod context_budget;
 pub mod context_overflow;
 pub mod docker_sandbox;
 pub mod drivers;
+pub mod error_compaction;
 pub mod embedding;
 pub mod graceful_shutdown;
 pub mod hooks;
