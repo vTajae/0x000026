@@ -1484,6 +1484,30 @@ impl OpenFangKernel {
             .check_quota(agent_id)
             .map_err(KernelError::OpenFang)?;
 
+        // Violation auto-downgrade: if agent exceeded safety threshold,
+        // demote from Full → Assist mode to restrict tool access.
+        if self.violation_tracker.should_downgrade(&agent_id.to_string()) {
+            if let Some(current_mode) = self.registry.get(agent_id).map(|e| e.mode) {
+                if current_mode == AgentMode::Full {
+                    let _ = self.registry.set_mode(agent_id, AgentMode::Assist);
+                    warn!(
+                        agent_id = %agent_id,
+                        score = self.violation_tracker.current_score(&agent_id.to_string()),
+                        "Auto-downgraded agent from Full → Assist due to violation threshold"
+                    );
+                    self.audit_log.record(
+                        agent_id.to_string(),
+                        openfang_runtime::audit::AuditAction::AgentMessage,
+                        "violation auto-downgrade",
+                        format!(
+                            "Agent downgraded to Assist mode (violation score: {})",
+                            self.violation_tracker.current_score(&agent_id.to_string())
+                        ),
+                    );
+                }
+            }
+        }
+
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
