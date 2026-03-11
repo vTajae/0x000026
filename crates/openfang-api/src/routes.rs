@@ -8,7 +8,7 @@ use axum::Json;
 use dashmap::DashMap;
 use openfang_kernel::triggers::{TriggerId, TriggerPattern};
 use openfang_kernel::workflow::{
-    ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowStep,
+    ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowStep, WorkflowTemplates,
 };
 use openfang_kernel::OpenFangKernel;
 use openfang_types::memory::Memory as MemoryTrait;
@@ -10916,6 +10916,128 @@ pub async fn comms_task(
             Json(serde_json::json!({"error": format!("Failed to post task: {e}")})),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Workflow Templates
+// ---------------------------------------------------------------------------
+
+/// List available workflow templates.
+pub async fn workflow_templates() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "templates": [
+            {
+                "id": "rpi",
+                "name": "Research-Plan-Implement",
+                "description": "Four-phase workflow: research context, plan approach, implement solution, validate result.",
+                "required_roles": ["researcher", "planner", "implementer"],
+                "steps": ["Research", "Plan", "Implement", "Validate"]
+            },
+            {
+                "id": "code-review",
+                "name": "Code Review",
+                "description": "Three-phase code review: review findings, apply fixes, verify resolution.",
+                "required_roles": ["reviewer", "implementer"],
+                "steps": ["Review", "Fix", "Verify"]
+            },
+            {
+                "id": "deep-research",
+                "name": "Deep Research",
+                "description": "Iterative research: search, synthesize, self-critique until thorough.",
+                "required_roles": ["researcher"],
+                "steps": ["Initial-Search", "Synthesize", "Critique-And-Deepen"]
+            }
+        ]
+    }))
+}
+
+/// Instantiate a workflow from a template.
+#[derive(serde::Deserialize)]
+pub struct InstantiateTemplateRequest {
+    pub template_id: String,
+    pub agents: HashMap<String, String>,
+}
+
+pub async fn instantiate_workflow_template(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<InstantiateTemplateRequest>,
+) -> impl IntoResponse {
+    let workflow = match req.template_id.as_str() {
+        "rpi" => {
+            let researcher = req.agents.get("researcher").map(|s| s.as_str()).unwrap_or("researcher");
+            let planner = req.agents.get("planner").map(|s| s.as_str()).unwrap_or("planner");
+            let implementer = req.agents.get("implementer").map(|s| s.as_str()).unwrap_or("coder");
+            WorkflowTemplates::rpi(researcher, planner, implementer)
+        }
+        "code-review" => {
+            let reviewer = req.agents.get("reviewer").map(|s| s.as_str()).unwrap_or("reviewer");
+            let implementer = req.agents.get("implementer").map(|s| s.as_str()).unwrap_or("coder");
+            WorkflowTemplates::code_review(reviewer, implementer)
+        }
+        "deep-research" => {
+            let researcher = req.agents.get("researcher").map(|s| s.as_str()).unwrap_or("researcher");
+            WorkflowTemplates::deep_research(researcher)
+        }
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Unknown template: {other}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let wf_id = state.kernel.workflows.register(workflow).await;
+    Json(serde_json::json!({
+        "ok": true,
+        "workflow_id": wf_id.to_string(),
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// EARS Requirements
+// ---------------------------------------------------------------------------
+
+/// Parse EARS requirement text into structured form.
+#[derive(serde::Deserialize)]
+pub struct ParseEarsRequest {
+    pub requirements: Vec<EarsInput>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct EarsInput {
+    pub id: String,
+    pub text: String,
+    #[serde(default)]
+    pub priority: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+pub async fn parse_ears_requirements(
+    Json(req): Json<ParseEarsRequest>,
+) -> impl IntoResponse {
+    let mut spec = openfang_types::ears::EarsSpec::new("Parsed Requirements");
+    for input in &req.requirements {
+        let r = spec.add(&input.id, &input.text);
+        if let Some(ref p) = input.priority {
+            r.priority = match p.to_lowercase().as_str() {
+                "critical" => openfang_types::ears::RequirementPriority::Critical,
+                "high" => openfang_types::ears::RequirementPriority::High,
+                "medium" => openfang_types::ears::RequirementPriority::Medium,
+                "low" => openfang_types::ears::RequirementPriority::Low,
+                _ => openfang_types::ears::RequirementPriority::High,
+            };
+        }
+        r.tags = input.tags.clone();
+    }
+
+    Json(serde_json::json!({
+        "spec": spec,
+        "markdown": spec.to_prompt_markdown(),
+        "count": spec.requirements.len(),
+    }))
 }
 
 /// Remove a `[section]` and its contents from a TOML string.

@@ -55,6 +55,10 @@ pub struct PromptContext {
     pub peer_agents: Vec<(String, String, String)>,
     /// Current date/time string for temporal awareness.
     pub current_date: Option<String>,
+    /// STEERING.md content (architectural constraints and directives).
+    pub steering_md: Option<String>,
+    /// REQUIREMENTS.md content (EARS requirements spec).
+    pub requirements_md: Option<String>,
 }
 
 /// Build the complete system prompt from a `PromptContext`.
@@ -151,6 +155,30 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     // Section 9.5 — Peer Agent Awareness (skip for subagents)
     if !ctx.is_subagent && !ctx.peer_agents.is_empty() {
         sections.push(build_peer_agents_section(&ctx.agent_name, &ctx.peer_agents));
+    }
+
+    // Section 9.7 — Steering Documents (skip for subagents)
+    if !ctx.is_subagent {
+        if let Some(ref steering) = ctx.steering_md {
+            if !steering.trim().is_empty() {
+                sections.push(format!(
+                    "## Steering Directives\nThese are architectural constraints you MUST follow:\n{}",
+                    cap_str(steering, 3000)
+                ));
+            }
+        }
+    }
+
+    // Section 9.8 — EARS Requirements (skip for subagents)
+    if !ctx.is_subagent {
+        if let Some(ref reqs) = ctx.requirements_md {
+            if !reqs.trim().is_empty() {
+                sections.push(format!(
+                    "## Requirements\n{}",
+                    cap_str(reqs, 2000)
+                ));
+            }
+        }
     }
 
     // Section 10 — Safety & Oversight (skip for subagents)
@@ -904,6 +932,45 @@ mod tests {
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Workspace"));
         assert!(prompt.contains("/home/user/project"));
+    }
+
+    #[test]
+    fn test_steering_md_injected() {
+        let mut ctx = basic_ctx();
+        ctx.steering_md = Some("Never modify production databases directly.".to_string());
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("## Steering Directives"));
+        assert!(prompt.contains("Never modify production databases"));
+    }
+
+    #[test]
+    fn test_requirements_md_injected() {
+        let mut ctx = basic_ctx();
+        ctx.requirements_md = Some("- REQ-001: The system shall log all actions.".to_string());
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("## Requirements"));
+        assert!(prompt.contains("REQ-001"));
+    }
+
+    #[test]
+    fn test_steering_omitted_for_subagents() {
+        let mut ctx = basic_ctx();
+        ctx.is_subagent = true;
+        ctx.steering_md = Some("Important directive".to_string());
+        ctx.requirements_md = Some("REQ-001".to_string());
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("## Steering"));
+        assert!(!prompt.contains("## Requirements"));
+    }
+
+    #[test]
+    fn test_steering_before_safety() {
+        let mut ctx = basic_ctx();
+        ctx.steering_md = Some("Directive here".to_string());
+        let prompt = build_system_prompt(&ctx);
+        let steering_pos = prompt.find("## Steering Directives").unwrap();
+        let safety_pos = prompt.find("## Safety").unwrap();
+        assert!(steering_pos < safety_pos);
     }
 
     #[test]

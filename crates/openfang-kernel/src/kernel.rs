@@ -1807,6 +1807,14 @@ impl OpenFangKernel {
                 },
                 peer_agents,
                 current_date: Some(chrono::Local::now().format("%A, %B %d, %Y (%Y-%m-%d %H:%M %Z)").to_string()),
+                steering_md: manifest
+                    .workspace
+                    .as_ref()
+                    .and_then(|w| read_identity_file(w, "STEERING.md")),
+                requirements_md: manifest
+                    .workspace
+                    .as_ref()
+                    .and_then(|w| read_identity_file(w, "REQUIREMENTS.md")),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -2291,6 +2299,14 @@ impl OpenFangKernel {
                 },
                 peer_agents,
                 current_date: Some(chrono::Local::now().format("%A, %B %d, %Y (%Y-%m-%d %H:%M %Z)").to_string()),
+                steering_md: manifest
+                    .workspace
+                    .as_ref()
+                    .and_then(|w| read_identity_file(w, "STEERING.md")),
+                requirements_md: manifest
+                    .workspace
+                    .as_ref()
+                    .and_then(|w| read_identity_file(w, "REQUIREMENTS.md")),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);

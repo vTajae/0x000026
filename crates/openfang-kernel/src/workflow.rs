@@ -785,6 +785,176 @@ impl Default for WorkflowEngine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Workflow Templates — pre-built multi-agent pipeline patterns
+// ---------------------------------------------------------------------------
+
+/// Pre-built workflow templates for common agent pipeline patterns.
+///
+/// These templates follow the blueprint's methodology patterns:
+/// - **RPI**: Research → Plan → Implement → Validate
+/// - **Code Review**: Review → Fix → Verify
+/// - **Deep Research**: Search → Synthesize → Critique → Refine
+pub struct WorkflowTemplates;
+
+impl WorkflowTemplates {
+    /// Research-Plan-Implement (RPI) workflow.
+    ///
+    /// Four-step pipeline: a research agent gathers context, a planner
+    /// designs the approach, an implementer executes, then the planner
+    /// validates the result against the original requirements.
+    pub fn rpi(
+        researcher_name: &str,
+        planner_name: &str,
+        implementer_name: &str,
+    ) -> Workflow {
+        Workflow {
+            id: WorkflowId::new(),
+            name: "Research-Plan-Implement".to_string(),
+            description: "Four-phase workflow: research context, plan approach, implement solution, validate result.".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    name: "Research".to_string(),
+                    agent: StepAgent::ByName { name: researcher_name.to_string() },
+                    prompt_template: "Research the following task thoroughly. Gather all relevant context, \
+                        prior art, and constraints. Summarize your findings clearly.\n\nTask: {{input}}".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 300,
+                    error_mode: ErrorMode::Fail,
+                    output_var: Some("research".to_string()),
+                },
+                WorkflowStep {
+                    name: "Plan".to_string(),
+                    agent: StepAgent::ByName { name: planner_name.to_string() },
+                    prompt_template: "Based on this research, create a detailed implementation plan. \
+                        List specific steps, files to modify, and acceptance criteria.\n\n\
+                        Original task: {{input}}\n\nResearch findings:\n{{research}}".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 180,
+                    error_mode: ErrorMode::Fail,
+                    output_var: Some("plan".to_string()),
+                },
+                WorkflowStep {
+                    name: "Implement".to_string(),
+                    agent: StepAgent::ByName { name: implementer_name.to_string() },
+                    prompt_template: "Execute this implementation plan. Make all necessary code changes \
+                        and verify they work.\n\nPlan:\n{{plan}}".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 600,
+                    error_mode: ErrorMode::Fail,
+                    output_var: Some("implementation".to_string()),
+                },
+                WorkflowStep {
+                    name: "Validate".to_string(),
+                    agent: StepAgent::ByName { name: planner_name.to_string() },
+                    prompt_template: "Review the implementation against the original plan and task. \
+                        Verify all acceptance criteria are met. Report any gaps.\n\n\
+                        Original task: {{input}}\nPlan: {{plan}}\n\nImplementation result:\n{{implementation}}".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 180,
+                    error_mode: ErrorMode::Skip,
+                    output_var: None,
+                },
+            ],
+            created_at: Utc::now(),
+        }
+    }
+
+    /// Code review workflow — review, fix, verify cycle.
+    pub fn code_review(
+        reviewer_name: &str,
+        implementer_name: &str,
+    ) -> Workflow {
+        Workflow {
+            id: WorkflowId::new(),
+            name: "Code-Review".to_string(),
+            description: "Three-phase code review: review findings, apply fixes, verify resolution.".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    name: "Review".to_string(),
+                    agent: StepAgent::ByName { name: reviewer_name.to_string() },
+                    prompt_template: "Review the following code or changes for bugs, security issues, \
+                        and quality problems. List each finding with severity.\n\n{{input}}".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 300,
+                    error_mode: ErrorMode::Fail,
+                    output_var: Some("review".to_string()),
+                },
+                WorkflowStep {
+                    name: "Fix".to_string(),
+                    agent: StepAgent::ByName { name: implementer_name.to_string() },
+                    prompt_template: "Apply fixes for each review finding below. Only fix the issues \
+                        identified — don't refactor unrelated code.\n\nReview findings:\n{{review}}".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 600,
+                    error_mode: ErrorMode::Fail,
+                    output_var: Some("fixes".to_string()),
+                },
+                WorkflowStep {
+                    name: "Verify".to_string(),
+                    agent: StepAgent::ByName { name: reviewer_name.to_string() },
+                    prompt_template: "Verify that all review findings have been addressed. \
+                        Confirm each fix resolves its finding.\n\n\
+                        Original review:\n{{review}}\n\nFixes applied:\n{{fixes}}".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 180,
+                    error_mode: ErrorMode::Skip,
+                    output_var: None,
+                },
+            ],
+            created_at: Utc::now(),
+        }
+    }
+
+    /// Deep research workflow — iterative search-synthesize-critique cycle.
+    pub fn deep_research(researcher_name: &str) -> Workflow {
+        Workflow {
+            id: WorkflowId::new(),
+            name: "Deep-Research".to_string(),
+            description: "Iterative research: search, synthesize, self-critique until thorough.".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    name: "Initial-Search".to_string(),
+                    agent: StepAgent::ByName { name: researcher_name.to_string() },
+                    prompt_template: "Search broadly for information about: {{input}}\n\n\
+                        Use web_search and web_fetch to gather data from multiple sources. \
+                        Document all sources with URLs.".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 300,
+                    error_mode: ErrorMode::Fail,
+                    output_var: Some("raw_research".to_string()),
+                },
+                WorkflowStep {
+                    name: "Synthesize".to_string(),
+                    agent: StepAgent::ByName { name: researcher_name.to_string() },
+                    prompt_template: "Synthesize these research findings into a coherent analysis. \
+                        Identify patterns, contradictions, and gaps in the data.\n\n\
+                        Raw research:\n{{raw_research}}".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 180,
+                    error_mode: ErrorMode::Fail,
+                    output_var: Some("synthesis".to_string()),
+                },
+                WorkflowStep {
+                    name: "Critique-And-Deepen".to_string(),
+                    agent: StepAgent::ByName { name: researcher_name.to_string() },
+                    prompt_template: "Critique your own synthesis. What claims are weakly supported? \
+                        What perspectives are missing? Search for additional evidence to fill gaps.\n\n\
+                        Current synthesis:\n{{synthesis}}\n\nOriginal question: {{input}}".to_string(),
+                    mode: StepMode::Loop {
+                        max_iterations: 2,
+                        until: "RESEARCH COMPLETE".to_string(),
+                    },
+                    timeout_secs: 300,
+                    error_mode: ErrorMode::Skip,
+                    output_var: Some("final_research".to_string()),
+                },
+            ],
+            created_at: Utc::now(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1315,6 +1485,25 @@ mod tests {
         assert!(output.contains("Done: Task A"));
         assert!(output.contains("Done: Task B"));
         assert!(output.contains("---"));
+    }
+
+    #[tokio::test]
+    async fn test_rpi_template() {
+        let wf = WorkflowTemplates::rpi("researcher", "planner", "coder");
+        assert_eq!(wf.name, "Research-Plan-Implement");
+        assert_eq!(wf.steps.len(), 4); // research, plan, implement, validate
+        assert_eq!(wf.steps[0].name, "Research");
+        assert_eq!(wf.steps[1].name, "Plan");
+        assert_eq!(wf.steps[2].name, "Implement");
+        assert_eq!(wf.steps[3].name, "Validate");
+        assert!(wf.steps[0].prompt_template.contains("{{input}}"));
+        assert!(wf.steps[2].prompt_template.contains("{{plan}}"));
+    }
+
+    #[tokio::test]
+    async fn test_review_template() {
+        let wf = WorkflowTemplates::code_review("reviewer", "coder");
+        assert_eq!(wf.steps.len(), 3);
     }
 
     #[tokio::test]
