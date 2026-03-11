@@ -346,6 +346,16 @@ pub async fn build_router(
             "/api/agents/{id}/assertions/cache",
             axum::routing::delete(routes::clear_agent_assertion_cache),
         )
+        // Reflection & meta-cognition endpoints
+        .route("/api/reflection/config", axum::routing::get(routes::reflection_config))
+        .route("/api/reflection/analyze", axum::routing::post(routes::reflection_analyze))
+        .route("/api/reflection/parse", axum::routing::post(routes::reflection_parse))
+        // Curriculum learning endpoints
+        .route("/api/curriculum/tiers", axum::routing::get(routes::curriculum_tiers))
+        .route("/api/curriculum/tool-tier", axum::routing::post(routes::curriculum_tool_tier))
+        .route("/api/curriculum/gate", axum::routing::post(routes::curriculum_gate))
+        // Scratch pad endpoints
+        .route("/api/scratch-pad/parse", axum::routing::post(routes::scratch_pad_parse))
         // Skills endpoints
         .route("/api/skills", axum::routing::get(routes::list_skills))
         .route(

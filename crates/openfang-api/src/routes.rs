@@ -11175,6 +11175,149 @@ pub async fn check_assertions(
     }))
 }
 
+// ── Reflection & Meta-Cognition ──────────────────────────────────────
+
+/// GET /api/reflection/config — get reflection config defaults.
+pub async fn reflection_config() -> impl IntoResponse {
+    let config = openfang_runtime::reflection::ReflectionConfig::default();
+    Json(serde_json::json!(config))
+}
+
+/// POST /api/reflection/analyze — analyze a turn for reflection insights.
+pub async fn reflection_analyze(
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let user_message = req.get("user_message").and_then(|v| v.as_str()).unwrap_or("");
+    let agent_response = req.get("agent_response").and_then(|v| v.as_str()).unwrap_or("");
+    let tool_call_count = req.get("tool_call_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let cost_usd = req.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let tools_used: Vec<String> = req
+        .get("tools_used")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let had_errors = req.get("had_errors").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let ctx = openfang_runtime::reflection::ReflectionPrompt {
+        user_message: user_message.to_string(),
+        agent_response: agent_response.to_string(),
+        tool_call_count,
+        tools_used,
+        had_errors,
+        cost_usd,
+    };
+
+    let prompt = openfang_runtime::reflection::build_reflection_prompt(&ctx);
+    let category = openfang_runtime::reflection::categorize_task(user_message);
+
+    Json(serde_json::json!({
+        "reflection_prompt": prompt,
+        "task_category": category,
+        "should_reflect": tool_call_count >= 3 || agent_response.len() >= 500,
+    }))
+}
+
+/// POST /api/reflection/parse — parse an LLM's reflection response into structured insight.
+pub async fn reflection_parse(
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let response = req.get("response").and_then(|v| v.as_str()).unwrap_or("");
+    let insight = openfang_runtime::reflection::parse_reflection_response(response);
+    Json(serde_json::json!(insight))
+}
+
+// ── Curriculum Learning ─────────────────────────────────────────────
+
+/// GET /api/curriculum/tiers — list all skill tiers and their requirements.
+pub async fn curriculum_tiers() -> impl IntoResponse {
+    let tiers: Vec<serde_json::Value> = openfang_runtime::curriculum::SkillTier::all()
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "tier": t,
+                "threshold": t.mastery_threshold(),
+                "next": t.next(),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "tiers": tiers }))
+}
+
+/// POST /api/curriculum/tool-tier — get the tier for a tool name.
+pub async fn curriculum_tool_tier(
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let tool_name = req.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+    let tier = openfang_runtime::curriculum::tool_tier(tool_name);
+    Json(serde_json::json!({
+        "tool_name": tool_name,
+        "tier": tier,
+    }))
+}
+
+/// POST /api/curriculum/gate — check if tools are accessible at a given tier.
+pub async fn curriculum_gate(
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let tier_str = req.get("current_tier").and_then(|v| v.as_str()).unwrap_or("foundational");
+    let current_tier: openfang_runtime::curriculum::SkillTier =
+        serde_json::from_value(serde_json::json!(tier_str)).unwrap_or(openfang_runtime::curriculum::SkillTier::Foundational);
+
+    let tool_names: Vec<String> = req
+        .get("tool_names")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    let curriculum_state = openfang_runtime::curriculum::CurriculumState {
+        current_tier,
+        ..Default::default()
+    };
+
+    let results: Vec<serde_json::Value> = tool_names
+        .iter()
+        .map(|name| {
+            let tier = openfang_runtime::curriculum::tool_tier(name);
+            serde_json::json!({
+                "tool": name,
+                "tier": tier,
+                "accessible": curriculum_state.can_use_tool(name),
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "current_tier": current_tier,
+        "tools": results,
+    }))
+}
+
+// ── Scratch Pad ─────────────────────────────────────────────────────
+
+/// POST /api/scratch-pad/parse — parse scratch commands from content.
+pub async fn scratch_pad_parse(
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let content = req.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let (commands, cleaned) = openfang_runtime::scratch_pad::parse_scratch_commands(content);
+    let cmd_json: Vec<serde_json::Value> = commands
+        .iter()
+        .map(|c| match c {
+            openfang_runtime::scratch_pad::ScratchCommand::Set { key, value } => {
+                serde_json::json!({"type": "set", "key": key, "value": value})
+            }
+            openfang_runtime::scratch_pad::ScratchCommand::Get { key } => {
+                serde_json::json!({"type": "get", "key": key})
+            }
+            openfang_runtime::scratch_pad::ScratchCommand::Del { key } => {
+                serde_json::json!({"type": "del", "key": key})
+            }
+        })
+        .collect();
+    Json(serde_json::json!({
+        "commands": cmd_json,
+        "cleaned_content": cleaned,
+    }))
+}
+
 /// Remove a `[section]` and its contents from a TOML string.
 fn remove_toml_section(content: &str, section: &str) -> String {
     let header = format!("[{}]", section);
