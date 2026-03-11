@@ -67,6 +67,9 @@ function agentsPage() {
     editingFallback: false,
     newFallbackValue: '',
 
+    // -- Context pressure state (Smart Zone) --
+    contextPressureMap: {},
+
     // -- Templates state --
     tplTemplates: [],
     tplProviders: [],
@@ -263,6 +266,7 @@ function agentsPage() {
       this.loadError = '';
       try {
         await Alpine.store('app').refreshAgents();
+        this.loadContextPressure();
       } catch(e) {
         this.loadError = e.message || 'Could not load agents. Is the daemon running?';
       }
@@ -286,10 +290,40 @@ function agentsPage() {
       this.loadError = '';
       try {
         await Alpine.store('app').refreshAgents();
+        this.loadContextPressure();
       } catch(e) {
         this.loadError = e.message || 'Could not load agents.';
       }
       this.loading = false;
+    },
+
+    async loadContextPressure() {
+      try {
+        var data = await OpenFangAPI.get('/api/context/pressure');
+        var map = {};
+        (data.agents || []).forEach(function(a) {
+          map[a.agent_id] = a;
+        });
+        this.contextPressureMap = map;
+      } catch(e) { /* silent — non-critical */ }
+    },
+
+    pressureColor(agentId) {
+      var info = this.contextPressureMap[agentId];
+      if (!info) return 'transparent';
+      switch (info.pressure) {
+        case 'critical': return '#ef4444';
+        case 'high': return '#f97316';
+        case 'medium': return '#eab308';
+        case 'proactive': return '#3b82f6';
+        default: return '#22c55e';
+      }
+    },
+
+    pressureTooltip(agentId) {
+      var info = this.contextPressureMap[agentId];
+      if (!info) return '';
+      return 'Context: ' + (info.usage_percent || 0).toFixed(1) + '% (' + info.pressure + ')';
     },
 
     async loadTemplates() {

@@ -10304,10 +10304,12 @@ pub async fn context_pressure_all(
                 "pressure": report.pressure,
                 "usage_percent": report.usage_percent,
                 "estimated_tokens": report.estimated_tokens,
+                "message_count": report.message_count,
+                "context_window": report.context_window,
             }));
         }
     }
-    Json(serde_json::json!(results))
+    Json(serde_json::json!({ "agents": results }))
 }
 
 /// SECURITY: Validate webhook bearer token using constant-time comparison.
