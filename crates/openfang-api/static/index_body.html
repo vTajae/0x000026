@@ -1296,6 +1296,8 @@
           <h2>Workflows</h2>
           <div class="flex gap-2">
             <button class="btn btn-ghost btn-sm" :class="{ active: wfTab === 'list' }" @click="wfTab = 'list'">List</button>
+            <button class="btn btn-ghost btn-sm" :class="{ active: wfTab === 'templates' }" @click="wfTab = 'templates'">Templates</button>
+            <button class="btn btn-ghost btn-sm" :class="{ active: wfTab === 'ears' }" @click="wfTab = 'ears'">EARS</button>
             <button class="btn btn-ghost btn-sm" :class="{ active: wfTab === 'builder' }" @click="wfTab = 'builder'">Visual Builder</button>
           </div>
         </div>
@@ -1399,6 +1401,103 @@
             </div>
           </template>
         </div>
+        </div>
+        </template>
+
+        <!-- Tab: Templates -->
+        <template x-if="wfTab === 'templates'">
+        <div x-data="workflowsPage" x-init="loadTemplates()">
+          <div class="page-body">
+            <div class="card mb-4" style="border-left:3px solid #8b5cf6">
+              <div class="font-bold" style="font-size:13px;margin-bottom:4px">Workflow Templates</div>
+              <div class="text-sm text-dim" style="line-height:1.6">
+                Pre-built multi-agent pipeline patterns. Select a template, assign agents to roles, and instantly create a workflow.
+              </div>
+            </div>
+            <div class="grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px">
+              <template x-for="tpl in templates" :key="tpl.id">
+                <div class="card" style="cursor:pointer;border:1px solid var(--border);transition:border-color 0.2s" @click="selectTemplate(tpl)"
+                     @mouseenter="$el.style.borderColor='var(--accent)'" @mouseleave="$el.style.borderColor='var(--border)'">
+                  <div class="font-bold" style="font-size:14px;color:var(--accent)" x-text="tpl.name"></div>
+                  <div class="text-xs text-dim mt-1" x-text="tpl.description"></div>
+                  <div class="flex gap-1 mt-3" style="flex-wrap:wrap">
+                    <template x-for="step in tpl.steps" :key="step">
+                      <span class="badge" style="font-size:10px" x-text="step"></span>
+                    </template>
+                  </div>
+                  <div class="text-xs text-dim mt-2">Roles: <span x-text="tpl.required_roles.join(', ')"></span></div>
+                </div>
+              </template>
+            </div>
+            <div class="empty-state" x-show="!templates.length">
+              <h3>No templates available</h3>
+              <p>Templates will appear once the API is running.</p>
+            </div>
+          </div>
+          <!-- Template instantiation modal -->
+          <template x-if="showTemplateModal && selectedTemplate">
+            <div class="modal-overlay" @click.self="showTemplateModal = false" @keydown.escape.window="showTemplateModal = false">
+              <div class="modal">
+                <div class="modal-header"><h3 x-text="'Create: ' + selectedTemplate.name"></h3><button class="modal-close" @click="showTemplateModal = false">&times;</button></div>
+                <div class="text-sm text-dim mb-4" x-text="selectedTemplate.description"></div>
+                <div class="mb-2 font-bold text-xs">Assign agents to roles:</div>
+                <template x-for="role in selectedTemplate.required_roles" :key="role">
+                  <div class="form-group">
+                    <label class="text-xs" x-text="role"></label>
+                    <input class="form-input" x-model="templateAgents[role]" :placeholder="'Agent name for ' + role + ' role'">
+                  </div>
+                </template>
+                <button class="btn btn-primary btn-block mt-2" @click="instantiateTemplate()">Create Workflow</button>
+              </div>
+            </div>
+          </template>
+        </div>
+        </template>
+
+        <!-- Tab: EARS Requirements -->
+        <template x-if="wfTab === 'ears'">
+        <div x-data="workflowsPage">
+          <div class="page-body">
+            <div class="card mb-4" style="border-left:3px solid #10b981">
+              <div class="font-bold" style="font-size:13px;margin-bottom:4px">EARS Requirement Syntax</div>
+              <div class="text-sm text-dim" style="line-height:1.6">
+                Parse natural-language requirements into structured EARS patterns. Each line is one requirement.
+                Supported patterns: <strong>Ubiquitous</strong> (The X shall Y), <strong>Event-driven</strong> (When X, the Y shall Z),
+                <strong>State-driven</strong> (While X, the Y shall Z), <strong>Unwanted</strong> (If X, then the Y shall Z),
+                <strong>Optional</strong> (Where X, the Y shall Z), <strong>Complex</strong> (While X, when Y, the Z shall W).
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Requirements (one per line)</label>
+              <textarea class="form-textarea" x-model="earsInput" rows="6" placeholder="The system shall log all actions.
+When a user logs in, the auth service shall issue a token.
+If the violation score exceeds threshold, then the kernel shall downgrade the agent."></textarea>
+            </div>
+            <button class="btn btn-primary btn-sm mb-4" @click="parseEars()">Parse Requirements</button>
+            <template x-if="earsResults && earsResults.spec">
+              <div>
+                <div class="text-xs text-dim mb-2"><span x-text="earsResults.count"></span> requirement(s) parsed</div>
+                <div class="table-wrap">
+                  <table>
+                    <thead><tr><th>ID</th><th>Pattern</th><th>Text</th></tr></thead>
+                    <tbody>
+                      <template x-for="req in earsResults.spec.requirements" :key="req.id">
+                        <tr>
+                          <td class="font-bold text-xs" x-text="req.id"></td>
+                          <td><span class="badge" :style="'background:' + earsPatternColor(earsPatternLabel(req)) + '20;color:' + earsPatternColor(earsPatternLabel(req))" x-text="earsPatternLabel(req)"></span></td>
+                          <td class="text-xs" x-text="req.text"></td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="card mt-4">
+                  <div class="card-header">Prompt Markdown</div>
+                  <pre style="font-size:11px;white-space:pre-wrap;margin-top:8px;color:var(--text-dim)" x-text="earsResults.markdown"></pre>
+                </div>
+              </div>
+            </template>
+          </div>
         </div>
         </template>
 

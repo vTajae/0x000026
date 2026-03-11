@@ -74,6 +74,81 @@ function workflowsPage() {
       } catch(e) {
         OpenFangToast.error('Failed to load run history: ' + e.message);
       }
+    },
+
+    // -- Templates --
+    templates: [],
+    showTemplateModal: false,
+    selectedTemplate: null,
+    templateAgents: {},
+
+    async loadTemplates() {
+      try {
+        var data = await OpenFangAPI.get('/api/workflows/templates');
+        this.templates = data.templates || [];
+      } catch(e) {
+        this.templates = [];
+      }
+    },
+
+    selectTemplate(tpl) {
+      this.selectedTemplate = tpl;
+      this.templateAgents = {};
+      var self = this;
+      tpl.required_roles.forEach(function(role) {
+        self.templateAgents[role] = '';
+      });
+      this.showTemplateModal = true;
+    },
+
+    async instantiateTemplate() {
+      if (!this.selectedTemplate) return;
+      try {
+        var res = await OpenFangAPI.post('/api/workflows/templates/instantiate', {
+          template_id: this.selectedTemplate.id,
+          agents: this.templateAgents
+        });
+        this.showTemplateModal = false;
+        OpenFangToast.success('Workflow "' + this.selectedTemplate.name + '" created');
+        await this.loadWorkflows();
+      } catch(e) {
+        OpenFangToast.error('Failed to instantiate: ' + e.message);
+      }
+    },
+
+    // -- EARS Requirements --
+    earsInput: '',
+    earsResults: null,
+
+    async parseEars() {
+      if (!this.earsInput.trim()) return;
+      var lines = this.earsInput.trim().split('\n').filter(function(l) { return l.trim(); });
+      var requirements = lines.map(function(line, i) {
+        return { id: 'REQ-' + String(i + 1).padStart(3, '0'), text: line.trim() };
+      });
+      try {
+        this.earsResults = await OpenFangAPI.post('/api/ears/parse', { requirements: requirements });
+      } catch(e) {
+        OpenFangToast.error('EARS parse failed: ' + e.message);
+      }
+    },
+
+    earsPatternLabel(req) {
+      if (!req || !req.pattern) return 'freeform';
+      return req.pattern.type || 'freeform';
+    },
+
+    earsPatternColor(type) {
+      var colors = {
+        'ubiquitous': '#3b82f6',
+        'event_driven': '#10b981',
+        'state_driven': '#f59e0b',
+        'unwanted_behavior': '#ef4444',
+        'optional': '#8b5cf6',
+        'complex': '#ec4899',
+        'freeform': '#6b7280'
+      };
+      return colors[type] || '#6b7280';
     }
   };
 }
