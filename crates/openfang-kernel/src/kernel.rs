@@ -369,6 +369,40 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
         name = manifest.name
     );
 
+    let steering_content = format!(
+        "# Steering Directives\n\n\
+         ## Architectural Constraints\n\
+         - Follow the principle of least privilege \u{2014} request only the tools and permissions you need.\n\
+         - Prefer reversible actions over irreversible ones.\n\
+         - When uncertain, ask the user rather than guessing.\n\n\
+         ## Quality Standards\n\
+         - Verify your work before reporting completion.\n\
+         - Cite sources when making factual claims.\n\
+         - Keep responses focused and relevant to the user's request.\n\n\
+         ## Agent: {name}\n\
+         <!-- Add agent-specific constraints below -->\n",
+        name = manifest.name
+    );
+
+    let requirements_content = format!(
+        "# Requirements\n\n\
+         <!-- EARS-format requirements for this agent. Parsed and injected into system prompts. -->\n\
+         <!-- Examples:\n\
+           The {name} shall respond to all user queries within the conversation context.\n\
+           When the user provides feedback, the {name} shall incorporate it into future responses.\n\
+           If a tool call fails, then the {name} shall explain the error and suggest alternatives.\n\
+         -->\n",
+        name = manifest.name
+    );
+
+    let assertions_content = "{\n  \"assertions\": [\n    {\n      \"name\": \"max-response-length\",\n      \
+         \"description\": \"Prevent excessively long responses\",\n      \
+         \"condition\": { \"type\": \"max_response_length\", \"limit\": 8000 },\n      \
+         \"on_fail\": \"warn\"\n    },\n    {\n      \"name\": \"no-secrets\",\n      \
+         \"description\": \"Never leak API keys or secrets\",\n      \
+         \"condition\": { \"type\": \"response_excludes\", \"pattern\": \"sk-\", \"case_sensitive\": true },\n      \
+         \"on_fail\": \"violate\"\n    }\n  ]\n}\n";
+
     let files: &[(&str, &str)] = &[
         ("SOUL.md", &soul_content),
         ("USER.md", user_content),
@@ -377,6 +411,9 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
         ("AGENTS.md", agents_content),
         ("BOOTSTRAP.md", &bootstrap_content),
         ("IDENTITY.md", &identity_content),
+        ("STEERING.md", &steering_content),
+        ("REQUIREMENTS.md", &requirements_content),
+        ("ASSERTIONS.json", assertions_content),
     ];
 
     // Conditionally generate HEARTBEAT.md for autonomous agents
