@@ -338,6 +338,14 @@ pub async fn build_router(
             "/api/assertions/check",
             axum::routing::post(routes::check_assertions),
         )
+        .route(
+            "/api/agents/{id}/assertions",
+            axum::routing::get(routes::get_agent_assertions),
+        )
+        .route(
+            "/api/agents/{id}/assertions/cache",
+            axum::routing::delete(routes::clear_agent_assertion_cache),
+        )
         // Skills endpoints
         .route("/api/skills", axum::routing::get(routes::list_skills))
         .route(

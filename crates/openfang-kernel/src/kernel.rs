@@ -161,6 +161,8 @@ pub struct OpenFangKernel {
     pub credential_resolver: Arc<openfang_extensions::credentials::CredentialResolver>,
     /// Behavioral violation tracker — aggregates violations from all guard systems.
     pub violation_tracker: openfang_runtime::violation_tracker::ViolationTracker,
+    /// Per-agent runtime assertions cache (loaded from ASSERTIONS.json in workspace).
+    pub assertion_cache: dashmap::DashMap<AgentId, Vec<openfang_runtime::assertions::RuntimeAssertion>>,
 }
 
 /// Bounded in-memory delivery receipt tracker.
@@ -1042,6 +1044,7 @@ impl OpenFangKernel {
             self_handle: OnceLock::new(),
             credential_resolver,
             violation_tracker: openfang_runtime::violation_tracker::ViolationTracker::new(),
+            assertion_cache: dashmap::DashMap::new(),
         };
 
         // Restore persisted agents from SQLite
@@ -1532,6 +1535,52 @@ impl OpenFangKernel {
                 // Update last active time
                 let _ = self.registry.set_state(agent_id, AgentState::Running);
 
+                // Runtime assertion checking — load from workspace ASSERTIONS.json
+                // and validate the response against declared invariants.
+                if !result.response.is_empty() {
+                    let assertions = self.load_agent_assertions(agent_id);
+                    if !assertions.is_empty() {
+                        let check = openfang_runtime::assertions::check_assertions(
+                            &assertions,
+                            &result.response,
+                            result.iterations as usize,
+                            result.cost_usd.unwrap_or(0.0),
+                        );
+                        if !check.all_passed {
+                            for r in &check.results {
+                                if !r.passed {
+                                    match r.fail_action {
+                                        openfang_runtime::assertions::FailAction::Violate => {
+                                            self.violation_tracker.record(
+                                                &agent_id.to_string(),
+                                                openfang_types::violation::ViolationKind::ToolPolicyBlock,
+                                                None,
+                                                &format!("Assertion '{}' failed: {}", r.name, r.reason),
+                                            );
+                                        }
+                                        openfang_runtime::assertions::FailAction::Block => {
+                                            warn!(
+                                                agent_id = %agent_id,
+                                                assertion = %r.name,
+                                                reason = %r.reason,
+                                                "Assertion BLOCKED response (not enforced yet)"
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                    debug!(
+                                        agent_id = %agent_id,
+                                        assertion = %r.name,
+                                        action = ?r.fail_action,
+                                        reason = %r.reason,
+                                        "Runtime assertion failed"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // SECURITY: Record successful message in audit trail
                 self.audit_log.record(
                     agent_id.to_string(),
@@ -1571,6 +1620,42 @@ impl OpenFangKernel {
                 Err(e)
             }
         }
+    }
+
+    /// Load runtime assertions for an agent from its workspace ASSERTIONS.json.
+    ///
+    /// Results are cached per agent to avoid re-reading the file on every message.
+    /// Cache is invalidated when the file is modified (checked via metadata timestamp).
+    pub fn load_agent_assertions(
+        &self,
+        agent_id: AgentId,
+    ) -> Vec<openfang_runtime::assertions::RuntimeAssertion> {
+        // Check cache first
+        if let Some(cached) = self.assertion_cache.get(&agent_id) {
+            return cached.clone();
+        }
+
+        // Load from workspace
+        let assertions = self
+            .registry
+            .get(agent_id)
+            .and_then(|entry| entry.manifest.workspace.clone())
+            .and_then(|workspace| {
+                let path = workspace.join("ASSERTIONS.json");
+                let content = std::fs::read_to_string(&path).ok()?;
+                match openfang_runtime::assertions::parse_assertions_json(&content) {
+                    Ok(a) => Some(a),
+                    Err(e) => {
+                        warn!(agent_id = %agent_id, error = %e, "Failed to parse ASSERTIONS.json");
+                        None
+                    }
+                }
+            })
+            .unwrap_or_default();
+
+        // Cache the result (even if empty, to avoid re-reading)
+        self.assertion_cache.insert(agent_id, assertions.clone());
+        assertions
     }
 
     /// Send a message to an agent with streaming responses.

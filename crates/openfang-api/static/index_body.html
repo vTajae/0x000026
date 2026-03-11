@@ -73,6 +73,10 @@
               <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M18 20V10M12 20V4M6 20v-6"/></svg></span>
               <span class="nav-label">Analytics</span>
             </a>
+            <a class="nav-item" :class="{ active: page === 'quality' }" @click="navigate('quality')" :aria-current="page === 'quality' ? 'page' : false">
+              <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z"/><path d="m9 12 2 2 4-4"/></svg></span>
+              <span class="nav-label">Quality</span>
+            </a>
             <a class="nav-item" :class="{ active: page === 'logs' }" @click="navigate('logs')" :aria-current="page === 'logs' ? 'page' : false">
               <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg></span>
               <span class="nav-label">Logs</span>
@@ -4218,6 +4222,131 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             </div>
           </div>
         </div>
+      </div>
+    </template>
+
+    <!-- Page: Quality -->
+    <template x-if="page === 'quality'">
+      <div x-data="qualityPage" x-init="loadData().then(() => loadAllAssertions())">
+        <div class="page-header">
+          <h2>Quality Monitor</h2>
+          <div class="flex gap-2">
+            <button class="btn btn-ghost btn-sm" :class="{ active: tab === 'assertions' }" @click="tab = 'assertions'">Assertions</button>
+            <button class="btn btn-ghost btn-sm" :class="{ active: tab === 'violations' }" @click="tab = 'violations'">
+              Violations
+              <template x-if="violations.length > 0">
+                <span class="badge badge-sm" style="background:#ef4444;color:white;margin-left:4px" x-text="violations.reduce((s,v) => s + (v.recent_violations||0), 0)"></span>
+              </template>
+            </button>
+            <button class="btn btn-ghost btn-sm" :class="{ active: tab === 'critique' }" @click="tab = 'critique'">Self-Critique</button>
+          </div>
+        </div>
+
+        <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Loading quality data...</span></div>
+
+        <!-- Tab: Assertions -->
+        <div x-show="!loading && tab === 'assertions'">
+          <div class="card mb-4" style="border-left:3px solid #10b981">
+            <div class="font-bold" style="font-size:13px;margin-bottom:4px">Runtime Assertions</div>
+            <div class="text-sm text-dim" style="line-height:1.6">
+              Behavioral invariants checked automatically after every agent response.
+              Place an <code>ASSERTIONS.json</code> file in any agent's workspace directory to enable.
+            </div>
+          </div>
+          <div class="stats-row mb-4">
+            <div class="stat-card"><div class="stat-value" x-text="agents.length"></div><div class="stat-label">Agents</div></div>
+            <div class="stat-card"><div class="stat-value" x-text="agentsWithAssertions().length"></div><div class="stat-label">With Assertions</div></div>
+            <div class="stat-card"><div class="stat-value" x-text="totalAssertions()"></div><div class="stat-label">Total Rules</div></div>
+          </div>
+          <template x-for="agent in agents" :key="agent.id">
+            <div class="card mb-3" x-show="(agentAssertions[agent.id] || []).length > 0">
+              <div class="flex items-center gap-2 mb-2">
+                <span class="font-bold" x-text="agent.name"></span>
+                <span class="badge badge-sm" x-text="(agentAssertions[agent.id] || []).length + ' assertions'"></span>
+                <button class="btn btn-ghost btn-sm" @click="refreshAssertions(agent.id)" style="margin-left:auto;font-size:10px">Reload</button>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>Name</th><th>Condition</th><th>On Fail</th><th>Description</th></tr></thead>
+                  <tbody>
+                    <template x-for="a in (agentAssertions[agent.id] || [])" :key="a.name">
+                      <tr>
+                        <td class="font-bold text-xs" x-text="a.name"></td>
+                        <td><span class="badge badge-sm" x-text="conditionLabel(a.condition)"></span></td>
+                        <td><span class="badge badge-sm" :style="'background:' + failActionColor(a.on_fail) + '20;color:' + failActionColor(a.on_fail)" x-text="a.on_fail"></span></td>
+                        <td class="text-xs text-dim" x-text="a.description || '-'"></td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </template>
+          <div class="empty-state" x-show="agentsWithAssertions().length === 0">
+            <h3>No assertions configured</h3>
+            <p>Create an <code>ASSERTIONS.json</code> file in an agent's workspace to define runtime quality checks.</p>
+          </div>
+        </div>
+
+        <!-- Tab: Violations -->
+        <div x-show="!loading && tab === 'violations'">
+          <div class="stats-row mb-4">
+            <div class="stat-card"><div class="stat-value" x-text="violations.reduce((s,v) => s + (v.recent_violations||0), 0)"></div><div class="stat-label">Recent Violations</div></div>
+            <div class="stat-card"><div class="stat-value" x-text="violations.filter(v => v.should_downgrade).length"></div><div class="stat-label">At Risk</div></div>
+            <div class="stat-card"><div class="stat-value" x-text="violationConfig.max_score || 50"></div><div class="stat-label">Threshold</div></div>
+          </div>
+          <template x-for="v in violations" :key="v.agent_id">
+            <div class="card mb-3">
+              <div class="flex items-center gap-2 mb-2">
+                <span class="font-bold" x-text="v.agent_id"></span>
+                <span class="badge badge-sm" x-show="v.should_downgrade" style="background:#ef444420;color:#ef4444">AT RISK</span>
+              </div>
+              <div class="flex items-center gap-3 text-xs text-dim mb-2">
+                <span>Score: <strong :style="'color:' + violationScoreColor(v.weighted_score)" x-text="v.weighted_score"></strong> / <span x-text="violationConfig.max_score || 50"></span></span>
+                <span>Recent: <span x-text="v.recent_violations"></span></span>
+                <span>Total: <span x-text="v.total_violations"></span></span>
+              </div>
+              <div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden">
+                <div :style="'width:' + violationScoreWidth(v.weighted_score) + ';height:100%;background:' + violationScoreColor(v.weighted_score) + ';border-radius:3px;transition:width 0.3s'"></div>
+              </div>
+            </div>
+          </template>
+          <div class="empty-state" x-show="violations.length === 0">
+            <h3>No violations recorded</h3>
+            <p>Violations are tracked when agents trigger safety guardrails.</p>
+          </div>
+        </div>
+
+        <!-- Tab: Self-Critique -->
+        <div x-show="!loading && tab === 'critique'">
+          <div class="card mb-4" style="border-left:3px solid #8b5cf6">
+            <div class="font-bold" style="font-size:13px;margin-bottom:4px">Self-Critique Tool</div>
+            <div class="text-sm text-dim" style="line-height:1.6">
+              Evaluate an agent response against quality criteria. Paste a query and response to generate a critique prompt,
+              or paste a critique result to parse it into structured evaluations.
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Original Query</label>
+            <input class="form-input" x-model="critiqueQuery" placeholder="What was the user's question?">
+          </div>
+          <div class="form-group">
+            <label>Agent Response</label>
+            <textarea class="form-textarea" x-model="critiqueResponse" rows="4" placeholder="Paste the agent's response here..."></textarea>
+          </div>
+          <button class="btn btn-primary btn-sm mb-4" @click="buildCritique()">Generate Critique Prompt</button>
+          <template x-if="critiqueResult">
+            <div class="card mb-4">
+              <div class="flex items-center gap-2 mb-2">
+                <span class="font-bold text-xs">Should critique?</span>
+                <span class="badge badge-sm" :style="critiqueResult.should_critique ? 'background:#10b98120;color:#10b981' : 'background:#6b728020;color:#6b7280'" x-text="critiqueResult.should_critique ? 'Yes' : 'No (too short)'"></span>
+              </div>
+              <div class="card-header">Critique Prompt</div>
+              <pre style="font-size:11px;white-space:pre-wrap;margin-top:8px;color:var(--text-dim);max-height:300px;overflow:auto" x-text="critiqueResult.critique_prompt"></pre>
+            </div>
+          </template>
+        </div>
+
       </div>
     </template>
 

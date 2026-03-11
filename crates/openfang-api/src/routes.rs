@@ -11093,6 +11093,62 @@ pub async fn parse_critique(
 // Runtime Assertions
 // ---------------------------------------------------------------------------
 
+/// GET /api/agents/{id}/assertions — Get loaded assertions for an agent.
+pub async fn get_agent_assertions(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id = match id.parse::<openfang_types::agent::AgentId>() {
+        Ok(id) => id,
+        Err(_) => {
+            // Try name lookup
+            match state.kernel.registry.find_by_name(&id) {
+                Some(entry) => entry.id,
+                None => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": "Agent not found"})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+
+    let assertions = state.kernel.load_agent_assertions(agent_id);
+    Json(serde_json::json!({
+        "agent_id": agent_id.to_string(),
+        "assertions": assertions,
+        "count": assertions.len(),
+    }))
+    .into_response()
+}
+
+/// DELETE /api/agents/{id}/assertions/cache — Invalidate assertion cache for hot-reload.
+pub async fn clear_agent_assertion_cache(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id = match id.parse::<openfang_types::agent::AgentId>() {
+        Ok(id) => id,
+        Err(_) => {
+            match state.kernel.registry.find_by_name(&id) {
+                Some(entry) => entry.id,
+                None => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": "Agent not found"})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+
+    state.kernel.assertion_cache.remove(&agent_id);
+    Json(serde_json::json!({"ok": true, "message": "Assertion cache cleared"})).into_response()
+}
+
 /// POST /api/assertions/check — Check response against assertions.
 #[derive(serde::Deserialize)]
 pub struct CheckAssertionsRequest {
