@@ -450,6 +450,15 @@ pub async fn build_router(
             "/api/mcp/servers",
             axum::routing::get(routes::list_mcp_servers),
         )
+        // MCP Auth endpoints
+        .route(
+            "/api/mcp/auth",
+            axum::routing::get(routes::mcp_auth_status),
+        )
+        .route(
+            "/api/mcp/auth/discover",
+            axum::routing::post(routes::mcp_auth_discover),
+        )
         // Audit endpoints
         .route(
             "/api/audit/recent",

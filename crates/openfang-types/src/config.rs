@@ -1147,6 +1147,34 @@ pub struct McpServerConfigEntry {
     /// Environment variables to pass through (e.g., ["GITHUB_PERSONAL_ACCESS_TOKEN"]).
     #[serde(default)]
     pub env: Vec<String>,
+    /// OAuth2 authentication config for this MCP server (enables DCR).
+    #[serde(default)]
+    pub auth: Option<McpAuthEntry>,
+}
+
+/// OAuth2 authentication config for an MCP server connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpAuthEntry {
+    /// Pre-configured OAuth2 client ID (skips DCR if set).
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Pre-configured OAuth2 client secret.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Requested OAuth2 scopes (space-separated).
+    #[serde(default = "default_mcp_auth_scope")]
+    pub scope: String,
+    /// Whether to use Dynamic Client Registration when client_id is not set.
+    #[serde(default = "default_true_fn")]
+    pub enable_dcr: bool,
+}
+
+fn default_mcp_auth_scope() -> String {
+    "mcp".to_string()
+}
+
+fn default_true_fn() -> bool {
+    true
 }
 
 fn default_mcp_timeout() -> u64 {

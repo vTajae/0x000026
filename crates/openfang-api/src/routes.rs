@@ -4336,6 +4336,74 @@ pub async fn list_mcp_servers(State(state): State<Arc<AppState>>) -> impl IntoRe
 }
 
 // ---------------------------------------------------------------------------
+// MCP Auth endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /api/mcp/auth — List MCP servers with OAuth2 auth status.
+pub async fn mcp_auth_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let servers = state.kernel.mcp_auth_store.servers().await;
+    let mut statuses = Vec::new();
+    for url in &servers {
+        let config = openfang_runtime::mcp_auth::McpAuthConfig {
+            server_url: url.clone(),
+            client_id: None,
+            client_secret: None,
+            scope: "mcp".into(),
+            enable_dcr: true,
+        };
+        let client = state.kernel.mcp_auth_store.get_or_create(config).await;
+        let has_token = client.has_valid_token().await;
+        statuses.push(serde_json::json!({
+            "server_url": url,
+            "has_valid_token": has_token,
+        }));
+    }
+    Json(serde_json::json!({
+        "auth_servers": statuses,
+        "total": servers.len(),
+    }))
+}
+
+/// POST /api/mcp/auth/discover — Discover OAuth2 metadata for a server URL.
+pub async fn mcp_auth_discover(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let server_url = match body.get("server_url").and_then(|v| v.as_str()) {
+        Some(url) => url.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "server_url required"})),
+            )
+        }
+    };
+
+    let config = openfang_runtime::mcp_auth::McpAuthConfig {
+        server_url: server_url.clone(),
+        client_id: None,
+        client_secret: None,
+        scope: "mcp".into(),
+        enable_dcr: true,
+    };
+    let client = state.kernel.mcp_auth_store.get_or_create(config).await;
+
+    match client.discover_metadata().await {
+        Ok(meta) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "server_url": server_url,
+                "metadata": meta,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Audit endpoints
 // ---------------------------------------------------------------------------
 

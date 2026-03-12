@@ -98,6 +98,8 @@ pub struct OpenFangKernel {
     pub mcp_connections: tokio::sync::Mutex<Vec<openfang_runtime::mcp::McpConnection>>,
     /// MCP tool definitions cache (populated after connections are established).
     pub mcp_tools: std::sync::Mutex<Vec<ToolDefinition>>,
+    /// OAuth2 auth store for MCP server authentication (DCR + token management).
+    pub mcp_auth_store: openfang_runtime::mcp_auth::McpAuthStore,
     /// A2A task store for tracking task lifecycle.
     pub a2a_task_store: openfang_runtime::a2a::A2aTaskStore,
     /// Discovered external A2A agent cards.
@@ -1055,6 +1057,7 @@ impl OpenFangKernel {
             running_tasks: dashmap::DashMap::new(),
             mcp_connections: tokio::sync::Mutex::new(Vec::new()),
             mcp_tools: std::sync::Mutex::new(Vec::new()),
+            mcp_auth_store: openfang_runtime::mcp_auth::McpAuthStore::new(),
             a2a_task_store: openfang_runtime::a2a::A2aTaskStore::default(),
             a2a_external_agents: std::sync::Mutex::new(Vec::new()),
             web_ctx,
@@ -4560,6 +4563,36 @@ impl OpenFangKernel {
             .unwrap_or_default();
 
         for server_config in &servers {
+            // OAuth2 DCR: if auth config is present, acquire token before connecting
+            if let Some(ref auth_entry) = server_config.auth {
+                if let McpTransportEntry::Sse { ref url } = server_config.transport {
+                    let auth_config = openfang_runtime::mcp_auth::McpAuthConfig {
+                        server_url: url.clone(),
+                        client_id: auth_entry.client_id.clone(),
+                        client_secret: auth_entry.client_secret.clone(),
+                        scope: auth_entry.scope.clone(),
+                        enable_dcr: auth_entry.enable_dcr,
+                    };
+                    match self.mcp_auth_store.get_token(auth_config).await {
+                        Ok(token) => {
+                            info!(
+                                server = %server_config.name,
+                                "OAuth2 token acquired for MCP server"
+                            );
+                            // Token is cached in the auth store for future requests
+                            drop(token);
+                        }
+                        Err(e) => {
+                            warn!(
+                                server = %server_config.name,
+                                error = %e,
+                                "OAuth2 auth failed for MCP server, connecting without auth"
+                            );
+                        }
+                    }
+                }
+            }
+
             let transport = match &server_config.transport {
                 McpTransportEntry::Stdio { command, args } => McpTransport::Stdio {
                     command: command.clone(),
