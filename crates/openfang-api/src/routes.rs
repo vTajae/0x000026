@@ -11318,6 +11318,48 @@ pub async fn scratch_pad_parse(
     }))
 }
 
+// ── Property-Based Testing (PBT) ────────────────────────────────────
+
+/// POST /api/pbt/generate — generate property invariants from an EARS spec.
+pub async fn pbt_generate(
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let spec: openfang_types::ears::EarsSpec = match serde_json::from_value(req) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid EARS spec: {e}")})),
+            );
+        }
+    };
+    let invariants = openfang_runtime::pbt::generate_invariants(&spec);
+    (StatusCode::OK, Json(serde_json::json!({
+        "invariant_count": invariants.len(),
+        "invariants": invariants,
+    })))
+}
+
+/// POST /api/pbt/check — check invariants against a response.
+pub async fn pbt_check(
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let invariants: Vec<openfang_runtime::pbt::PropertyInvariant> = req
+        .get("invariants")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let user_input = req.get("user_input").and_then(|v| v.as_str()).unwrap_or("");
+    let response = req.get("response").and_then(|v| v.as_str()).unwrap_or("");
+
+    let report = openfang_runtime::pbt::check_invariants(&invariants, user_input, response);
+    let markdown = openfang_runtime::pbt::report_to_markdown(&report);
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "report": report,
+        "markdown": markdown,
+    })))
+}
+
 // ── Agent-level Curriculum & Reflection ──────────────────────────────
 
 /// GET /api/agents/{id}/curriculum — get agent's curriculum learning state.
