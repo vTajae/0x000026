@@ -450,6 +450,21 @@ pub async fn build_router(
             "/api/mcp/servers",
             axum::routing::get(routes::list_mcp_servers),
         )
+        // Task Queue endpoints
+        .route(
+            "/api/tasks/queue",
+            axum::routing::get(routes::task_queue_status)
+                .post(routes::task_queue_submit),
+        )
+        .route(
+            "/api/tasks/queue/:id",
+            axum::routing::get(routes::task_queue_get)
+                .delete(routes::task_queue_cancel),
+        )
+        .route(
+            "/api/tasks/queue/:id/complete",
+            axum::routing::post(routes::task_queue_complete),
+        )
         // MCP Auth endpoints
         .route(
             "/api/mcp/auth",

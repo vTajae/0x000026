@@ -100,6 +100,8 @@ pub struct OpenFangKernel {
     pub mcp_tools: std::sync::Mutex<Vec<ToolDefinition>>,
     /// OAuth2 auth store for MCP server authentication (DCR + token management).
     pub mcp_auth_store: openfang_runtime::mcp_auth::McpAuthStore,
+    /// Priority task queue for inter-agent delegation.
+    pub task_queue: crate::task_queue::TaskQueue,
     /// A2A task store for tracking task lifecycle.
     pub a2a_task_store: openfang_runtime::a2a::A2aTaskStore,
     /// Discovered external A2A agent cards.
@@ -1058,6 +1060,7 @@ impl OpenFangKernel {
             mcp_connections: tokio::sync::Mutex::new(Vec::new()),
             mcp_tools: std::sync::Mutex::new(Vec::new()),
             mcp_auth_store: openfang_runtime::mcp_auth::McpAuthStore::new(),
+            task_queue: crate::task_queue::TaskQueue::new(),
             a2a_task_store: openfang_runtime::a2a::A2aTaskStore::default(),
             a2a_external_agents: std::sync::Mutex::new(Vec::new()),
             web_ctx,

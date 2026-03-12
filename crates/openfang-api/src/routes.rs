@@ -4336,6 +4336,103 @@ pub async fn list_mcp_servers(State(state): State<Arc<AppState>>) -> impl IntoRe
 }
 
 // ---------------------------------------------------------------------------
+// Task Queue endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /api/tasks/queue — Get task queue stats and pending tasks.
+pub async fn task_queue_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let stats = state.kernel.task_queue.stats();
+    Json(serde_json::json!({
+        "stats": stats,
+        "pending_count": state.kernel.task_queue.pending_count(),
+    }))
+}
+
+/// POST /api/tasks/queue — Submit a task to the queue.
+pub async fn task_queue_submit(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let source = match body.get("source_agent").and_then(|v| v.as_str()) {
+        Some(s) => match s.parse::<AgentId>() {
+            Ok(id) => id,
+            Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid source_agent"}))),
+        },
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "source_agent required"}))),
+    };
+
+    let target = body
+        .get("target_agent")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<AgentId>().ok());
+
+    let priority = match body.get("priority").and_then(|v| v.as_str()).unwrap_or("normal") {
+        "low" => openfang_kernel::task_queue::TaskPriority::Low,
+        "high" => openfang_kernel::task_queue::TaskPriority::High,
+        "critical" => openfang_kernel::task_queue::TaskPriority::Critical,
+        _ => openfang_kernel::task_queue::TaskPriority::Normal,
+    };
+
+    let payload = body
+        .get("payload")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let metadata = body.get("metadata").cloned();
+
+    let deadline = body
+        .get("deadline_secs")
+        .and_then(|v| v.as_u64())
+        .map(std::time::Duration::from_secs);
+
+    match state.kernel.task_queue.submit(source, target, priority, payload, metadata, deadline) {
+        Ok(id) => (StatusCode::OK, Json(serde_json::json!({"task_id": id}))),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+/// GET /api/tasks/queue/:id — Get a specific queued task.
+pub async fn task_queue_get(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.kernel.task_queue.get(id) {
+        Some(task) => (StatusCode::OK, Json(serde_json::json!(task))),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Task not found"}))),
+    }
+}
+
+/// POST /api/tasks/queue/:id/complete — Complete a queued task.
+pub async fn task_queue_complete(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let result = body
+        .get("result")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    match state.kernel.task_queue.complete(id, result) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "completed"}))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+/// DELETE /api/tasks/queue/:id — Cancel a queued task.
+pub async fn task_queue_cancel(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.kernel.task_queue.cancel(id) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "cancelled"}))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MCP Auth endpoints
 // ---------------------------------------------------------------------------
 
