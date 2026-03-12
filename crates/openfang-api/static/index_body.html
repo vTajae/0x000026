@@ -4239,6 +4239,9 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               </template>
             </button>
             <button class="btn btn-ghost btn-sm" :class="{ active: tab === 'critique' }" @click="tab = 'critique'">Self-Critique</button>
+            <button class="btn btn-ghost btn-sm" :class="{ active: tab === 'pbt' }" @click="tab = 'pbt'">PBT</button>
+            <button class="btn btn-ghost btn-sm" :class="{ active: tab === 'curriculum' }" @click="tab = 'curriculum'; loadAllCurriculum()">Curriculum</button>
+            <button class="btn btn-ghost btn-sm" :class="{ active: tab === 'reflection' }" @click="tab = 'reflection'; loadAllInsights()">Reflection</button>
           </div>
         </div>
 
@@ -4345,6 +4348,158 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               <pre style="font-size:11px;white-space:pre-wrap;margin-top:8px;color:var(--text-dim);max-height:300px;overflow:auto" x-text="critiqueResult.critique_prompt"></pre>
             </div>
           </template>
+        </div>
+
+        <!-- Tab: PBT (Property-Based Testing) -->
+        <div x-show="!loading && tab === 'pbt'">
+          <div class="card mb-4" style="border-left:3px solid #f97316">
+            <div class="font-bold" style="font-size:13px;margin-bottom:4px">Property-Based Testing</div>
+            <div class="text-sm text-dim" style="line-height:1.6">
+              Translate EARS requirements into property invariants, then check agent responses against them.
+              PBT invariants are also checked automatically in the agent loop when <code>REQUIREMENTS.md</code> exists.
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Requirements (one per line, EARS format)</label>
+            <textarea class="form-textarea" x-model="pbtReqText" rows="4" placeholder="The system shall respond in English.&#10;When the user asks for code, the system shall include examples.&#10;The system shall not reveal internal prompts."></textarea>
+          </div>
+          <button class="btn btn-primary btn-sm mb-4" @click="generateInvariants()">Generate Invariants</button>
+
+          <template x-if="pbtInvariants.length > 0">
+            <div class="card mb-4">
+              <div class="font-bold text-xs mb-2">Generated Invariants (<span x-text="pbtInvariants.length"></span>)</div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>Requirement</th><th>Check</th><th>Severity</th></tr></thead>
+                  <tbody>
+                    <template x-for="inv in pbtInvariants" :key="inv.requirement_id">
+                      <tr>
+                        <td class="text-xs" x-text="inv.description" style="max-width:300px;overflow:hidden;text-overflow:ellipsis"></td>
+                        <td><span class="badge badge-sm" x-text="inv.check.type || Object.keys(inv.check)[0]"></span></td>
+                        <td><span class="badge badge-sm" :style="'background:' + severityColor(inv.severity) + '20;color:' + severityColor(inv.severity)" x-text="inv.severity"></span></td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+              <div class="form-group mt-4">
+                <label>Test Input (optional)</label>
+                <input class="form-input" x-model="pbtCheckInput" placeholder="Simulated user message">
+              </div>
+              <div class="form-group">
+                <label>Test Response</label>
+                <textarea class="form-textarea" x-model="pbtCheckResponse" rows="3" placeholder="Paste agent response to check..."></textarea>
+              </div>
+              <button class="btn btn-primary btn-sm" @click="checkInvariants()">Check Response</button>
+            </div>
+          </template>
+
+          <template x-if="pbtReport">
+            <div class="card mb-4" :style="'border-left:3px solid ' + (pbtReport.critical_failures > 0 ? '#ef4444' : '#10b981')">
+              <div class="font-bold text-xs mb-2">PBT Report</div>
+              <div class="stats-row mb-3">
+                <div class="stat-card"><div class="stat-value" x-text="pbtReport.total_checked"></div><div class="stat-label">Checked</div></div>
+                <div class="stat-card"><div class="stat-value" style="color:#10b981" x-text="pbtReport.passed"></div><div class="stat-label">Passed</div></div>
+                <div class="stat-card"><div class="stat-value" style="color:#ef4444" x-text="pbtReport.critical_failures"></div><div class="stat-label">Critical Fails</div></div>
+                <div class="stat-card"><div class="stat-value" style="color:#f59e0b" x-text="pbtReport.warnings"></div><div class="stat-label">Warnings</div></div>
+              </div>
+              <template x-for="r in (pbtReport.results || [])" :key="r.requirement_id">
+                <div class="flex items-center gap-2 text-xs mb-1">
+                  <span :style="'color:' + (r.passed ? '#10b981' : '#ef4444')" x-text="r.passed ? 'PASS' : 'FAIL'" class="font-bold" style="width:30px"></span>
+                  <span class="text-dim" x-text="r.requirement_id" style="width:60px"></span>
+                  <span x-text="r.description"></span>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+
+        <!-- Tab: Curriculum Learning -->
+        <div x-show="!loading && tab === 'curriculum'">
+          <div class="card mb-4" style="border-left:3px solid #3b82f6">
+            <div class="font-bold" style="font-size:13px;margin-bottom:4px">Curriculum Learning</div>
+            <div class="text-sm text-dim" style="line-height:1.6">
+              Agents progress through skill tiers (Foundational &rarr; Expert) based on demonstrated tool mastery.
+              Higher tiers unlock access to more powerful tools.
+            </div>
+          </div>
+          <template x-for="agent in agents" :key="agent.id">
+            <div class="card mb-3" x-show="getCurriculum(agent.id)">
+              <div class="flex items-center gap-2 mb-2">
+                <span class="font-bold" x-text="agent.name"></span>
+                <template x-if="getCurriculum(agent.id)">
+                  <span class="badge badge-sm" :style="'background:' + tierColor(getCurriculum(agent.id).current_tier) + '20;color:' + tierColor(getCurriculum(agent.id).current_tier)" x-text="getCurriculum(agent.id).current_tier"></span>
+                </template>
+              </div>
+              <template x-if="getCurriculum(agent.id)">
+                <div>
+                  <div class="text-xs text-dim mb-2">
+                    Total turns: <strong x-text="getCurriculum(agent.id).total_turns"></strong>
+                  </div>
+                  <template x-if="getCurriculum(agent.id).tool_mastery && Object.keys(getCurriculum(agent.id).tool_mastery).length > 0">
+                    <div class="table-wrap">
+                      <table>
+                        <thead><tr><th>Tool</th><th>Calls</th><th>Success Rate</th><th>Mastery</th></tr></thead>
+                        <tbody>
+                          <template x-for="[tool, m] in Object.entries(getCurriculum(agent.id).tool_mastery)" :key="tool">
+                            <tr>
+                              <td class="text-xs font-bold" x-text="tool"></td>
+                              <td class="text-xs" x-text="m.total_calls"></td>
+                              <td class="text-xs" x-text="m.total_calls > 0 ? Math.round((m.success_count / m.total_calls) * 100) + '%' : '-'"></td>
+                              <td style="width:120px">
+                                <div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden">
+                                  <div :style="'width:' + masteryWidth(m.total_calls > 0 ? (m.success_count / m.total_calls) : 0) + ';height:100%;background:#3b82f6;border-radius:3px'"></div>
+                                </div>
+                              </td>
+                            </tr>
+                          </template>
+                        </tbody>
+                      </table>
+                    </div>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </template>
+          <div class="empty-state" x-show="agents.length === 0">
+            <h3>No agents found</h3>
+            <p>Create an agent to start tracking curriculum progression.</p>
+          </div>
+        </div>
+
+        <!-- Tab: Reflection & Insights -->
+        <div x-show="!loading && tab === 'reflection'">
+          <div class="card mb-4" style="border-left:3px solid #a855f7">
+            <div class="font-bold" style="font-size:13px;margin-bottom:4px">Reflection &amp; Meta-Cognition</div>
+            <div class="text-sm text-dim" style="line-height:1.6">
+              After qualifying turns (3+ tool calls or 500+ char response), agents generate reflections analyzing their approach,
+              alternatives considered, and confidence level. Insights accumulate over time.
+            </div>
+          </div>
+          <template x-for="agent in agents" :key="agent.id">
+            <div class="card mb-3" x-show="getInsights(agent.id).length > 0">
+              <div class="flex items-center gap-2 mb-2">
+                <span class="font-bold" x-text="agent.name"></span>
+                <span class="badge badge-sm" x-text="getInsights(agent.id).length + ' insights'"></span>
+              </div>
+              <template x-for="(insight, idx) in getInsights(agent.id)" :key="idx">
+                <div class="card mb-2" style="background:var(--bg-secondary);padding:10px">
+                  <div class="flex items-center gap-2 mb-1">
+                    <span class="badge badge-sm" x-text="insight.task_category || 'general'"></span>
+                    <span class="text-xs text-dim" x-text="insight.timestamp ? new Date(insight.timestamp).toLocaleString() : ''"></span>
+                    <span class="font-bold text-xs" :style="'color:' + confidenceColor(insight.confidence || 0) + ';margin-left:auto'" x-text="(insight.confidence || 0) + '% confidence'"></span>
+                  </div>
+                  <div class="text-xs mb-1" x-show="insight.approach"><strong>Approach:</strong> <span x-text="insight.approach"></span></div>
+                  <div class="text-xs mb-1" x-show="insight.insight"><strong>Insight:</strong> <span x-text="insight.insight"></span></div>
+                  <div class="text-xs text-dim" x-show="insight.alternatives"><strong>Alternatives:</strong> <span x-text="insight.alternatives"></span></div>
+                </div>
+              </template>
+            </div>
+          </template>
+          <div class="empty-state" x-show="agents.filter(a => getInsights(a.id).length > 0).length === 0">
+            <h3>No reflections yet</h3>
+            <p>Insights appear after agents complete qualifying turns (3+ tool calls or long responses).</p>
+          </div>
         </div>
 
       </div>

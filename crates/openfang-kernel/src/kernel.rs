@@ -1624,6 +1624,72 @@ impl OpenFangKernel {
                     }
                 }
 
+                // PBT invariant checking — load EARS requirements from workspace,
+                // generate property invariants, and validate against the response.
+                if !result.response.is_empty() {
+                    if let Some(ref workspace) = self
+                        .registry
+                        .get(agent_id)
+                        .and_then(|e| e.manifest.workspace.clone())
+                    {
+                        let reqs_path = workspace.join("REQUIREMENTS.md");
+                        if reqs_path.exists() {
+                            if let Ok(reqs_content) = std::fs::read_to_string(&reqs_path) {
+                                // Parse EARS requirements from the markdown
+                                let mut spec = openfang_types::ears::EarsSpec::new(
+                                    agent_id.to_string(),
+                                );
+                                for line in reqs_content.lines() {
+                                    let trimmed = line.trim().trim_start_matches("- ");
+                                    if !trimmed.is_empty()
+                                        && !trimmed.starts_with('#')
+                                        && !trimmed.starts_with("*")
+                                    {
+                                        let req_id = format!("PBT-{:03}", spec.requirements.len() + 1);
+                                        spec.add(req_id, trimmed);
+                                    }
+                                }
+                                if !spec.requirements.is_empty() {
+                                    let invariants =
+                                        openfang_runtime::pbt::generate_invariants(&spec);
+                                    if !invariants.is_empty() {
+                                        let report = openfang_runtime::pbt::check_invariants(
+                                            &invariants,
+                                            message,
+                                            &result.response,
+                                        );
+                                        if report.critical_failures > 0 {
+                                            warn!(
+                                                agent_id = %agent_id,
+                                                failed = report.critical_failures,
+                                                total = report.total,
+                                                "PBT critical invariant failures detected"
+                                            );
+                                            for r in &report.results {
+                                                if !r.passed
+                                                    && r.severity
+                                                        == openfang_runtime::pbt::InvariantSeverity::Critical
+                                                {
+                                                    self.violation_tracker.record(
+                                                        &agent_id.to_string(),
+                                                        openfang_types::violation::ViolationKind::ToolPolicyBlock,
+                                                        None,
+                                                        &format!(
+                                                            "PBT invariant '{}' failed: {}",
+                                                            r.requirement_id,
+                                                            r.details.as_deref().unwrap_or("unknown")
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // SECURITY: Record successful message in audit trail
                 self.audit_log.record(
                     agent_id.to_string(),

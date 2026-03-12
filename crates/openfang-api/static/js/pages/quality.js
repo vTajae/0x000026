@@ -18,6 +18,20 @@ function qualityPage() {
     // EARS state
     earsSpecs: [],
 
+    // PBT state
+    pbtReqText: '',
+    pbtInvariants: [],
+    pbtCheckInput: '',
+    pbtCheckResponse: '',
+    pbtReport: null,
+
+    // Curriculum state
+    curriculumAgents: {},
+    curriculumTiers: ['Foundational', 'Intermediate', 'Advanced', 'Expert'],
+
+    // Reflection state
+    insightAgents: {},
+
     async loadData() {
       this.loading = true;
       this.loadError = '';
@@ -165,6 +179,88 @@ function qualityPage() {
     violationScoreWidth(score) {
       var threshold = this.violationConfig.max_score || 50;
       return Math.min(100, Math.round((score / threshold) * 100)) + '%';
+    },
+
+    // PBT methods
+    async generateInvariants() {
+      if (!this.pbtReqText.trim()) return;
+      try {
+        var data = await OpenFangAPI.post('/api/pbt/generate', { requirements_text: this.pbtReqText });
+        this.pbtInvariants = data.invariants || [];
+        OpenFangToast.success('Generated ' + this.pbtInvariants.length + ' invariants');
+      } catch(e) {
+        OpenFangToast.error('PBT generate failed: ' + e.message);
+      }
+    },
+
+    async checkInvariants() {
+      if (!this.pbtInvariants.length || !this.pbtCheckResponse.trim()) return;
+      try {
+        this.pbtReport = await OpenFangAPI.post('/api/pbt/check', {
+          invariants: this.pbtInvariants,
+          input: this.pbtCheckInput,
+          response: this.pbtCheckResponse
+        });
+      } catch(e) {
+        OpenFangToast.error('PBT check failed: ' + e.message);
+      }
+    },
+
+    severityColor(severity) {
+      var colors = { 'Critical': '#ef4444', 'Warning': '#f59e0b', 'Info': '#3b82f6' };
+      return colors[severity] || '#6b7280';
+    },
+
+    // Curriculum methods
+    async loadCurriculumForAgent(agentId) {
+      try {
+        this.curriculumAgents[agentId] = await OpenFangAPI.get('/api/agents/' + agentId + '/curriculum');
+      } catch(e) {
+        this.curriculumAgents[agentId] = null;
+      }
+    },
+
+    async loadAllCurriculum() {
+      var self = this;
+      await Promise.all(this.agents.map(function(a) { return self.loadCurriculumForAgent(a.id); }));
+    },
+
+    getCurriculum(agentId) {
+      return this.curriculumAgents[agentId] || null;
+    },
+
+    tierColor(tier) {
+      var colors = { 'Foundational': '#6b7280', 'Intermediate': '#3b82f6', 'Advanced': '#f59e0b', 'Expert': '#10b981' };
+      return colors[tier] || '#6b7280';
+    },
+
+    masteryWidth(mastery) {
+      return Math.round((mastery || 0) * 100) + '%';
+    },
+
+    // Reflection methods
+    async loadInsightsForAgent(agentId) {
+      try {
+        this.insightAgents[agentId] = await OpenFangAPI.get('/api/agents/' + agentId + '/insights');
+      } catch(e) {
+        this.insightAgents[agentId] = null;
+      }
+    },
+
+    async loadAllInsights() {
+      var self = this;
+      await Promise.all(this.agents.map(function(a) { return self.loadInsightsForAgent(a.id); }));
+    },
+
+    getInsights(agentId) {
+      var data = this.insightAgents[agentId];
+      return data ? (data.insights || []) : [];
+    },
+
+    confidenceColor(c) {
+      if (c >= 80) return '#10b981';
+      if (c >= 50) return '#f59e0b';
+      return '#ef4444';
     }
   };
 }
