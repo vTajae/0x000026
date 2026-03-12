@@ -356,6 +356,9 @@ pub async fn build_router(
         .route("/api/curriculum/gate", axum::routing::post(routes::curriculum_gate))
         // Scratch pad endpoints
         .route("/api/scratch-pad/parse", axum::routing::post(routes::scratch_pad_parse))
+        // Agent-level curriculum and reflection endpoints
+        .route("/api/agents/{id}/curriculum", axum::routing::get(routes::get_agent_curriculum))
+        .route("/api/agents/{id}/insights", axum::routing::get(routes::get_agent_insights))
         // Skills endpoints
         .route("/api/skills", axum::routing::get(routes::list_skills))
         .route(

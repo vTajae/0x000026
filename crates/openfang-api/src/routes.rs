@@ -11318,6 +11318,71 @@ pub async fn scratch_pad_parse(
     }))
 }
 
+// ── Agent-level Curriculum & Reflection ──────────────────────────────
+
+/// GET /api/agents/{id}/curriculum — get agent's curriculum learning state.
+pub async fn get_agent_curriculum(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
+
+    let curriculum = state
+        .kernel
+        .curriculum_states
+        .get(&agent_id)
+        .map(|s| s.clone())
+        .unwrap_or_default();
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "agent_id": agent_id.to_string(),
+        "current_tier": curriculum.current_tier,
+        "tier_mastery": curriculum.tier_mastery(),
+        "total_turns": curriculum.total_turns,
+        "tool_mastery": curriculum.tool_mastery,
+        "tier_history": curriculum.tier_history,
+        "suggested_practice": curriculum.suggested_practice(),
+    })))
+}
+
+/// GET /api/agents/{id}/insights — get agent's reflection insights.
+pub async fn get_agent_insights(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
+
+    let store = state
+        .kernel
+        .insight_stores
+        .get(&agent_id)
+        .map(|s| s.clone())
+        .unwrap_or_else(|| openfang_runtime::reflection::InsightStore::new(10));
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "agent_id": agent_id.to_string(),
+        "insights": store.insights,
+        "avg_confidence": store.avg_confidence(),
+        "total_insights": store.insights.len(),
+    })))
+}
+
 /// Remove a `[section]` and its contents from a TOML string.
 fn remove_toml_section(content: &str, section: &str) -> String {
     let header = format!("[{}]", section);

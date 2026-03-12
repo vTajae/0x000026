@@ -342,6 +342,11 @@ pub async fn run_agent_loop(
     let final_response;
     let mut tool_error_count: usize = 0;
 
+    // Ephemeral scratch-pad — per-turn working memory (Blueprint Factor 1)
+    let mut scratch_pad = crate::scratch_pad::ScratchPad::new();
+    // Track tool names used this turn (for reflection)
+    let mut tools_used_this_turn: Vec<String> = Vec::new();
+
     // Safety valve: trim excessively long message histories to prevent context overflow.
     // The full compaction system handles sophisticated summarization, but this prevents
     // the catastrophic case where 200+ messages cause instant context overflow.
@@ -402,6 +407,13 @@ pub async fn run_agent_loop(
         // Context guard: compact oversized tool results before LLM call
         apply_context_guard(&mut messages, &context_budget, available_tools);
 
+        // Inject scratch-pad working memory into system prompt for this iteration
+        let effective_system_prompt = if let Some(pad_section) = scratch_pad.to_prompt_section() {
+            format!("{system_prompt}\n\n{pad_section}")
+        } else {
+            system_prompt.clone()
+        };
+
         // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
         let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
 
@@ -411,7 +423,7 @@ pub async fn run_agent_loop(
             tools: available_tools.to_vec(),
             max_tokens: manifest.model.max_tokens,
             temperature: manifest.model.temperature,
-            system: Some(system_prompt.clone()),
+            system: Some(effective_system_prompt.clone()),
             thinking: None,
         };
 
@@ -922,6 +934,23 @@ pub async fn run_agent_loop(
                     if result.is_error {
                         tool_error_count += 1;
                     }
+
+                    // Process scratch-pad commands from tool output (Factor 1)
+                    let final_content = {
+                        let (cmds, cleaned) = crate::scratch_pad::parse_scratch_commands(&final_content);
+                        if !cmds.is_empty() {
+                            crate::scratch_pad::apply_commands(&mut scratch_pad, &cmds);
+                            cleaned
+                        } else {
+                            final_content
+                        }
+                    };
+
+                    // Track tool usage for reflection (Factor 12)
+                    if !tools_used_this_turn.contains(&tool_call.name) {
+                        tools_used_this_turn.push(tool_call.name.clone());
+                    }
+
                     tool_result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: result.tool_use_id,
                         tool_name: tool_call.name.clone(),
@@ -1490,6 +1519,11 @@ pub async fn run_agent_loop_streaming(
     let final_response;
     let mut tool_error_count: usize = 0;
 
+    // Ephemeral scratch-pad — per-turn working memory (Blueprint Factor 1)
+    let mut scratch_pad = crate::scratch_pad::ScratchPad::new();
+    // Track tool names used this turn (for reflection)
+    let mut tools_used_this_turn: Vec<String> = Vec::new();
+
     // Safety valve: trim excessively long message histories to prevent context overflow.
     if messages.len() > MAX_HISTORY_MESSAGES {
         let trim_count = messages.len() - MAX_HISTORY_MESSAGES;
@@ -1558,6 +1592,13 @@ pub async fn run_agent_loop_streaming(
         // Context guard: compact oversized tool results before LLM call
         apply_context_guard(&mut messages, &context_budget, available_tools);
 
+        // Inject scratch-pad working memory into system prompt for this iteration
+        let effective_system_prompt = if let Some(pad_section) = scratch_pad.to_prompt_section() {
+            format!("{system_prompt}\n\n{pad_section}")
+        } else {
+            system_prompt.clone()
+        };
+
         // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
         let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
 
@@ -1567,7 +1608,7 @@ pub async fn run_agent_loop_streaming(
             tools: available_tools.to_vec(),
             max_tokens: manifest.model.max_tokens,
             temperature: manifest.model.temperature,
-            system: Some(system_prompt.clone()),
+            system: Some(effective_system_prompt.clone()),
             thinking: None,
         };
 
@@ -2084,6 +2125,23 @@ pub async fn run_agent_loop_streaming(
                     if result.is_error {
                         tool_error_count += 1;
                     }
+
+                    // Process scratch-pad commands from tool output (Factor 1)
+                    let final_content = {
+                        let (cmds, cleaned) = crate::scratch_pad::parse_scratch_commands(&final_content);
+                        if !cmds.is_empty() {
+                            crate::scratch_pad::apply_commands(&mut scratch_pad, &cmds);
+                            cleaned
+                        } else {
+                            final_content
+                        }
+                    };
+
+                    // Track tool usage for reflection (Factor 12)
+                    if !tools_used_this_turn.contains(&tool_call.name) {
+                        tools_used_this_turn.push(tool_call.name.clone());
+                    }
+
                     tool_result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: result.tool_use_id,
                         tool_name: tool_call.name.clone(),

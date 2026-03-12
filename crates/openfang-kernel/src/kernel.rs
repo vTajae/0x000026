@@ -163,6 +163,10 @@ pub struct OpenFangKernel {
     pub violation_tracker: openfang_runtime::violation_tracker::ViolationTracker,
     /// Per-agent runtime assertions cache (loaded from ASSERTIONS.json in workspace).
     pub assertion_cache: dashmap::DashMap<AgentId, Vec<openfang_runtime::assertions::RuntimeAssertion>>,
+    /// Per-agent curriculum learning state (Blueprint Factor 13).
+    pub curriculum_states: dashmap::DashMap<AgentId, openfang_runtime::curriculum::CurriculumState>,
+    /// Per-agent reflection insight stores (Blueprint Factor 12).
+    pub insight_stores: dashmap::DashMap<AgentId, openfang_runtime::reflection::InsightStore>,
 }
 
 /// Bounded in-memory delivery receipt tracker.
@@ -1082,6 +1086,8 @@ impl OpenFangKernel {
             credential_resolver,
             violation_tracker: openfang_runtime::violation_tracker::ViolationTracker::new(),
             assertion_cache: dashmap::DashMap::new(),
+            curriculum_states: dashmap::DashMap::new(),
+            insight_stores: dashmap::DashMap::new(),
         };
 
         // Restore persisted agents from SQLite
@@ -2609,6 +2615,56 @@ impl OpenFangKernel {
             openfang_types::config::UsageFooterMode::Tokens => {
                 // Tokens are already in result.total_usage, omit cost
                 result.cost_usd = None;
+            }
+        }
+
+        // Curriculum learning: record turn completion (Factor 13)
+        {
+            let mut state = self
+                .curriculum_states
+                .entry(agent_id)
+                .or_default();
+            state.record_turn();
+            if let Some(new_tier) = state.check_advancement() {
+                info!(agent_id = %agent_id, tier = ?new_tier, "Agent advanced to new skill tier");
+            }
+        }
+
+        // Reflection: generate insight for qualifying turns (Factor 12)
+        if result.iterations > 3 || result.response.len() > 500 {
+            let reflection_config = openfang_runtime::reflection::ReflectionConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            if openfang_runtime::reflection::should_reflect(
+                &reflection_config,
+                result.iterations as usize,
+                result.response.len(),
+            ) {
+                let category = openfang_runtime::reflection::categorize_task(message);
+                // Store a lightweight insight without calling the LLM again
+                let insight = openfang_runtime::reflection::ReflectionInsight {
+                    approach: if result.iterations > 10 {
+                        "Multi-step approach with many tool calls".into()
+                    } else {
+                        "Efficient approach".into()
+                    },
+                    alternatives: "N/A".into(),
+                    confidence: 7,
+                    insight: format!(
+                        "Task type '{}': {} iterations, cost ${:.4}",
+                        category,
+                        result.iterations,
+                        result.cost_usd.unwrap_or(0.0)
+                    ),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    task_category: Some(category.to_string()),
+                };
+                let mut store = self
+                    .insight_stores
+                    .entry(agent_id)
+                    .or_insert_with(|| openfang_runtime::reflection::InsightStore::new(10));
+                store.add(insight, message);
             }
         }
 
