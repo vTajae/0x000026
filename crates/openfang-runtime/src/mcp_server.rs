@@ -6,11 +6,22 @@
 //! This module provides a reusable handler function — the CLI team
 //! wires it into a stdio transport.
 
+use crate::mcp_roots::RootStore;
+use crate::mcp_sampling::SamplingConfig;
 use openfang_types::tool::ToolDefinition;
 use serde_json::json;
 
 /// MCP protocol version supported by this server.
 const PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Extended MCP server context (optional capabilities).
+#[derive(Default)]
+pub struct McpServerContext {
+    /// Root store for filesystem scoping.
+    pub roots: Option<RootStore>,
+    /// Sampling configuration.
+    pub sampling: Option<SamplingConfig>,
+}
 
 /// Handle an incoming MCP JSON-RPC request and return a response.
 ///
@@ -20,23 +31,39 @@ pub async fn handle_mcp_request(
     request: &serde_json::Value,
     tools: &[ToolDefinition],
 ) -> serde_json::Value {
+    handle_mcp_request_with_context(request, tools, &McpServerContext::default()).await
+}
+
+/// Handle an incoming MCP JSON-RPC request with extended context.
+pub async fn handle_mcp_request_with_context(
+    request: &serde_json::Value,
+    tools: &[ToolDefinition],
+    ctx: &McpServerContext,
+) -> serde_json::Value {
     let method = request["method"].as_str().unwrap_or("");
     let id = request.get("id").cloned();
 
     match method {
-        "initialize" => make_response(
-            id,
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {
-                    "tools": {}
-                },
-                "serverInfo": {
-                    "name": "openfang",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }),
-        ),
+        "initialize" => {
+            let mut capabilities = json!({"tools": {}});
+            if ctx.roots.is_some() {
+                capabilities["roots"] = json!({"listChanged": true});
+            }
+            if ctx.sampling.as_ref().is_some_and(|s| s.enabled) {
+                capabilities["sampling"] = json!({});
+            }
+            make_response(
+                id,
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": capabilities,
+                    "serverInfo": {
+                        "name": "openfang",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }),
+            )
+        }
         "notifications/initialized" => {
             // Notification — no response needed
             json!(null)
@@ -79,6 +106,38 @@ pub async fn handle_mcp_request(
                     }]
                 }),
             )
+        }
+        "roots/list" => {
+            if let Some(ref roots) = ctx.roots {
+                make_response(id, roots.to_list_response())
+            } else {
+                make_response(id, json!({"roots": []}))
+            }
+        }
+        "sampling/createMessage" => {
+            let params = request.get("params").cloned().unwrap_or(json!({}));
+            let config = ctx.sampling.as_ref().cloned().unwrap_or_default();
+
+            match crate::mcp_sampling::parse_sampling_request(&params) {
+                Ok(req) => {
+                    if let Err(e) = crate::mcp_sampling::validate_request(&req, &config) {
+                        crate::mcp_sampling::build_sampling_error(id, &e)
+                    } else {
+                        // Validation passed — actual LLM execution is delegated to the host.
+                        // Return a placeholder indicating the request is valid.
+                        make_response(
+                            id,
+                            json!({
+                                "role": "assistant",
+                                "content": {"type": "text", "text": "Sampling request validated. Host must wire LLM execution."},
+                                "model": "pending",
+                                "stopReason": "end_turn"
+                            }),
+                        )
+                    }
+                }
+                Err(e) => crate::mcp_sampling::build_sampling_error(id, &e),
+            }
         }
         _ => make_error(id, -32601, &format!("Method not found: {method}")),
     }
